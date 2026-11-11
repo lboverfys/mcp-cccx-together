@@ -1,0 +1,6 @@
+node_modules/
+.team-state/
+.team-runtime/
+team.config.json
+.codex/config.toml
+*.log
