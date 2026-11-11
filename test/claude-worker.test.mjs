@@ -2,6 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createClaudeWorker } from '../src/claude-worker.mjs';
@@ -30,7 +35,7 @@ function outputQueue() {
   };
 }
 
-function harness({ workerOverrides = {}, request, autoExit = true, streamError, endError, stopTask } = {}) {
+function harness({ workerOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand } = {}) {
   const events = [];
   const messages = [];
   const waiters = [];
@@ -61,6 +66,7 @@ function harness({ workerOverrides = {}, request, autoExit = true, streamError, 
     },
     config: { claudeExecutable: 'D:/tools/claude.exe', tempDir: 'D:/task/temp' },
     request: request ?? (async () => ({ allow: false, reason: '未授权' })),
+    readDependency,
     emit(type, data) {
       events.push({ type, data });
       for (let i = waiters.length - 1; i >= 0; i--) {
@@ -74,7 +80,7 @@ function harness({ workerOverrides = {}, request, autoExit = true, streamError, 
     queryImpl({ prompt, options }) {
       queryOptions = options;
       options.spawnClaudeCodeProcess({
-        command: options.pathToClaudeCodeExecutable,
+        command: spawnCommand ?? options.pathToClaudeCodeExecutable,
         args: ['--input-format', 'stream-json'],
         cwd: options.cwd,
         env: options.env,
@@ -191,8 +197,114 @@ test('复用现有 exe、配置与环境，read 工作者移除写入和再委�
   assert.equal(h.options.permissionMode, 'default');
   assert.equal(h.options.persistSession, true);
   assert.equal(h.options.strictMcpConfig, true);
+  assert.equal(h.options.systemPrompt.snapshot, false);
   assert.deepEqual(Object.keys(h.options.mcpServers), ['team']);
+  assert.deepEqual(h.options.allowedTools, []);
   assert.deepEqual(h.options.settings, { disableAllHooks: true });
+  await h.instance.close();
+});
+
+test('SDK 请求 node 启动 JS 入口时复用 MCP 当前解释器', async () => {
+  const h = harness({ spawnCommand: 'node' });
+  assert.equal(h.spawnOptions.command, process.execPath);
+  assert.deepEqual(h.spawnOptions.args, ['--input-format', 'stream-json']);
+  await h.instance.close();
+});
+
+test('结果保留 SDK 用量、费用和耗时，失败轮次也可检查消耗', async () => {
+  const h = harness();
+  const usage = { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 80, cache_creation_input_tokens: 0 };
+  h.pushOutput({ type: 'result', subtype: 'error_max_turns', is_error: true, errors: ['已达轮次限制'],
+    usage, total_cost_usd: 0.004, duration_ms: 2450, num_turns: 3 });
+  await h.until(events => events.some(event => event.type === 'result'));
+  const result = h.events.find(event => event.type === 'result').data;
+  assert.equal(result.success, false);
+  assert.deepEqual(result.usage, usage);
+  assert.equal(result.costUsd, 0.004);
+  assert.equal(result.durationMs, 2450);
+  assert.equal(result.numTurns, 3);
+  await h.instance.close();
+});
+
+test('轮次和预算限制仅在主控指定时传给 SDK，恢复时保持配置', async () => {
+  const plain = harness();
+  assert.equal(Object.hasOwn(plain.options, 'maxTurns'), false);
+  assert.equal(Object.hasOwn(plain.options, 'maxBudgetUsd'), false);
+  await plain.instance.close();
+  const limited = harness({ workerOverrides: { maxTurns: 8, maxBudgetUsd: 0.25, sessionId: 'saved-session' } });
+  assert.equal(limited.options.maxTurns, 8);
+  assert.equal(limited.options.maxBudgetUsd, 0.25);
+  assert.equal(limited.options.resume, 'saved-session');
+  await limited.instance.close();
+});
+
+test('结果保留完整长交付、全部错误、多个关联消息和累计计量', async () => {
+  const h = harness();
+  const report = '完整交付'.repeat(12000);
+  const errors = Array.from({ length: 12 }, (_, index) => `${index}:` + '错误细节'.repeat(800));
+  const modelUsage = { 'example-model': { inputTokens: 50, outputTokens: 20, costUSD: 0.1 } };
+  h.pushOutput({ type: 'result', subtype: 'error_during_execution', is_error: true,
+    result: report, errors, modelUsage, total_cost_usd: 0.1,
+    user_message_uuid: 'last-message', user_message_uuids: ['first-message', 'last-message'],
+    queued_turn_count: 2, result_index: 4, startup_failure_reason: 'config_file_invalid' });
+  await h.until(events => events.some(event => event.type === 'result'));
+  const result = h.events.find(event => event.type === 'result').data;
+  assert.equal(result.text, report);
+  assert.deepEqual(result.errors, errors);
+  assert.deepEqual(result.messageIds, ['first-message', 'last-message']);
+  assert.deepEqual(result.modelUsage, modelUsage);
+  assert.equal(result.costUsd, 0.1);
+  assert.equal(result.queuedTurnCount, 2);
+  assert.equal(result.resultIndex, 4);
+  assert.equal(result.startupFailureReason, 'config_file_invalid');
+  await h.instance.close();
+});
+
+test('success 信封中的中断、后台、额度阻塞按实际终止原因区分', async () => {
+  const h = harness();
+  const reasons = [undefined, 'completed', 'aborted_streaming', 'aborted_tools', 'background_requested', 'blocking_limit'];
+  for (const reason of reasons) h.pushOutput({ type: 'result', subtype: 'success', is_error: false, terminal_reason: reason });
+  await h.until(events => events.filter(event => event.type === 'result').length === reasons.length);
+  const results = h.events.filter(event => event.type === 'result').map(event => event.data);
+  assert.deepEqual(results.map(result => result.success), [true, true, false, false, false, false]);
+  assert.deepEqual(results.map(result => result.interrupted), [false, false, true, true, false, false]);
+  assert.deepEqual(results.map(result => result.background), [false, false, false, false, true, false]);
+  await h.instance.close();
+});
+
+test('记录后台快照、重试等待、限额与规则拒绝，主控可判断等待原因', async () => {
+  const h = harness();
+  h.pushOutput({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'job', task_type: 'local_bash', description: '构建' }] });
+  h.pushOutput({ type: 'system', subtype: 'api_retry', attempt: 2, max_retries: 4, retry_delay_ms: 1000, error_status: 429, error: 'rate_limit' });
+  h.pushOutput({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1234, rateLimitType: 'five_hour', utilization: 1 } });
+  h.pushOutput({ type: 'system', subtype: 'permission_denied', tool_name: 'Bash', tool_use_id: 'denied-tool', decision_reason: '规则拒绝', message: '当前命令不允许' });
+  h.pushOutput({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  await h.until(events => events.filter(event => event.type === 'background_tasks').length === 2);
+  assert.deepEqual(h.events.find(event => event.type === 'api_retry').data,
+    { attempt: 2, maxRetries: 4, retryDelayMs: 1000, errorStatus: 429, error: 'rate_limit' });
+  assert.equal(h.events.find(event => event.type === 'rate_limit').data.resetsAt, 1234);
+  assert.equal(h.events.find(event => event.type === 'permission_denied').data.reason, '规则拒绝');
+  assert.equal(h.events.filter(event => event.type === 'background_tasks').at(-1).data.tasks.length, 0);
+  await h.instance.close();
+});
+
+test('同名外部 MCP 工具仍须审批，并向主控保留权限来源和原因', async () => {
+  const calls = [];
+  const h = harness({ request: async (kind, payload) => {
+    calls.push({ kind, payload });
+    return { allow: false, reason: '非内嵌协调工具' };
+  } });
+  const context = { signal: new AbortController().signal, requestId: 'permission-1', toolUseID: 'tool-1',
+    mcpServer: { name: 'team', source: 'plugin' }, decisionReason: '需要读取外部数据',
+    title: '读取数据', description: '可访问外部资源', defaultToNo: true,
+    matchedAskRule: { source: 'userSettings', toolName: 'mcp__team__read_dependency' } };
+  const decision = await h.options.canUseTool('mcp__team__read_dependency', { workerId: '设计cc' }, context);
+  assert.equal(decision.behavior, 'deny');
+  assert.equal(calls[0].kind, 'permission');
+  assert.deepEqual(calls[0].payload.mcpServer, context.mcpServer);
+  assert.equal(calls[0].payload.decisionReason, context.decisionReason);
+  assert.equal(calls[0].payload.defaultToNo, true);
+  assert.deepEqual(calls[0].payload.matchedAskRule, context.matchedAskRule);
   await h.instance.close();
 });
 
@@ -205,6 +317,10 @@ test('问答保留原问题并返回答案，权限拒绝不伪装成功', async
   const context = { signal: new AbortController().signal, requestId: 'request-1', toolUseID: 'tool-1' };
   assert.equal(h.options.strictMcpConfig, true);
   assert.deepEqual(h.options.settings, { disableAllHooks: true });
+  for (const toolName of ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency']) {
+    const input = { summary: '协调消息' };
+    assert.deepEqual(await h.options.canUseTool(toolName, input, { ...context, mcpServer: { name: 'team', source: 'sdk' } }), { behavior: 'allow', updatedInput: input });
+  }
   const questions = [{ question: '选择方案', options: [{ label: 'A', description: '' }], multiSelect: false }];
   const answer = await h.options.canUseTool('AskUserQuestion', { questions }, context);
   assert.deepEqual(answer, { behavior: 'allow', updatedInput: { questions, answers: { '选择方案': 'A' } } });
@@ -286,6 +402,8 @@ test('无法确认进程退出时 close 明确超时失败', async (t) => {
   await stopped;
   assert.equal(h.child.exitCode, null);
   h.exit();
+  await h.instance.close();
+  assert.equal(h.child.exitCode, 0);
 });
 
 test('主动关闭可处理预期 AbortError，仍传播其他流异常', async () => {
@@ -362,9 +480,13 @@ test('后台任务没有停止快照时 close 有限超时且仍清理自有 CC 
 test('内嵌 MCP 记录进度并等待主控问答，不虚报主控已读', async () => {
   const asked = deferred();
   const response = deferred();
+  const dependencies = [];
   const h = harness({ request: async (kind, payload) => {
     asked.resolve({ kind, payload });
     return await response.promise;
+  }, readDependency: async (workerId, offset, limit) => {
+    dependencies.push({ workerId, offset, limit });
+    return { text: '{"text":"设计交付"}', nextOffset: null, offsetUnit: 'utf8-bytes' };
   } });
   const client = new Client({ name: 'worker-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -382,9 +504,183 @@ test('内嵌 MCP 记录进度并等待主控问答，不虚报主控已读', asy
     response.resolve({ text: '继续检查' });
     const answer = await waiting;
     assert.equal(answer.content[0].text, '继续检查');
+    const dependency = await client.callTool({ name: 'read_dependency', arguments: { workerId: '设计cc' } });
+    assert.equal(JSON.parse(dependency.content[0].text).text, '{"text":"设计交付"}');
+    assert.deepEqual(dependencies, [{ workerId: '设计cc', offset: 0, limit: 12000 }]);
+    const invalid = await client.callTool({ name: 'read_dependency', arguments: { workerId: '设计cc', limit: 1 } });
+    assert.equal(invalid.isError, true);
   } finally {
     await client.close();
     await server.close();
     await h.instance.close();
   }
+});
+
+test('真实 SDK 验证多轮合并、权限问答、失败后追加、后台关闭、预算参数和恢复', { timeout: 30000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cc-team-sdk-'));
+  const cli = join(dir, 'cli.mjs');
+  writeFileSync(cli, `
+import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
+const resumedSession = process.argv.find(arg => arg.startsWith('--resume='))?.slice('--resume='.length);
+const sessionId = resumedSession ?? randomUUID();
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+const batch = [];
+const permissions = new Map();
+let initialization;
+const result = (messages, data, extra = {}) => send({
+  type: 'result', subtype: 'success', is_error: false, uuid: randomUUID(), session_id: sessionId,
+  result: JSON.stringify(data), user_message_uuid: messages.at(-1).uuid, user_message_uuids: messages.map(item => item.uuid),
+  duration_ms: 1, duration_api_ms: 0, total_cost_usd: 0, num_turns: 1,
+  usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+  modelUsage: {}, permission_denials: [], ...extra,
+});
+const lines = createInterface({ input: process.stdin });
+lines.on('line', line => {
+  const message = JSON.parse(line);
+  if (message.type === 'control_request') {
+    if (message.request.subtype === 'initialize') initialization = message.request;
+    send({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id,
+      response: message.request.subtype === 'initialize'
+        ? { commands: [], models: [], account: {}, output_style: 'default', available_output_styles: [] }
+        : message.request.subtype === 'interrupt' ? { still_queued: batch.map(item => item.uuid) } : {} } });
+    if (message.request.subtype === 'stop_task') {
+      send({ type: 'system', subtype: 'background_tasks_changed', tasks: [], uuid: randomUUID(), session_id: sessionId });
+    }
+  } else if (message.type === 'control_response') {
+    const waiting = permissions.get(message.response.request_id);
+    if (waiting) {
+      permissions.delete(message.response.request_id);
+      result([waiting], message.response);
+    }
+  } else if (message.type === 'user') {
+    send({ type: 'system', subtype: 'init', session_id: sessionId, uuid: randomUUID(),
+      capabilities: ['interrupt_receipt_v1'], tools: [], mcp_servers: [], model: 'local-fixture', cwd: process.cwd(), permissionMode: 'default' });
+    const task = message.message.content.startsWith('{') ? JSON.parse(message.message.content) : { action: 'echo' };
+    if (task.action === 'permission' || task.action === 'question') {
+      const requestId = randomUUID();
+      permissions.set(requestId, message);
+      send({ type: 'control_request', request_id: requestId, request: {
+        subtype: 'can_use_tool', tool_name: task.action === 'question' ? 'AskUserQuestion' : 'Bash',
+        input: task.action === 'question' ? { questions: [{ question: '请选择执行方案', options: [{ label: 'A', description: '方案A' }], multiSelect: false }] }
+          : { command: task.command }, tool_use_id: randomUUID(), decision_reason: '需要主控决定',
+      } });
+    } else if (task.action === 'batch') {
+      batch.push(message);
+      if (batch.length === 2) result(batch.splice(0), { merged: true });
+    } else if (task.action === 'failure') {
+      result([message], {}, { subtype: 'error_max_turns', is_error: true, errors: ['已达到模型轮次上限'], terminal_reason: 'max_turns' });
+    } else if (task.action === 'background') {
+      send({ type: 'system', subtype: 'background_tasks_changed', uuid: randomUUID(), session_id: sessionId,
+        tasks: [{ task_id: 'local-build', task_type: 'local_bash', description: '模拟后台构建', run_id: 'first-run' }] });
+      result([message], {}, { terminal_reason: 'background_requested' });
+    } else if (task.action === 'options') {
+      result([message], { maxTurns: process.argv.find(arg => arg.startsWith('--max-turns=')),
+        maxBudgetUsd: process.argv.find(arg => arg.startsWith('--max-budget-usd=')),
+        snapshot: initialization.systemPromptSnapshot, append: initialization.appendSystemPrompt });
+    } else {
+      result([message], { text: message.message.content, resumed: Boolean(resumedSession) });
+    }
+  }
+});
+lines.on('close', () => process.exit(0));
+`, { flag: 'wx' });
+  const workers = [];
+  const children = [];
+  t.after(async () => {
+    const results = await Promise.allSettled(workers.map(worker => worker.close()));
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise(resolve => child.once('exit', resolve));
+        child.kill('SIGKILL');
+        await exited;
+      }
+      assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
+    }
+    unlinkSync(cli);
+    rmdirSync(dir);
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
+  });
+  function start(sessionId, { request, workerOverrides = {} } = {}) {
+    const events = [];
+    let failure;
+    const worker = createClaudeWorker({
+      worker: { id: 'sdk-worker', name: '协议验证cc', cwd: dir, instructions: '仅处理模拟协议', access: 'read', allowedTools: [], sessionId, ...workerOverrides },
+      config: { claudeExecutable: cli, tempDir: dir },
+      emit: (type, data) => events.push({ type, data }),
+      request: request ?? (async () => { throw new Error('当前模拟轮次不应请求工具审批'); }),
+      spawnImpl(command, args, options) {
+        const child = spawn(command, args, options);
+        children.push(child);
+        return child;
+      },
+    });
+    worker.done.catch(error => { failure = error; });
+    workers.push(worker);
+    return { worker, events, async result(count) {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        if (failure) throw failure;
+        const result = events.filter(event => event.type === 'result')[count - 1];
+        if (result) return result.data;
+        await delay(10);
+      }
+      assert.fail(`模拟 CLI 结果超时：${JSON.stringify(events)}`);
+    } };
+  }
+  const first = start();
+  first.worker.send('第一轮', 'a3da1b73-4f86-43c0-b91f-baa439a2fd10');
+  const firstResult = await first.result(1);
+  assert.deepEqual(JSON.parse(firstResult.text), { text: '第一轮', resumed: false });
+  assert.equal(firstResult.costUsd, 0);
+  await first.worker.interrupt();
+  first.worker.send('第二轮', 'e089f75b-d79e-4093-a76d-31e6c06556df');
+  assert.deepEqual(JSON.parse((await first.result(2)).text), { text: '第二轮', resumed: false });
+  await first.worker.close();
+  assert.equal(children[0].exitCode, 0);
+  const resumed = start(firstResult.sessionId, { workerOverrides: { instructions: '恢复后当前任务的新约束' } });
+  resumed.worker.send('恢复轮次', '8aa3c05e-41c6-44d1-950c-ea74701c301c');
+  const resumedResult = await resumed.result(1);
+  assert.equal(resumedResult.sessionId, firstResult.sessionId);
+  assert.deepEqual(JSON.parse(resumedResult.text), { text: '恢复轮次', resumed: true });
+  resumed.worker.send(JSON.stringify({ action: 'options' }), 'a9beb50f-ea6c-4056-bcd5-c035bf5fb80b');
+  const resumedOptions = JSON.parse((await resumed.result(2)).text);
+  assert.equal(resumedOptions.snapshot, false);
+  assert.match(resumedOptions.append, /恢复后当前任务的新约束/);
+  await resumed.worker.close();
+  assert.equal(children[1].exitCode, 0);
+
+  const questions = [];
+  const controlled = start(undefined, { workerOverrides: { maxTurns: 7, maxBudgetUsd: 0.25 }, request: async (kind, payload) => {
+    questions.push({ kind, payload });
+    return kind === 'question' ? { text: 'A' }
+      : payload.input.command === 'allowed-command' ? { allow: true } : { allow: false, reason: '命令未授权' };
+  } });
+  controlled.worker.send(JSON.stringify({ action: 'permission', command: 'allowed-command' }), 'b71c505a-d54c-4b97-9e83-678585d9ba86');
+  assert.equal(JSON.parse((await controlled.result(1)).text).response.behavior, 'allow');
+  assert.equal(questions[0].payload.decisionReason, '需要主控决定');
+  controlled.worker.send(JSON.stringify({ action: 'permission', command: 'denied-command' }), '4188dcba-1dbb-4426-94bf-bf88d8a5978b');
+  assert.equal(JSON.parse((await controlled.result(2)).text).response.behavior, 'deny');
+  controlled.worker.send(JSON.stringify({ action: 'question' }), 'f7796ab1-fdd4-4b03-8b35-9a718f43edcf');
+  assert.deepEqual(JSON.parse((await controlled.result(3)).text).response.updatedInput.answers, { 请选择执行方案: 'A' });
+  controlled.worker.send(JSON.stringify({ action: 'batch' }), '2711c3e4-68f5-4779-b9f8-6b2d3e6e8884');
+  controlled.worker.send(JSON.stringify({ action: 'batch' }), 'cb2f73ec-afd2-4028-8f64-209b750ab9b6');
+  assert.deepEqual((await controlled.result(4)).messageIds, ['2711c3e4-68f5-4779-b9f8-6b2d3e6e8884', 'cb2f73ec-afd2-4028-8f64-209b750ab9b6']);
+  controlled.worker.send(JSON.stringify({ action: 'failure' }), 'ce574c1d-e4ef-47bb-9b0f-fbfced823975');
+  assert.equal((await controlled.result(5)).success, false);
+  controlled.worker.send('失败后新任务', '738f2b72-aeae-4c37-beed-608c00295f06');
+  assert.equal((await controlled.result(6)).success, true);
+  controlled.worker.send(JSON.stringify({ action: 'options' }), 'b12838ac-9752-4f54-a811-78b27852d634');
+  const options = JSON.parse((await controlled.result(7)).text);
+  assert.equal(options.maxTurns, '--max-turns=7');
+  assert.equal(options.maxBudgetUsd, '--max-budget-usd=0.25');
+  assert.equal(options.snapshot, false);
+  controlled.worker.send(JSON.stringify({ action: 'background' }), '7d287742-1818-4bc6-a4f7-4726277b3311');
+  const backgroundResult = await controlled.result(8);
+  assert.equal(backgroundResult.success, false);
+  assert.equal(backgroundResult.background, true);
+  await controlled.worker.close();
+  assert.deepEqual(controlled.events.filter(event => event.type === 'background_tasks').at(-1).data.tasks, []);
+  assert.equal(children[2].exitCode, 0);
 });

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { loadConfig } from '../src/config.mjs';
 
 // 显式运行才会调用真实模型；--notify 额外授权向当前 Codex 会话投递一次提示。
 const args = process.argv.slice(2);
@@ -15,25 +17,28 @@ const parentThreadId = process.env.CODEX_THREAD_ID;
 if (notify) assert(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(parentThreadId ?? ''), '--notify 需要当前环境的完整 CODEX_THREAD_ID');
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const baseConfig = JSON.parse(readFileSync(path.join(root, 'team.config.json'), 'utf8'));
-const tempBase = 'D:/rubbish/zhongjian/temp/mcp-cccx-together';
+const baseConfig = loadConfig();
+const tempBase = path.join(tmpdir(), 'cc-team-mcp');
 mkdirSync(tempBase, { recursive: true });
 const temp = mkdtempSync(path.join(tempBase, 'smoke-'));
 const configPath = path.join(temp, 'config.json');
 const tempDir = path.join(temp, 'tmp');
 mkdirSync(tempDir);
-writeFileSync(configPath, JSON.stringify({ ...baseConfig, stateDir: path.join(temp, 'state'), tempDir }, null, 2), { flag: 'wx' });
+writeFileSync(configPath, JSON.stringify({ ...baseConfig, stateDir: path.join(temp, 'state'), tempDir,
+  notificationMode: notify ? 'codex-queue' : 'poll' }, null, 2), { flag: 'wx' });
 
 const log = (stage, data = {}) => process.stdout.write(`${JSON.stringify({ stage, ...data })}\n`);
 const deadline = Date.now() + 180_000;
 const mainDeadline = deadline - 25_000; // 给正常关闭和实际进程退出检查预留时间。
 const teamId = `smoke-${randomUUID()}`;
-const client = new Client({ name: 'cc-team-live-smoke', version: '0.1.0' });
+const client = new Client({ name: 'cc-team-live-smoke', version: '0.2.0' });
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: [path.join(root, 'src/server.mjs'), configPath],
+  args: [path.join(root, 'src/cli.mjs'), '--config', configPath],
   cwd: root,
-  env: { ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)), TEMP: tempDir, TMP: tempDir },
+  env: { ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
+    TEMP: tempDir, TMP: tempDir, TMPDIR: tempDir, CC_TEAM_STATE_DIR: path.join(temp, 'state'),
+    CC_TEAM_TEMP_DIR: tempDir, CC_TEAM_NOTIFICATION_MODE: notify ? 'codex-queue' : 'poll' },
   stderr: 'pipe',
 });
 let stderrTail = '';

@@ -1,12 +1,17 @@
 {
   "name": "cc-team-mcp",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
-  "description": "由 Codex 协调本机 Claude Code 工作者的团队 MCP",
+  "description": "Cross-platform MCP server for Codex to coordinate local Claude Code workers",
+  "bin": { "cc-team-mcp": "src/cli.mjs" },
+  "files": ["src/", "README.md", "team.config.example.json"],
+  "repository": { "type": "git", "url": "git+https://github.com/lboverfys/mcp-cccx-together.git" },
+  "bugs": { "url": "https://github.com/lboverfys/mcp-cccx-together/issues" },
   "engines": { "node": ">=22" },
   "scripts": {
-    "start": "node src/server.mjs",
+    "start": "node src/cli.mjs",
+    "doctor": "node src/cli.mjs doctor",
+    "setup": "node src/cli.mjs setup",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "check": "node scripts/check.mjs"
   },

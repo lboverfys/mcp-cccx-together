@@ -1,230 +1,209 @@
-# mcp-cccx-together
+# CC Team MCP
 
-让 **Codex 负责规划、协调和验收，Claude Code 负责执行** 的本地多 Agent 协作 MCP。
+[![Test](https://github.com/lboverfys/mcp-cccx-together/actions/workflows/ci.yml/badge.svg)](https://github.com/lboverfys/mcp-cccx-together/actions/workflows/ci.yml)
 
-在 Codex 中用自然语言安排任务，它便可以按需启动多个 Claude Code（简称 CC）工作者，接收进度、回答问题、追加指令，并在验收后关闭进程、保留会话。两个客户端各自使用原有的模型配置；桥接程序不绑定某个模型提供商。
+让 **Codex 负责任务拆分、协调和验收，Claude Code 负责执行** 的本地多智能体协作 MCP 服务。
 
-> 当前面向 **Windows + PowerShell 7 + Node.js 22 或更新版本**。已验证本机 Codex 与 Claude Code 的协作流程；其他操作系统尚未验证。模型服务仍需兼容各自客户端，尤其是 Claude Code 的工具调用。
+Codex 可以一次提交有依赖的任务，服务自动安排并行执行、等待主控验收、传递上游交付，再推进后续工作。主控随时接收进度和问题、追加指令、检查完整结果，并在关闭进程后恢复原会话。工作者复用本机 Claude Code 的模型与登录配置。支持 Windows、macOS 和 Linux，使用标准 MCP stdio 接入。
 
-```mermaid
-flowchart TD
-    U[用户：描述目标与约束] --> C[Codex：规划、协调、验收]
-    C <--> M[cc_team MCP：任务与会话管理]
-    M <--> A[计划功能cc]
-    M <--> B[验证cc]
-    M <--> D[布局测试cc]
+## 安装
+
+### 前置条件
+
+- **Node.js 22 或更新版本**，包含 npm。
+- **Git**，用于从 GitHub 安装；下载 ZIP 使用源码方式时可省略。
+- **Claude Code** 已安装，能在终端独立运行并完成一次正常对话。
+- **Codex** 已安装；使用其他支持本地 stdio 的 MCP 客户端时，可以手动配置。
+
+Claude Code 的安装和平台要求见[官方安装文档](https://code.claude.com/docs/en/setup)。Windows 下执行命令所需的 Git Bash 等组件按该文档准备。
+
+### 推荐：从 GitHub 安装
+
+在 PowerShell 或 macOS/Linux 终端中执行：
+
+```sh
+npm install -g --omit=optional github:lboverfys/mcp-cccx-together
+cc-team-mcp doctor
+cc-team-mcp setup
 ```
 
-## 能做什么
+`setup` 通过 `codex mcp add` 注册名为 `cc_team` 的服务，保存当前 Node 和服务入口的绝对路径。已有同名配置时会提示处理，不自动覆盖。注册完成后，重新打开 Codex 会话，通过 `/mcp` 检查连接。
 
-- **按需增加工作者**：没有固定工作者数量上限，支持批量派发、查询和关闭；实际规模受本机资源、模型服务配额及状态存储限制。
-- **按名字协作**：名字采用“职责 + cc”，完整名字不超过十个字符，例如 `计划功能cc`、`验证cc`、`布局测试cc`。
-- **双向沟通**：CC 汇报进度、提出问题；Codex 读取事件、回答请求、追加任务或中断当前轮次。
-- **保留与恢复会话**：关闭执行进程后保存会话标识，后续可以在原团队中按名字恢复。
-- **由主控验收**：CC 报告成功后仍处于待验收状态，Codex 检查实际改动与测试结果，再记录验收。
-- **检查并行范围**：通过任务的 `scope` 检测读写冲突，帮助主控安排并行或串行执行。
+`--omit=optional` 跳过 SDK 捆绑的另一份 Claude 原生程序，本项目直接使用已安装的 Claude Code，减少下载与磁盘占用。安装位置由 npm 的全局前缀决定。使用自定义磁盘或已有工具目录时，可以添加 npm 的 `--prefix` 和 `--cache` 参数；将该前缀的命令目录加入终端环境，或直接运行其中的命令。
 
-这是通过 MCP 管理独立 CC 会话的协作桥接，不依赖 Claude Code 的 Agent Teams 功能。
+### 从源码使用
 
-## 快速开始
-
-### 1. 准备已有工具
-
-先确保以下工具能够独立运行：
-
-- PowerShell 7；
-- Node.js 22 或更新版本，`node` 可在当前终端找到；
-- 已完成模型及鉴权配置的 Claude Code；
-- 已完成配置的 Codex CLI。主动通知需要其原生入口支持 `codex queue --thread ... --resume`。
-
-本项目复用已有客户端，不负责安装 Codex、Claude Code 或配置模型账号。已完成真实联调的客户端版本为 Claude Code `2.1.318`、Codex `0.167.0`；这不是对所有其他版本的兼容承诺。
-
-### 2. 克隆并安装依赖
-
-以下示例将项目放在 `D:\projects`，可换成自己的目录。在 PowerShell 7 中执行：
-
-```powershell
-git clone https://github.com/lboverfys/mcp-cccx-together.git D:\projects\mcp-cccx-together
-Set-Location D:\projects\mcp-cccx-together
-npm ci --omit=optional --ignore-scripts --cache D:\rubbish\zhongjian\caches\node
+```sh
+git clone https://github.com/lboverfys/mcp-cccx-together.git
+cd mcp-cccx-together
+npm ci --omit=optional
+node src/cli.mjs doctor
+node src/cli.mjs setup
 ```
 
-依赖保存在项目的 `node_modules`，上面的命令仅为本次安装指定 npm 缓存目录，不修改全局配置。依赖版本已锁定；省略可选依赖和安装脚本，是为了复用已有 CC 可执行文件，避免另外下载平台二进制。本项目没有编译步骤。
+也可以下载仓库 ZIP，解压后在目录内执行后三条命令。保留安装目录供 Codex 启动服务；移动目录后重新注册。
 
-### 3. 配置本机路径
+### 其他 MCP 客户端
 
-首次使用时复制示例，再用编辑器修改 `team.config.json`：
+运行以下命令生成带有本机绝对路径的 MCP JSON 配置：
 
-```powershell
-Copy-Item .\team.config.example.json .\team.config.json
+```sh
+cc-team-mcp print-config
 ```
 
-示例中的路径只是占位，必须换成自己机器上的绝对路径：
+将输出的 `mcpServers.cc_team` 配置加入客户端的本地 MCP 设置。服务通过标准输入输出通信，不需要开放网络端口。Codex 的配置说明见[官方 MCP 文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
 
-| 字段 | 用途 |
-| --- | --- |
-| `claudeExecutable` | 已有的原生 `claude.exe` 文件 |
-| `codexExecutable` | 已有的原生 `codex.exe` 文件，用于启动主控及投递通知 |
-| `stateDir` | 团队元数据、事件和锁文件的保存目录 |
-| `tempDir` | 本项目启动的 CC 工作者使用的临时目录 |
+## 使用
 
-可以用下面的命令检查当前入口：
+连接成功后，直接向 Codex 描述任务，例如：
 
-```powershell
-Get-Command node, claude, codex -All | Select-Object Name, Source
-```
+> 使用 cc_team 帮我实现登录功能。先检查项目约束，将接口和页面拆成不同工作范围。你负责协调和验收，工作者完成后检查实际改动与测试，最后关闭工作进程并保留会话。
 
-如果 `claude` 或 `codex` 指向 `.ps1` / `.cmd` 包装器，请找到其对应安装目录里的原生 `.exe`，不要把包装器填入配置。通过 npm 安装的客户端，其原生文件可能位于对应包的 `bin` 或平台包的 `vendor` 目录中，具体以实际安装结构为准。
+Codex 会按以下流程协作：
 
-配置不要求填写 API 密钥。CC 继续使用现有用户、项目及本地设置和当前环境中的模型配置；身份、授权和会话记录仍保存在 CC 自己的标准位置。
+1. `team_open` 创建团队，传入项目约束，并记录返回的 `teamId`。
+2. `team_dispatch` 批量提交任务，为工作者指定名字、项目绝对路径、任务、文件范围和依赖。
+3. 持续调用 `team_events` 等待进度；工作者提问或申请工具权限时，读取请求并通过 `team_reply` 回答。
+4. 根据需要使用 `team_send` 追加指令、`team_interrupt` 中断当前轮次。
+5. 通过 `team_result` 读取完整交付，检查实际文件改动与验证结果后，用 `team_review` 传入对应 `resultId`，记录验收和交接结论。结果在审批期间变化时会拒绝验收，避免放行错误轮次。
+6. `team_close` 或 `team_shutdown` 关闭执行进程，保留记录。
 
-`team.config.json`、`.codex/config.toml`、`node_modules` 及默认运行状态目录已被 Git 忽略。若把状态目录改到项目内的其他位置，请相应排除它。任务文本、模型输出和 stderr 可能进入状态记录，应按任务内容决定其保密与保留方式。
+工作者使用简短的职责名，例如 `接口开发cc`、`页面布局cc`、`验证cc`。名字在同一团队中唯一，包含 `cc` 后缀最多十个字符；后续操作可以直接使用完整名字。
 
-### 4. 启动带团队工具的 Codex
+### 自动调度与交接
 
-将 `-ProjectPath` 指向需要协作的项目：
-
-```powershell
-& 'D:\projects\mcp-cccx-together\Start-TeamCodex.ps1' -ProjectPath 'D:\projects\your-project'
-```
-
-启动器从当前终端查找 Node，通过命令行参数为**本次 Codex** 配置 `cc_team`，不改用户级 Codex 配置、PATH 或模型设置。无需把 MCP 文件复制到目标项目。
-
-进入 Codex 后，用 `/mcp` 检查 `cc_team` 连接。已打开的旧 Codex 对话不会因此自动加载此 MCP，请从启动器进入新会话。
-
-启动器会把当前环境中的模型提供商及代理变量名加入 MCP 环境白名单，不打印或保存它们的值。需要环境变量的模型配置应在运行启动器的终端中先准备好。
-
-## 怎样安排任务
-
-直接在 Codex 中说：
-
-> 按刚才的方案开三个 CC：计划功能cc 只读分析方案，接口实现cc 修改 src/api，布局实现cc 修改 src/ui。先完成方案，再并行实施。你负责协调和验收，遇到超出授权的操作问我，完成后关闭进程并保留会话。
-
-后续可以继续说：
-
-> 看看布局实现cc做到哪了。
->
-> 让接口实现cc继续处理刚才发现的问题。
->
-> 关闭计划功能cc，保留会话。
-
-Codex 应先查看状态：工作者仍运行时追加消息，已关闭时恢复原会话。名字会传给 CC 会话并持久保存；同团队内不可重名，已关闭的工作者也保留名字。
-
-名字缺少 `cc` 时自动补齐，末尾 `CC` 统一为小写，不重复追加。**完整名字包含 `cc` 最多十个字符，职责部分最多八个字符。** 后续引用须使用完整名字或 UUID，不按部分名字猜测。
-
-新 Codex 对话若要继续旧团队，需要先用原 `teamId` 打开团队；不同团队不共享名字。`teamId` 默认使用父 Codex 会话 UUID，也可以显式指定。同一团队只允许一个管理进程打开。
-
-## 协作流程与工具
-
-1. Codex 调用 `team_open`，绑定当前主会话，传入用户规则、项目约束及验收标准。
-2. 按职责命名并派发任务。默认只读；编辑任务须使用 `access: "write"` 并明确相对路径 `scope`。
-3. 按游标读取事件，处理进度、阻塞问题和权限请求。需要完整请求时先分页读取详情。
-4. 收到成功结果后，检查实际文件差异与验证证据，再记录验收；需要修正则继续追加任务。
-5. 使用结束后关闭工作者或团队。进程退出，会话标识及项目改动保留。
-
-| 工具 | 作用 |
-| --- | --- |
-| `team_open` | 打开或恢复团队，绑定当前 Codex 主会话，本身不启动 CC |
-| `team_dispatch` | 为一个或多个任务启动命名工作者 |
-| `team_status` | 查看名字、任务、状态和待答复请求，可按工作者筛选 |
-| `team_events` | 按游标增量读取事件，可等待最多 25 秒 |
-| `team_send` | 向运行中或待命的工作者追加指令 |
-| `team_request` | 分页读取待答复请求的完整内容 |
-| `team_reply` | 回答问题或处理权限请求 |
-| `team_interrupt` | 请求中断当前轮次，不关闭会话 |
-| `team_resume` | 按保存的 CC 会话标识恢复已关闭的工作者，并发送新指令 |
-| `team_review` | 记录验收结论，通过后不会自动关闭进程 |
-| `team_close` | 关闭指定工作者，保留记录和可恢复会话 |
-| `team_shutdown` | 关闭团队内所有执行进程并释放团队锁 |
-
-工具参数 `workerId` / `workerIds` 均接受完整名字或 UUID，例如：
+例如，一次提交以下任务，`cwd` 替换为项目的绝对路径：
 
 ```json
 {
-  "workerId": "验证cc",
-  "message": "继续验证登录接口"
+  "workers": [
+    { "name": "设计cc", "cwd": "<项目绝对路径>", "prompt": "梳理接口契约和验收条件", "scope": ["src"] },
+    { "name": "实现cc", "cwd": "<项目绝对路径>", "prompt": "根据已验收设计实现功能", "access": "write", "scope": ["src"], "dependsOn": ["设计cc"] },
+    { "name": "验证cc", "cwd": "<项目绝对路径>", "prompt": "独立检查实现与设计的一致性", "scope": ["src"], "dependsOn": ["实现cc"] }
+  ]
 }
 ```
 
-以上参数用于 `team_resume`；运行中的工作者则使用 `team_send`。阻塞问题必须用 `team_reply` 回答，不能靠追加消息解锁。会话保存的是对话，**不是文件快照**，恢复前应检查工作区现状。
+- 设计完成后先等待主控验收，通过后才启动实现；实现通过后再启动验证。
+- 前置任务的结果摘要和 `team_review.handoff` 随下游任务传入。工作者还可以用内部 `read_dependency` 工具分页读取其已声明依赖的完整交付。
+- 前置任务失败或被取消时，下游显示阻塞原因。主控修复、重新验收后，队列继续推进。
+- `team_open.maxConcurrent` 控制同时存活的 CC 进程，新团队默认 4。等待中的任务不启动模型；已验收的空闲进程会在排队任务需要容量或工作范围时关闭，保留会话供继续使用。
+- 需要修改已验收结果时，向原工作者追加任务或恢复原会话，并在新一轮完成后重新验收。
+- 每轮任务绑定具体的前置结果版本，分页读取期间保持一致。上游产生新版后，使用旧版交付的下游会显示 `staleDependencies`；更新并重新验收这条依赖链后，后续任务才继续。
 
-### 进度和主动通知
+`team_status` 显示依赖、排队原因、后台任务、最近交付和验收记录，`acceptedCurrent` 表示当前整条依赖链的验收是否有效。完整结果单独保存，事件窗口滚动后仍可通过 `team_result` 读取。
 
-每个 CC 都有 `report_progress` 和 `ask_parent` 工具。进度、工具活动、请求、结果和退出状态进入带游标的事件记录。
+### 并行范围与权限
 
-绑定有效的父 Codex 会话 UUID 后，MCP 使用原生 `codex queue` 投递通知：普通进度最多每 30 秒合并推送一次，阻塞和结果尽快合并推送。通知入队**不等于主控已读，也不保证立即唤醒**。`team_status.notificationDelivery` 及 `notification_delivery` 事件记录投递结果；主控仍应持续用 `team_events` 补读。
+- 默认 `access: "read"`，只提供读取、搜索和问答工具。
+- 修改任务使用 `access: "write"`，指定相对于 `cwd` 的 `scope`，例如 `["src/api", "test/api"]`。范围表示路径或目录，不是 glob 表达式。
+- 存在写入的重叠范围需要显式依赖来串行执行；没有先后依赖时整批拒绝。独立任务可拆分目录或使用独立工作区，只读任务可以共享范围。
+- `scope` 用于调度冲突检查。工具授权由 Claude Code 的权限机制及主控答复控制；需要操作系统级隔离时，使用独立工作区和宿主提供的沙箱。
+- 工作者先读取项目的 `AGENTS.md` / `CLAUDE.md`，遵循主控提供的约束；默认禁用继承的 hooks、额外 MCP 和再委派工具。内部依赖读取只允许访问已经声明且通过主控验收的前置任务。
+- `allowedTools` 可为已授权的工作提供 Claude Code 工具规则。其余待授权工具通过 `team_reply` 显式允许或拒绝。
 
-没有父会话 UUID 时，仍可派发任务、读取事件，只是不主动推送。事件最近保留 2000 条，每次最多读取 200 条；`gap: true` 表示较旧事件已截断，应同时查看当前状态。使用 `nextCursor` 继续读取，避免高频空轮询。
+### 恢复工作
 
-### 权限和执行边界
+在新对话中要求 Codex 先调用 `team_list`，按工作者名字和项目目录摘要查找历史团队，再用原 `teamId` 调用 `team_open`。随后按名字使用 `team_resume`，例如：
 
-- `read` 工作者仅提供 Read、Glob、Grep、AskUserQuestion 及团队工具，不提供内置写文件或终端工具。
-- `write` 工作者遵循现有 CC 权限规则，需要审批的操作回传主控。`allowedTools` 仅应用于已经获得用户授权的操作；桥接不提供绕过权限模式。
-- `scope` 是**并行调度冲突检查，不是文件系统沙箱**。实际范围重叠且涉及写任务时拒绝并发派发；多个只读任务可以重叠。并行修改同一范围，应先准备独立工作区。
-- 子 Agent 的报告是工具输出，不能当成用户新指令或新增授权。Git 提交、推送、部署等操作仍由主控依据用户授权安排。
-- 工作者沿用 user/project/local 设置，只加载本次团队 MCP，禁用普通 hooks、statusLine 及 Agent/Task/Workflow 再委派工具。这些是子进程选项，不改原 CC 配置；企业托管策略和必要鉴权辅助程序仍由 CC 管理。
-- `team_interrupt` 不保证清除已经排队的消息；需要完全停止工作者时使用 `team_close`。
+> 打开之前的团队，让“接口开发cc”继续完善错误处理，保留原来的项目约束。
 
-## 开发与验证
+恢复需要保留 MCP 状态目录和 Claude Code 自身的会话记录。团队约束、并发设置、依赖与验收随状态保存；显式传入新的 `constraints` 更新团队约束，后续派发、恢复或向运行中工作者 `team_send` 时带入新要求。取消后尚未启动的任务也可通过原名字 `team_resume` 重新排队。
 
-项目采用 Node.js 原生测试运行器，没有编译步骤。离线测试不调用真实模型，当前测试夹具要求临时目录位于 D 盘。可在 PowerShell 7 中运行：
+### 控制模型用量
 
-```powershell
-$testTemp = Join-Path 'D:\rubbish\zhongjian\temp\mcp-cccx-together' ('tests-' + [guid]::NewGuid())
-New-Item -ItemType Directory -Path $testTemp | Out-Null
-$previousTemp = $env:TEMP
-$previousTmp = $env:TMP
-try {
-    $env:TEMP = $testTemp
-    $env:TMP = $testTemp
-    npm run check
-    if ($LASTEXITCODE -ne 0) { throw '语法检查失败' }
-    npm test
-    if ($LASTEXITCODE -ne 0) { throw '离线测试失败' }
-} finally {
-    $env:TEMP = $previousTemp
-    $env:TMP = $previousTmp
-}
+每个任务可以指定 `maxTurns` 和 `maxBudgetUsd`，交由 Claude Agent SDK 限制轮次和本次运行的预算。例如为一个小型排查任务设置 `maxTurns: 8`。额度耗尽、中断和执行失败分别记录为对应结果，主控据此决定缩小任务或恢复执行。
+
+`costUsd` 和 `modelUsage` 是 SDK 的累计估算值，应读取最新一条，而不是逐结果相加；恢复后的结果可能包含历史用量。恢复新进程会开始新一次预算周期。并发限制、依赖排队和按需读取交付，可以减少无效启动与反复复制上下文。
+
+## 配置
+
+常规安装无需配置文件。服务自动查找 PATH 及 Claude Code 的常见安装位置。需要指定路径时，复制 `team.config.example.json` 并添加相应字段：
+
+| 字段 | 用途 |
+| --- | --- |
+| `claudeExecutable` | Claude Code 原生可执行文件或受支持的 JavaScript 入口绝对路径 |
+| `codexExecutable` | `setup` 和可选通知使用的 Codex 入口；只使用 MCP 轮询时可省略 |
+| `stateDir` | 团队、工作者与事件记录目录 |
+| `tempDir` | 工作者临时文件根目录 |
+| `notificationMode` | `poll`（默认）或 `codex-queue` |
+
+```sh
+cc-team-mcp doctor --config /absolute/path/team.config.json
+cc-team-mcp setup --config /absolute/path/team.config.json
 ```
 
-测试覆盖任务派发、命名、范围冲突、权限问答、通知、状态保存、关闭与恢复；包括以模拟工作者验证超过 16 个工作者的批量派发，以及继续增加到 32 个的流程。
+Windows 同样使用绝对路径，例如 `C:/tools/cc-team/team.config.json`。路径中有空格时加引号。
 
-可选真实联调：
+支持环境变量 `CC_TEAM_CONFIG`、`CC_TEAM_CLAUDE_EXECUTABLE`、`CC_TEAM_CODEX_EXECUTABLE`、`CC_TEAM_STATE_DIR`、`CC_TEAM_TEMP_DIR`、`CC_TEAM_NOTIFICATION_MODE`。显式 `--config` 优先于 `CC_TEAM_CONFIG`；各字段环境变量覆盖配置文件。源码目录原有的 `team.config.json` 继续兼容。
 
-```powershell
-node scripts/smoke-live.mjs
+默认状态目录使用平台的用户数据目录；默认临时目录使用系统临时目录下的 `cc-team-mcp`。`doctor` 显示当前实际路径，检查入口而不启动模型。状态和临时目录可分别覆盖，适用于自定义磁盘布局。
+
+### 模型配置和环境变量
+
+Claude Code 读取已有的用户、项目与本地设置，模型和鉴权按原配置运行。MCP 不保存额外的模型密钥。`worker.model` 仅在任务明确需要时覆盖模型。
+
+如果模型服务或代理只通过终端环境变量配置，需要让 MCP 客户端转发这些变量。Codex 可在对应 `[mcp_servers.cc_team]` 配置中添加变量名，例如：
+
+```toml
+env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
 ```
 
-此脚本读取本机 `team.config.json`，启动两个只读 CC 任务，验证汇报、提问、追加消息、关闭和恢复，**会使用已有模型服务并产生实际请求费用**。脚本当前将测试状态保存在 `D:\rubbish\zhongjian\temp\mcp-cccx-together\smoke-*`，结束后关闭本次 MCP 与 CC 进程，并保留诊断记录。显式加 `--notify` 时，还会向当前 `CODEX_THREAD_ID` 对应的 Codex 会话投递一次测试通知。
+按实际使用的提供商补充变量名，例如 AWS 或 Vertex 配置。凭据值保留在环境或 Claude Code 原有设置中。
 
-## 常见问题
+### 进度通知
 
-**能换成 DeepSeek 或其他模型吗？**
+默认使用 `team_events` 长轮询，每次最多等待 25 秒。Codex 应持续读取到任务结束，及时回答权限请求和问题。事件返回 `nextCursor`；出现 `gap` 时，同时检查 `team_status` 获取当前状态。
 
-桥接不固定模型。只要你的 Codex、Claude Code 已经能够使用对应模型正常完成任务，就会沿用其配置；模型服务是否兼容客户端工具调用，需要自行验证。也可在派发时通过 `model` 覆盖单个工作者的模型名，不会自动切换或兜底到另一模型。
+支持 `codex queue --thread ... --message ... --resume` 的客户端可以选择 `notificationMode: "codex-queue"`，并在 `team_open` 中提供主会话完整 UUID。通知仅发送摘要，完整内容通过事件工具读取；投递状态显示在 `team_status.notificationDelivery`。此模式是可选增强，安装和标准工作流使用默认轮询即可。
 
-**为什么没有收到进度通知？**
+## 工具参考
 
-检查 `team_status.notificationDelivery`、父会话 UUID 和本机 Codex daemon 状态。队列命令成功不等于主控已被唤醒，使用 `team_events` 补读；子工作者也需要主动调用汇报工具。
+| 工具 | 用途 |
+| --- | --- |
+| `team_list` | 分页查找保存的团队 |
+| `team_open` | 创建或恢复团队，设置约束 |
+| `team_dispatch` | 批量启动工作者并派发任务 |
+| `team_status` | 查询状态、进程 ID 和待答复请求 |
+| `team_events` | 按游标读取进度、问题及结果，支持等待和筛选 |
+| `team_request` | 分页读取完整的待答复请求 |
+| `team_result` | 分页读取完整交付，支持最近一轮或历史结果 ID |
+| `team_reply` | 回答问题或允许、拒绝工具操作 |
+| `team_send` | 追加指令 |
+| `team_interrupt` | 中断当前轮次 |
+| `team_resume` | 恢复原工作者会话 |
+| `team_review` | 记录主控验收 |
+| `team_close` | 批量关闭指定工作者并保留会话 |
+| `team_shutdown` | 关闭全部工作者并释放团队锁 |
 
-**为什么工作者不能并行启动？**
+`result` 事件包含摘要、完整结果 ID，以及 SDK 提供的用量、费用、轮次和耗时。成功交付进入待验收状态，中断和后台继续运行的结果保持各自状态。每位工作者最多有 32 条待处理消息；事件保留最近 2000 条。每份完整交付最多 8 MiB，大型产物应保存为项目文件并返回路径。
 
-检查 `scope` 是否重叠。没有人数上限，不代表可以同时写同一范围。拆分任务范围、按顺序执行，或使用独立工作区。
+`team_result` 和内部 `read_dependency` 返回完整结果 JSON 的 UTF-8 文本片段，使用返回的 `nextOffset` 续读，拼接 `text` 后即可解析。分页按字节读取并保持中文字符完整，避免每一页重复加载整个大结果。
 
-**提示团队已经被锁定怎么办？**
+## 排查问题
 
-先检查该团队 `store.lock` 中记录的 PID 以及工作者的实际运行状态。正常 `team_shutdown` 会释放锁，异常退出的旧锁不会被自动抢占。只有确认原管理器及其工作者不再运行后，才移除该团队的旧锁。不要按进程名批量结束其他任务。
+- **找不到 Claude Code**：先确认 `claude --version` 可运行，再执行 `cc-team-mcp doctor`；必要时指定 `claudeExecutable`。Windows 的任意 `.cmd` 脚本不能直接作为原生入口，标准 npm 安装会自动解析。
+- **Codex 没有发现工具**：检查 `codex mcp list` 和 `/mcp`，确认配置指向现有安装目录，然后重新打开会话。
+- **模型鉴权或网络错误**：先在同一环境独立运行 Claude Code，再检查客户端的环境变量转发和原有模型设置。
+- **工作者停在 `needs_input`**：读取 `team_status` 中的请求，必要时用 `team_request` 获取全文，再调用 `team_reply`。
+- **范围冲突**：关闭已完成的工作者，或拆分重叠目录后重试。
+- **团队已被其他进程持有**：关闭原团队后重试。异常退出留下的锁会显示 PID 和锁路径；确认原进程及其工作者均已结束后，备份并移除该团队的 `store.lock`，再打开团队。保留 `workers.json`、`team.json` 和事件文件。
+- **关闭失败**：查看错误中记录的进程或后台任务，处理后再次关闭。服务会保留未完成收尾的信息。
+- **PowerShell 阻止 npm 脚本**：使用 `npm.cmd` 和 `cc-team-mcp.cmd`，或在已允许脚本的终端执行。
 
-**关闭是否保证所有后台服务都退出？**
+状态文件包含任务内容、进度和工具请求，应放在当前用户可控的目录。停止使用时先关闭团队，再通过 `codex mcp remove cc_team` 移除注册；卸载命令为 `npm uninstall -g cc-team-mcp`，历史状态保留供自行归档。
 
-关闭会先停止该 CC 会话登记的后台任务，再等待 CC 进程退出，两个阶段各最多 10 秒；超时会明确报错。任意 Shell 命令自行脱离 CC 管理启动的服务，仍需主控根据记录的 PID 和端口另行核验。`team_close` 不删除代码改动、事件或 CC 的原生会话记录。
+## 开发与测试
 
-**数量不设上限，是否意味着完全没有资源限制？**
+```sh
+npm ci --omit=optional
+npm run check
+npm test
+npm pack --dry-run
+```
 
-没有固定工作者数量限制，但每个工作者都会消耗进程、内存及模型配额；团队元数据当前有 8 MiB 总量限制，事件和消息也有大小边界。应根据实际资源按需增加，而不是无限创建进程。
+自动化测试覆盖依赖调度、验收交接、完整交付、状态存储、并发范围、问答与权限路由、多轮会话、恢复、通知、CLI 和 stdio 生命周期，**不调用模型服务**。端到端测试通过真实 MCP 服务和真实 Claude Agent SDK 连接本地协议进程，实际执行设计交接、授权后写文件、发现失败、恢复修复及重新验证。CI 在 Windows、macOS、Linux 的 Node.js 22 和 24 上执行。
 
-## 相关文档
+`node scripts/smoke-live.mjs` 是可选的真实 Claude Code 联调，会产生模型用量。它验证两名工作者的汇报、问答、多轮和恢复；`--notify` 额外验证可选通知。该脚本不加入默认测试或 CI。
 
-- [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/typescript)
-- [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
-- [Codex queue](https://learn.chatgpt.com/docs/developer-commands?surface=cli#codex-queue)
+测试使用系统临时目录，可通过进程级 `TEMP`、`TMP`、`TMPDIR` 指定位置。运行期间创建的测试目录在收尾时清理；真实联调保留任务状态用于检查。

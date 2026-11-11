@@ -3,12 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { Store } from '../src/store.mjs';
 
-const tempRoot = process.env.TEMP || process.env.TMP;
-if (!tempRoot || !/^D:[\\/]/i.test(path.resolve(tempRoot))) {
-  throw new Error('测试要求 TEMP 或 TMP 指向 D 盘任务临时目录');
-}
+const tempRoot = process.env.TEMP || process.env.TMP || tmpdir();
 
 async function fixture(t) {
   const dir = mkdtempSync(path.join(tempRoot, 'store-test-'));
@@ -138,4 +136,19 @@ test('超大事件拒绝写入，不消耗游标；损坏尾行不静默丢弃',
   writeFileSync(store.eventsPath, '{"cursor":3', { flag: 'a' });
   await assert.rejects(new Store(f.dir).init(), /尾行不完整/);
   assert.equal(existsSync(store.lockPath), false);
+});
+
+test('团队元数据原子保存并跨重启保留，读取返回副本', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  assert.deepEqual(store.loadTeam(), {});
+  store.saveTeam({ constraints: '保留用户已有修改', updatedAt: '2026-11-12' });
+  const copy = store.loadTeam();
+  copy.constraints = '被调用者更改';
+  assert.equal(store.loadTeam().constraints, '保留用户已有修改');
+  assert.throws(() => store.saveTeam({ constraints: '字'.repeat(50000) }), /128 KiB/);
+  assert.equal(store.loadTeam().constraints, '保留用户已有修改');
+  store.close();
+  const restored = await f.create();
+  assert.equal(restored.loadTeam().constraints, '保留用户已有修改');
 });

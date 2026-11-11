@@ -19,7 +19,9 @@ function eventSummary(event) {
   switch (event.type) {
     case 'progress': return shortText(event.data?.summary || '有新的阶段进展', 240);
     case 'request': return '需要主控答复；请读取原始请求';
-    case 'result': return event.data?.success === false ? '本轮执行失败，请检查结果' : '本轮执行结束，等待主控验收';
+    case 'result': return event.data?.interrupted ? '当前轮次已中断，请检查排队消息'
+      : event.data?.background ? '任务在后台继续执行，请检查进展'
+      : event.data?.success === false ? '本轮执行失败，请检查结果' : '本轮执行结束，等待主控验收';
     case 'failed': return '工作者执行失败，请检查事件';
     case 'closed': return '工作者进程已关闭；会话是否可恢复请查状态';
     default: return '';
@@ -28,7 +30,7 @@ function eventSummary(event) {
 
 /** 将工具事件提示投递到 Codex；入队不代表模型已读取或会话已唤醒。 */
 export class CodexNotifier {
-  constructor({ command = process.execPath, args = [], threadId, cwd, resume = false,
+  constructor({ command, args = [], threadId, cwd, resume = false,
     intervalMs = 30_000, onDelivery, execFileImpl = execFile } = {}) {
     this.command = command;
     this.args = [...args];
@@ -57,7 +59,7 @@ export class CodexNotifier {
       this.clearTimer();
       this.nextProgressAt = 0;
     }
-    this.threadId = threadId || undefined;
+    this.threadId = this.command ? threadId || undefined : undefined;
     return this.threadId;
   }
 
@@ -161,6 +163,7 @@ export class CodexNotifier {
         shell: false,
         windowsHide: true,
         timeout: 10_000,
+        killSignal: 'SIGKILL',
         maxBuffer: 32 * 1024,
         encoding: 'utf8',
       }, complete);
@@ -178,7 +181,20 @@ export class CodexNotifier {
     if (operation) {
       operation.cancelled = true;
       if (!alreadyClosed) operation.child?.kill('SIGTERM');
-      await operation.done;
+      let forceTimer;
+      let deadline;
+      try {
+        await Promise.race([
+          operation.done,
+          new Promise((_, reject) => {
+            forceTimer = setTimeout(() => operation.child?.kill('SIGKILL'), 2000);
+            deadline = setTimeout(() => reject(new Error(`通知进程关闭超时，PID：${operation.child?.pid ?? '未知'}`)), 10_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(forceTimer);
+        clearTimeout(deadline);
+      }
     }
   }
 }

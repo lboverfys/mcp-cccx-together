@@ -2,12 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { TeamManager } from '../src/manager.mjs';
 
-const tempRoot = process.env.TEMP || process.env.TMP;
-if (!tempRoot || !/^D:[\\/]/i.test(path.resolve(tempRoot))) {
-  throw new Error('测试要求 TEMP 或 TMP 指向 D 盘任务临时目录');
-}
+const tempRoot = realpathSync(process.env.TEMP || process.env.TMP || tmpdir());
 
 function deferred() {
   let resolve;
@@ -388,4 +386,561 @@ test('请求事件写入失败时清理请求和取消监听，恢复原状态',
   abort.abort();
   assert.deepEqual((await manager.events({ after: lastCursor })).events, []);
   assert.equal(manager.status().workers[0].requests.length, 0);
+});
+
+test('通知关闭失败仍会关闭工作者，保留锁直到全部收尾成功', async t => {
+  const f = await fixture(t);
+  let notificationFailure = true;
+  const manager = await f.create({ notifier: {
+    notify() {},
+    close() { if (notificationFailure) throw new Error('模拟通知关闭失败'); },
+  } });
+  manager.dispatch([f.spec('A'), f.spec('B')]);
+  await assert.rejects(manager.close(), /通知进程未能关闭/);
+  assert.ok(f.controllers.every(controller => controller.closeCalls === 1));
+  assert.ok(manager.status().workers.every(worker => worker.status === 'closed'));
+  await assert.rejects(new TeamManager({ config: f.config, teamId: 'test-team' }).init(), /正被进程/);
+  notificationFailure = false;
+  await manager.close();
+  await f.create();
+});
+
+test('问题空白答复保持请求有效，主控可以重新回答', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  manager.dispatch([f.spec('A')]);
+  const waiting = f.controllers[0].request('question', { questions: [{ question: '目标目录？' }] });
+  const requestId = manager.status().workers[0].requests[0].id;
+  for (const answer of [{ text: '   ' }, { answers: {} }, { answers: { '目标目录？': ' \n' } }]) {
+    assert.throws(() => manager.reply(requestId, answer), /非空/);
+    assert.equal(manager.status().workers[0].requests[0].id, requestId);
+  }
+  manager.reply(requestId, { text: 'workspace' });
+  assert.deepEqual(await waiting, { text: 'workspace' });
+});
+
+test('进程退出时清空待处理消息，保留会话以便恢复', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A')]);
+  f.controllers[0].emit('session', { sessionId: 'session-a' });
+  manager.send(worker.id, '后续任务');
+  f.controllers[0].finished.resolve();
+  await tick();
+  const status = manager.status().workers[0];
+  assert.equal(status.status, 'stopped');
+  assert.equal(status.pendingMessages, 0);
+  assert.equal(status.sessionId, 'session-a');
+});
+
+test('团队约束持久保存，更新约束后恢复工作者使用当前约束和原补充要求', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ constraints: '只读检查，不安装依赖' });
+  const [worker] = manager.dispatch([f.spec('A', { instructions: '优先检查服务入口' })]);
+  f.controllers[0].emit('session', { sessionId: 'session-a' });
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal(reopened.constraints, '只读检查，不安装依赖');
+  reopened.updateConstraints('允许修改入口，不安装依赖');
+  reopened.resume(worker.id, '继续');
+  const prompt = f.controllers[1].options.worker.instructions;
+  assert.match(prompt, /允许修改入口，不安装依赖/);
+  assert.match(prompt, /优先检查服务入口/);
+  assert.doesNotMatch(prompt, /只读检查，不安装依赖/);
+  assert.doesNotMatch(prompt, /D 盘/);
+  await reopened.close();
+  const cleared = await f.create({ constraints: '' });
+  assert.equal(cleared.constraints, '');
+});
+
+test('恢复时重新解析范围，目录联接改变后的重叠会被拒绝', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const link = path.join(f.cwd, 'current');
+  symlinkSync(path.join(f.cwd, 'front'), link, 'junction');
+  try {
+    const [first] = manager.dispatch([f.spec('A', { access: 'write', scope: ['current'] })]);
+    f.controllers[0].emit('session', { sessionId: 'session-a' });
+    await manager.closeWorker(first.id);
+    unlinkSync(link);
+    symlinkSync(path.join(f.cwd, 'back'), link, 'junction');
+    manager.dispatch([f.spec('B', { access: 'write', scope: ['back'] })]);
+    assert.throws(() => manager.resume(first.id, '继续'), /冲突/);
+    assert.equal(f.controllers.length, 2);
+  } finally {
+    assert.ok(lstatSync(link).isSymbolicLink());
+    unlinkSync(link);
+  }
+});
+
+test('异常停止记录的 PID 仍存活时阻止重复启动', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A', { access: 'write', scope: ['front'] })]);
+  f.controllers[0].emit('session', { sessionId: 'session-a' });
+  f.controllers[0].finished.resolve();
+  await tick();
+  manager.get(worker.id).data.lastPid = process.pid;
+  assert.throws(() => manager.resume(worker.id, '继续'), /PID.*仍存活/);
+  assert.throws(() => manager.dispatch([f.spec('B', { access: 'write', scope: ['front'] })]), /冲突/);
+  await assert.rejects(manager.closeWorker(worker.id), /PID.*仍存活/);
+  await assert.rejects(manager.close(), /未能关闭/);
+  assert.equal(manager.get(worker.id).data.status, 'stopped');
+  assert.equal(f.controllers.length, 1);
+  manager.get(worker.id).data.lastPid = undefined;
+});
+
+test('旧版工作者恢复时保留历史补充要求并附加当前团队约束', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A')]);
+  const data = manager.get(worker.id).data;
+  delete data.taskInstructions;
+  data.instructions = '旧版通用指令\n主控提供的任务约束：\n旧的团队要求\n保留自定义检查点';
+  f.controllers[0].emit('session', { sessionId: 'session-a' });
+  await manager.closeWorker(worker.id);
+  manager.updateConstraints('新的团队要求');
+  manager.resume(worker.id, '继续');
+  const prompt = f.controllers[1].options.worker.instructions;
+  assert.match(prompt, /保留自定义检查点/);
+  assert.match(prompt, /当前约束为准）：\n新的团队要求/);
+  assert.doesNotMatch(prompt, /旧版通用指令/);
+});
+
+test('其他轮次结果到达时仍保留未回答请求的阻塞状态', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A')]);
+  manager.send(worker.id, '后续消息');
+  const controller = f.controllers[0];
+  const waiting = controller.request('question', { questions: [{ question: '继续吗？' }] });
+  controller.emit('result', { success: true, messageIds: [controller.sent[0].messageId], text: '首轮完成' });
+  assert.equal(manager.status().workers[0].status, 'needs_input');
+  const requestId = manager.status().workers[0].requests[0].id;
+  manager.reply(requestId, { text: '继续' });
+  await waiting;
+  assert.equal(manager.status().workers[0].status, 'running');
+});
+
+test('初始化期间写入失败会释放状态锁，可重试打开', async t => {
+  const f = await fixture(t);
+  const manager = new TeamManager({ config: f.config, teamId: 'test-team', constraints: '约束' });
+  manager.store.saveTeam = () => { throw new Error('模拟写入失败'); };
+  await assert.rejects(manager.init(), /模拟写入失败/);
+  await f.create();
+});
+
+test('默认最多四个真实工作进程，验收后按需关闭待命进程并自动启动队列', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const workers = manager.dispatch(Array.from({ length: 6 }, (_, i) => f.spec(`任务${i}`)));
+  assert.equal(manager.maxConcurrent, 4);
+  assert.equal(f.controllers.length, 4);
+  assert.deepEqual(workers.map(worker => worker.status), ['running', 'running', 'running', 'running', 'queued', 'queued']);
+  assert.equal(manager.status().queuedCount, 2);
+  assert.equal(manager.status().workers[4].queueReason, 'waiting_capacity');
+  const first = f.controllers[0];
+  first.emit('result', { success: true, text: '完成', sessionId: 'session-first' });
+  assert.equal(f.controllers.length, 4);
+  manager.review(workers[0].id, true, '检查通过');
+  await tick();
+  assert.equal(first.closeCalls, 1);
+  assert.equal(f.controllers.length, 5);
+  assert.equal(manager.status().runningCount, 4);
+  assert.equal(manager.status().queuedCount, 1);
+  assert.equal(manager.get(workers[0].id).data.status, 'closed');
+  assert.equal(manager.get(workers[0].id).data.sessionId, 'session-first');
+});
+
+test('并发上限持久化，可提高容量；降低容量等待现有工作退出', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  manager.dispatch([f.spec('A'), f.spec('B'), f.spec('C')]);
+  assert.equal(f.controllers.length, 1);
+  manager.updateMaxConcurrent(2);
+  assert.equal(f.controllers.length, 2);
+  manager.updateMaxConcurrent(1);
+  assert.equal(manager.status().runningCount, 2);
+  assert.equal(manager.status().queuedCount, 1);
+  assert.throws(() => manager.updateMaxConcurrent(0), /正整数/);
+  await manager.close();
+  const restored = await f.create();
+  assert.equal(restored.maxConcurrent, 1);
+  assert.equal(f.controllers.length, 2);
+  assert.ok(restored.status().workers.every(worker => worker.status === 'closed'));
+});
+
+test('同批前置任务验收后自动串行启动重叠范围，并交接完整结果', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [design, implement, verify] = manager.dispatch([
+    f.spec('设计', { access: 'write', scope: ['front'] }),
+    f.spec('实现', { access: 'write', scope: ['front'], dependsOn: ['设计'] }),
+    f.spec('验证', { scope: ['front'], dependsOn: ['实现'] }),
+  ]);
+  assert.equal(f.controllers.length, 1);
+  assert.equal(manager.get(implement.id).data.queueReason, 'waiting_dependencies');
+  const completeText = '设计详细说明'.repeat(2000);
+  f.controllers[0].emit('result', { success: true, text: completeText, sessionId: 'design-session' });
+  assert.equal(f.controllers.length, 1);
+  manager.review(design.id, true, '接口设计已核对', '保持错误码 E_AUTH');
+  await tick();
+  assert.equal(f.controllers.length, 2);
+  const developer = f.controllers[1];
+  assert.match(developer.options.worker.instructions, /保持错误码 E_AUTH/);
+  assert.match(developer.options.worker.instructions, /接口设计已核对/);
+  let text = '', offset = 0;
+  for (;;) {
+    const page = developer.options.readDependency('设计', offset, 4000);
+    text += page.text;
+    offset = page.nextOffset;
+    if (!page.hasMore) break;
+  }
+  assert.equal(JSON.parse(text).text, completeText);
+  assert.throws(() => developer.options.readDependency('验证'), /声明的前置依赖/);
+  const event = (await manager.events()).events.find(event => event.type === 'result');
+  assert.ok(event.data.text.length <= 2000);
+  assert.equal(event.data.resultId, manager.get(design.id).data.lastResult.resultId);
+  developer.emit('result', { success: true, text: '实现完成', sessionId: 'implement-session' });
+  manager.review(implement.id, true, '实现通过');
+  await tick();
+  assert.equal(f.controllers.length, 3);
+  assert.equal(manager.get(verify.id).data.status, 'running');
+  assert.ok(f.controllers.slice(0, 2).every(controller => controller.closeCalls === 1));
+});
+
+test('依赖可前向引用且循环、缺失依赖和无序写冲突整批拒绝', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  for (const specs of [
+    [f.spec('A', { dependsOn: ['A'] })],
+    [f.spec('A', { dependsOn: ['B'] }), f.spec('B', { dependsOn: ['A'] })],
+    [f.spec('A', { dependsOn: ['不存在'] })],
+    [f.spec('A', { access: 'write' }), f.spec('B', { access: 'write' })],
+  ]) {
+    assert.throws(() => manager.dispatch(specs), /循环|未找到|冲突/);
+    assert.equal(manager.workers.size, 0);
+    assert.equal(manager.store.listWorkers().length, 0);
+    assert.equal(f.controllers.length, 0);
+  }
+  const [second, first] = manager.dispatch([
+    f.spec('后执行', { access: 'write', dependsOn: ['先执行'] }),
+    f.spec('先执行', { access: 'write' }),
+  ]);
+  assert.equal(manager.get(second.id).data.status, 'queued');
+  assert.equal(manager.get(first.id).data.status, 'running');
+});
+
+test('共同前置任务不允许两个同范围后继并发写，显式传递链可以串行', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  assert.throws(() => manager.dispatch([
+    f.spec('A', { access: 'write', scope: ['front'] }),
+    f.spec('B', { access: 'write', scope: ['front'], dependsOn: ['A'] }),
+    f.spec('C', { access: 'write', scope: ['front'], dependsOn: ['A'] }),
+  ]), /冲突/);
+  const workers = manager.dispatch([
+    f.spec('A', { access: 'write', scope: ['front'] }),
+    f.spec('B', { scope: ['back'], dependsOn: ['A'] }),
+    f.spec('C', { access: 'write', scope: ['front/nested'], dependsOn: ['B'] }),
+  ]);
+  assert.equal(workers.length, 3);
+  assert.equal(f.controllers.length, 1);
+});
+
+test('依赖失败与拒绝验收显示阻塞，修复通过后下游自动继续', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })]);
+  f.controllers[0].emit('result', { success: false, text: '测试失败' });
+  assert.equal(manager.get(b.id).data.status, 'blocked');
+  assert.equal(manager.get(b.id).data.blockedBy[0].error, '测试失败');
+  manager.send(a.id, '修复测试');
+  assert.equal(manager.get(b.id).data.status, 'queued');
+  f.controllers[0].emit('result', { success: true, text: '修复完成' });
+  manager.review(a.id, false, '遗漏边界');
+  assert.equal(manager.get(b.id).data.status, 'blocked');
+  manager.send(a.id, '补充边界');
+  f.controllers[0].emit('result', { success: true, text: '所有检查通过' });
+  manager.review(a.id, true, '通过');
+  assert.equal(manager.get(b.id).data.status, 'running');
+  assert.equal(f.controllers.length, 2);
+});
+
+test('取消尚未启动任务不会创建进程，原名resume保留原任务并允许重新排队', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [a, b, c] = manager.dispatch([f.spec('A'), f.spec('B'), f.spec('C', { dependsOn: ['B'] })]);
+  await manager.closeWorker(b.id);
+  assert.equal(f.controllers.length, 1);
+  assert.equal(manager.get(c.id).data.status, 'blocked');
+  manager.resume(b.id, '请继续');
+  assert.equal(manager.get(b.id).data.status, 'queued');
+  assert.equal(manager.get(c.id).data.status, 'queued');
+  await manager.closeWorker(a.id);
+  assert.equal(f.controllers.length, 2);
+  assert.match(f.controllers[1].sent[0].text, /执行 B/);
+  assert.match(f.controllers[1].sent[0].text, /请继续/);
+});
+
+test('显式send传入更新后的团队约束，不另开模型轮次并使旧验收失效', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ constraints: '初始约束' });
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '完成' });
+  manager.review(a.id, true, '通过');
+  manager.updateConstraints('禁止写入配置');
+  assert.equal(controller.sent.length, 1);
+  manager.send(a.id, '检查下一项');
+  assert.equal(controller.sent.length, 2);
+  assert.match(controller.sent[1].text, /禁止写入配置/);
+  assert.equal(manager.get(a.id).data.lastReview, undefined);
+  manager.send(a.id, '再补充');
+  assert.equal(controller.sent[2].text, '再补充');
+});
+
+test('中断和后台任务结果不能验收，后台结束后可继续发送任务', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: false, interrupted: true, text: '已中断' });
+  assert.equal(manager.get(a.id).data.status, 'idle');
+  assert.throws(() => manager.review(a.id, true, '不应通过'), /待验收/);
+  assert.equal(manager.get(b.id).data.status, 'queued');
+  manager.send(a.id, '继续');
+  controller.emit('background_tasks', { tasks: [{ task_id: 'task-1' }] });
+  controller.emit('result', { success: false, background: true, text: '后台继续' });
+  assert.equal(manager.get(a.id).data.status, 'running');
+  assert.throws(() => manager.review(a.id, true, '不应通过'), /待验收/);
+  controller.emit('background_tasks', { tasks: [] });
+  assert.equal(manager.get(a.id).data.status, 'idle');
+});
+
+test('新会话打开保存的队列只恢复记录，需显式resume再运行', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  const saved = manager.get(b.id).data;
+  manager.store.saveWorker({ ...saved, status: 'queued' });
+  await manager.closeWorker(a.id);
+  await manager.close();
+  // 模拟异常退出前持久化了未启动记录。
+  const reopened = await f.create();
+  reopened.store.saveWorker({ ...saved, status: 'queued', startedAt: undefined, sessionId: null, lastPid: undefined });
+  await reopened.close();
+  const restored = await f.create();
+  assert.equal(restored.get(b.id).data.status, 'stopped');
+  const count = f.controllers.length;
+  assert.equal(restored.status().runningCount, 0);
+  restored.resume(b.id, '恢复排队任务');
+  assert.equal(f.controllers.length, count + 1);
+});
+
+test('成功结果之后进程自然退出仍可验收并释放依赖', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A', { access: 'write' }), f.spec('B', { access: 'write', dependsOn: ['A'] })]);
+  f.controllers[0].emit('result', { success: true, text: '已完成完整交付', sessionId: 'session-a' });
+  f.controllers[0].finished.resolve();
+  await tick();
+  assert.equal(manager.get(a.id).controller, null);
+  assert.equal(manager.get(a.id).data.status, 'awaiting_review');
+  manager.review(a.id, true, '检查通过');
+  assert.equal(manager.get(b.id).data.status, 'running');
+});
+
+test('恢复未启动队列保留断连前已接受的所有追加要求', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  manager.send(b.id, 'IMPORTANT-QUEUED-CHANGE');
+  const saved = JSON.parse(JSON.stringify(manager.get(b.id).data));
+  await manager.close();
+  const writer = await f.create();
+  writer.store.saveWorker(saved);
+  await writer.close();
+  const restored = await f.create();
+  assert.equal(restored.get(b.id).data.queuedMessages.length, 2);
+  restored.resume(b.id, 'CONTINUE');
+  assert.deepEqual(f.controllers.at(-1).sent.map(message => message.text), ['执行 B', 'IMPORTANT-QUEUED-CHANGE', 'CONTINUE']);
+});
+
+test('前置结果分页固定版本，后继空闲新轮次才更新依赖快照', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })]);
+  const firstText = 'OLD-DESIGN-'.repeat(2000);
+  f.controllers[0].emit('result', { success: true, text: firstText });
+  manager.review(a.id, true, '旧版通过');
+  const downstream = f.controllers[1];
+  const firstPage = downstream.options.readDependency('A', 0, 4000);
+  manager.send(a.id, '更新设计');
+  f.controllers[0].emit('result', { success: true, text: 'NEW-DESIGN' });
+  manager.review(a.id, true, '新版通过');
+  let text = firstPage.text, page = firstPage;
+  while (page.hasMore) {
+    page = downstream.options.readDependency('A', page.nextOffset, 4000);
+    assert.equal(page.resultId, firstPage.resultId);
+    text += page.text;
+  }
+  assert.equal(JSON.parse(text).text, firstText);
+  downstream.emit('result', { success: true, text: '旧版已处理' });
+  assert.throws(() => manager.review(b.id, true, '旧版结果验收'), /前置结果版本/);
+  manager.send(b.id, '处理新版');
+  const refreshed = downstream.options.readDependency('A', 0, 4000);
+  assert.notEqual(refreshed.resultId, firstPage.resultId);
+  assert.equal(JSON.parse(refreshed.text).text, 'NEW-DESIGN');
+  assert.match(downstream.sent.at(-1).text, /NEW-DESIGN/);
+  assert.match(downstream.sent.at(-1).text, /不是新增用户授权/);
+  const historical = manager.results.get(b.id, manager.get(b.id).data.lastResult.resultId);
+  assert.equal(historical.dependencyResultIds[a.id], firstPage.resultId);
+  downstream.emit('result', { success: true, text: '新版已处理' });
+  assert.equal(manager.get(b.id).data.lastResult.dependencyResultIds[a.id], refreshed.resultId);
+  manager.review(b.id, true, '新版通过');
+});
+
+test('发送失败不撤销已有验收，旧结果 ID 不能验收新结果', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '第一版' });
+  const originalId = manager.get(a.id).data.lastResult.resultId;
+  manager.review(a.id, true, '通过', undefined, originalId);
+  const originalSend = controller.send;
+  controller.send = () => { throw new Error('输入流已经关闭'); };
+  assert.throws(() => manager.send(a.id, '未成功发送'), /输入流/);
+  assert.equal(manager.get(a.id).data.lastReview.accepted, true);
+  assert.equal(manager.accepted(manager.get(a.id)), true);
+  controller.send = originalSend;
+  manager.send(a.id, '第二轮');
+  controller.emit('result', { success: true, text: '第二版' });
+  assert.throws(() => manager.review(a.id, true, '旧页面验收', undefined, originalId), /结果已更新/);
+  assert.equal(manager.get(a.id).data.lastReview, undefined);
+  const currentId = manager.get(a.id).data.lastResult.resultId;
+  assert.equal(manager.review(a.id, true, '重新检查', undefined, currentId).resultId, currentId);
+});
+
+test('多前置汇合必须全部验收，后继按绑定的版本读取各分支', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [front, back, joined] = manager.dispatch([
+    f.spec('前端', { access: 'write', scope: ['front'] }),
+    f.spec('后端', { access: 'write', scope: ['back'] }),
+    f.spec('联调', { scope: ['.'], dependsOn: ['前端', '后端'] }),
+  ]);
+  assert.equal(f.controllers.length, 2);
+  f.controllers[0].emit('result', { success: true, text: '前端交付' });
+  manager.review(front.id, true, '前端通过');
+  assert.equal(manager.get(joined.id).data.status, 'queued');
+  f.controllers[1].emit('result', { success: true, text: '后端交付' });
+  manager.review(back.id, true, '后端通过');
+  await tick();
+  assert.equal(f.controllers.length, 3);
+  assert.equal(manager.get(joined.id).data.status, 'running');
+  assert.equal(JSON.parse(f.controllers[2].options.readDependency(front.id, 0, 12000).text).text, '前端交付');
+  assert.equal(JSON.parse(f.controllers[2].options.readDependency(back.id, 0, 12000).text).text, '后端交付');
+});
+
+test('成功结果仍有后台任务时保持运行，后台清空后进入待验收', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('background_tasks', { tasks: [{ task_id: 'active-task' }] });
+  controller.emit('result', { success: true, text: '主体已完成' });
+  assert.equal(manager.status().workers[0].status, 'running');
+  assert.equal(manager.status().workers[0].backgroundTasks[0].task_id, 'active-task');
+  assert.throws(() => manager.review(a.id, true, '提前验收'), /待验收/);
+  controller.emit('background_tasks', { tasks: [] });
+  assert.equal(manager.get(a.id).data.status, 'awaiting_review');
+  manager.review(a.id, true, '全部结束');
+});
+
+test('排队期间联接目标变化显示明确冲突，追加已运行任务也重新检查实际范围', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const link = path.join(f.cwd, 'selected');
+  symlinkSync(path.join(f.cwd, 'front'), link, 'junction');
+  try {
+    const [a, b] = manager.dispatch([
+      f.spec('A', { access: 'write', scope: ['back'] }),
+      f.spec('B', { access: 'write', scope: ['selected'] }),
+    ]);
+    unlinkSync(link);
+    symlinkSync(path.join(f.cwd, 'back'), link, 'junction');
+    manager.updateMaxConcurrent(2);
+    assert.equal(manager.get(b.id).data.status, 'blocked');
+    assert.equal(manager.get(b.id).data.queueReason, 'scope_conflict');
+    assert.match(manager.get(b.id).data.error, /冲突/);
+    assert.equal(f.controllers.length, 1);
+    unlinkSync(link);
+    symlinkSync(path.join(f.cwd, 'front'), link, 'junction');
+    manager.updateMaxConcurrent(2);
+    assert.equal(manager.get(b.id).data.status, 'running');
+    unlinkSync(link);
+    symlinkSync(path.join(f.cwd, 'back'), link, 'junction');
+    assert.throws(() => manager.send(b.id, '继续修改'), /冲突/);
+    assert.equal(f.controllers[1].sent.length, 1);
+    assert.equal(manager.get(a.id).data.status, 'running');
+  } finally {
+    assert.ok(lstatSync(link).isSymbolicLink());
+    unlinkSync(link);
+  }
+});
+
+test('迟到进展不会复活待验收或已关闭状态，旧进程事件不能污染恢复后的工作者', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '完成', sessionId: 'session-a' });
+  controller.emit('progress', { summary: '迟到进度' });
+  assert.equal(manager.get(a.id).data.status, 'awaiting_review');
+  manager.review(a.id, true, '通过');
+  controller.emit('activity', { tool: 'Read' });
+  assert.equal(manager.get(a.id).data.status, 'idle');
+  await manager.closeWorker(a.id);
+  controller.emit('progress', { summary: '关闭后进度' });
+  assert.equal(manager.get(a.id).data.status, 'closed');
+  manager.resume(a.id, '新一轮');
+  controller.emit('result', { success: false, text: '旧进程失败' });
+  assert.equal(manager.get(a.id).data.status, 'running');
+  assert.equal(manager.get(a.id).data.error, undefined);
+});
+
+test('前置版本变化使整条旧交付链失效，重新执行并验收后才启动后继', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })]);
+  const ca = f.controllers[0];
+  ca.emit('result', { success: true, text: 'A1', sessionId: 'session-a' });
+  manager.review(a.id, true, 'A1通过');
+  const cb = f.controllers[1];
+  cb.emit('result', { success: true, text: 'B1', sessionId: 'session-b' });
+  manager.review(b.id, true, 'B1通过');
+  await manager.closeWorker(a.id);
+  await manager.closeWorker(b.id);
+  manager.resume(a.id, '更新为A2');
+  f.controllers[2].emit('result', { success: true, text: 'A2', sessionId: 'session-a' });
+  manager.review(a.id, true, 'A2通过');
+  const bStatus = manager.status([b.id]).workers[0];
+  assert.equal(bStatus.lastReview.accepted, true);
+  assert.equal(bStatus.acceptedCurrent, false);
+  assert.equal(bStatus.staleDependencies.length, 1);
+  assert.notEqual(bStatus.staleDependencies[0].expectedResultId, bStatus.staleDependencies[0].currentResultId);
+  const [c, d] = manager.dispatch([f.spec('C', { dependsOn: ['B'] }), f.spec('D', { dependsOn: ['C'] })]);
+  assert.equal(manager.get(c.id).data.status, 'blocked');
+  assert.equal(manager.get(c.id).data.queueReason, 'dependency_stale');
+  assert.equal(manager.get(d.id).data.status, 'blocked');
+  assert.equal(f.controllers.length, 3);
+  manager.resume(b.id, '基于A2重做');
+  f.controllers[3].emit('result', { success: true, text: 'B2', sessionId: 'session-b' });
+  manager.review(b.id, true, 'B2通过');
+  assert.equal(manager.status([b.id]).workers[0].acceptedCurrent, true);
+  assert.equal(manager.get(c.id).data.status, 'running');
+  assert.equal(manager.get(d.id).data.status, 'queued');
+  assert.equal(f.controllers.length, 5);
 });

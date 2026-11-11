@@ -3,15 +3,104 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createTeamServer } from '../src/server.mjs';
+import { TeamManager } from '../src/manager.mjs';
 
-const tempRoot = process.env.TEMP || process.env.TMP;
-if (!tempRoot || !/^D:[\\/]/i.test(path.resolve(tempRoot))) {
-  throw new Error('测试要求 TEMP 或 TMP 指向 D 盘任务临时目录');
-}
+const tempRoot = tmpdir();
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('客户端在团队初始化期间关闭时等待初始化并释放锁', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  const original = TeamManager.prototype.init;
+  let proceed;
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { proceed = resolve; });
+  t.mock.method(TeamManager.prototype, 'init', async function () {
+    entered();
+    await gate;
+    return original.call(this);
+  });
+  const opening = endpoint.call('team_open', { teamId: 'close-during-open', notifications: false });
+  await started;
+  let closed = false;
+  const closing = endpoint.app.close().then(() => { closed = true; });
+  await tick();
+  assert.equal(closed, false);
+  proceed();
+  await Promise.all([opening, closing]);
+  assert.equal(existsSync(path.join(f.config.stateDir, 'close-during-open', 'store.lock')), false);
+  assert.equal((await endpoint.raw('team_open', { teamId: 'late' })).isError, true);
+});
+
+test('默认轮询不启用专属通知，历史团队列表分页且无需先打开团队', async t => {
+  const f = await fixture(t);
+  delete f.config.notificationMode;
+  const endpoint = await f.connect();
+  assert.deepEqual((await endpoint.call('team_list')).teams, []);
+  const opened = await endpoint.call('team_open', { teamId: 'alpha', parentThreadId: randomUUID() });
+  assert.equal(opened.notifications, false);
+  assert.equal(f.notifiers[0].threadId, undefined);
+  await endpoint.call('team_shutdown');
+  await endpoint.call('team_open', { teamId: 'beta' });
+  const first = await endpoint.call('team_list', { limit: 1 });
+  assert.deepEqual(first, { teams: [{ teamId: 'alpha', current: false }], nextOffset: 1, hasMore: true, total: 2 });
+  const second = await endpoint.call('team_list', { offset: first.nextOffset, limit: 1 });
+  assert.deepEqual(second.teams, [{ teamId: 'beta', current: true }]);
+  assert.equal(second.hasMore, false);
+});
+
+test('团队约束跨 shutdown/open 保留，显式空串允许清空', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'constraints', constraints: '只在授权路径工作', notifications: false });
+  await endpoint.call('team_shutdown');
+  const restored = await endpoint.call('team_open', { teamId: 'constraints', notifications: false });
+  assert.equal(restored.constraints, '只在授权路径工作');
+  await endpoint.call('team_dispatch', { workers: [f.spec('审查')] });
+  assert.match(f.controllers[0].options.worker.instructions, /只在授权路径工作/);
+  const listed = (await endpoint.call('team_list')).teams[0];
+  assert.equal(listed.workerCount, 1);
+  assert.deepEqual(listed.workerNames, ['审查cc']);
+  assert.deepEqual(listed.projects, [f.controllers[0].options.worker.cwd]);
+  await endpoint.call('team_open', { teamId: 'constraints', constraints: '', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('验证')] });
+  assert.doesNotMatch(f.controllers[1].options.worker.instructions, /只在授权路径工作/);
+});
+
+test('事件窗口滚动后完整交付仍可按历史ID读取，旧结果ID无法验收新轮次', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'durable-results', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('长交付')] });
+  const text = '完整接口约定𠮷'.repeat(2000);
+  f.controllers[0].emit('result', { success: true, text });
+  const resultId = (await endpoint.call('team_status')).workers[0].lastResult.resultId;
+  for (let i = 0; i < 2005; i++) f.controllers[0].emit('progress', { summary: `后续事件 ${i}` });
+  const events = await endpoint.call('team_events');
+  assert.equal(events.gap, true);
+  const readAll = async id => {
+    let offset = 0, joined = '';
+    for (;;) {
+      const page = await endpoint.call('team_result', { workerId: '长交付cc', resultId: id, offset, limit: 4096 });
+      joined += page.text;
+      if (!page.hasMore) return JSON.parse(joined);
+      offset = page.nextOffset;
+    }
+  };
+  assert.equal((await readAll(resultId)).text, text);
+  await endpoint.call('team_send', { workerId: '长交付cc', message: '新一轮' });
+  f.controllers[0].emit('result', { success: true, text: '新版交付' });
+  const stale = await endpoint.raw('team_review', { workerId: '长交付cc', resultId, accepted: true, note: '旧验收' });
+  assert.equal(stale.isError, true);
+  await endpoint.call('team_shutdown');
+  await endpoint.call('team_open', { teamId: 'durable-results', notifications: false });
+  assert.equal((await readAll(resultId)).text, text);
+});
 
 async function fixture(t) {
   const dir = mkdtempSync(path.join(tempRoot, 'server-test-'));
@@ -19,7 +108,7 @@ async function fixture(t) {
   mkdirSync(cwd);
   const config = {
     stateDir: path.join(dir, 'state'), tempDir: path.join(dir, 'runtime'),
-    claudeExecutable: process.execPath, codexExecutable: process.execPath,
+    claudeExecutable: process.execPath, codexExecutable: process.execPath, notificationMode: 'codex-queue',
   };
   const endpoints = [];
   const controllers = [];
@@ -81,13 +170,13 @@ async function fixture(t) {
   return { dir, cwd, config, controllers, notifiers, connect, spec };
 }
 
-test('MCP 暴露全部 12 个工具，未打开团队时返回工具错误', async t => {
+test('MCP 暴露全部 14 个工具，未打开团队时返回工具错误', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   const { tools } = await endpoint.client.listTools();
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'team_open', 'team_dispatch', 'team_status', 'team_events', 'team_send', 'team_reply',
-    'team_request', 'team_interrupt', 'team_resume', 'team_review', 'team_close', 'team_shutdown',
+    'team_request', 'team_interrupt', 'team_resume', 'team_review', 'team_close', 'team_shutdown', 'team_list', 'team_result',
   ].sort());
   for (const name of ['team_status', 'team_events', 'team_request']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
@@ -126,7 +215,7 @@ test('派发经 MCP 立即返回，schema 默认只读，批量任务保留各�
 test('超过旧批次上限后仍可按需追加、恢复及批量筛选关闭工作者', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
-  await endpoint.call('team_open', { teamId: 'unlimited-team', notifications: false });
+  await endpoint.call('team_open', { teamId: 'unlimited-team', notifications: false, maxConcurrent: 40 });
   const first = await endpoint.call('team_dispatch', {
     workers: Array.from({ length: 24 }, (_, i) => f.spec(`协作${i}`)),
   });

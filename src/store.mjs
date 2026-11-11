@@ -7,6 +7,7 @@ import path from 'node:path';
 const RETAINED_EVENTS = 2000;
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_WORKERS_BYTES = 8 * 1024 * 1024;
+const MAX_TEAM_BYTES = 128 * 1024;
 const COMPACT_EXTRA_BYTES = 4 * 1024 * 1024;
 
 function jsonCopy(value) {
@@ -35,6 +36,7 @@ function processIsAlive(pid) {
 
 export class Store extends EventEmitter {
   #workers = new Map();
+  #team = {};
   #events = [];
   #lastCursor = 0;
   #eventBytes = 0;
@@ -48,6 +50,7 @@ export class Store extends EventEmitter {
     this.dir = path.resolve(dir);
     this.lockPath = path.join(this.dir, 'store.lock');
     this.workersPath = path.join(this.dir, 'workers.json');
+    this.teamPath = path.join(this.dir, 'team.json');
     this.eventsPath = path.join(this.dir, 'events.jsonl');
   }
 
@@ -57,12 +60,19 @@ export class Store extends EventEmitter {
     this.#acquireLock();
     try {
       this.#workers.clear();
+      this.#team = {};
       this.#events = [];
       this.#lastCursor = 0;
       this.#eventBytes = 0;
       this.#logBytes = 0;
       this.#logCount = 0;
       let workers = [];
+      try {
+        this.#team = readBoundedJson(this.teamPath, MAX_TEAM_BYTES);
+        if (!this.#team || Array.isArray(this.#team) || typeof this.#team !== 'object') throw new Error('team.json 必须是团队元数据对象');
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
       try {
         workers = readBoundedJson(this.workersPath, MAX_WORKERS_BYTES);
       } catch (error) {
@@ -135,8 +145,9 @@ export class Store extends EventEmitter {
     const temporary = `${file}.${this.#token}.tmp`;
     let created = false;
     try {
-      writeFileSync(temporary, text, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      const fd = openSync(temporary, 'wx', 0o600);
       created = true;
+      try { writeFileSync(fd, text, 'utf8'); } finally { closeSync(fd); }
       renameSync(temporary, file);
     } catch (error) {
       if (created) {
@@ -149,16 +160,38 @@ export class Store extends EventEmitter {
   }
 
   saveWorker(worker) {
+    return this.saveWorkers([worker])[0];
+  }
+
+  saveWorkers(workers) {
     this.#assertActive();
-    if (!worker || typeof worker.id !== 'string' || !worker.id) throw new Error('工作者必须有非空 id');
-    const { runtime, ...metadata } = worker;
-    const record = jsonCopy(metadata);
     const next = new Map(this.#workers);
-    next.set(record.id, record);
+    const records = workers.map(worker => {
+      if (!worker || typeof worker.id !== 'string' || !worker.id) throw new Error('工作者必须有非空 id');
+      const { runtime, ...metadata } = worker;
+      const record = jsonCopy(metadata);
+      next.set(record.id, record);
+      return record;
+    });
     const encoded = JSON.stringify([...next.values()]);
     if (Buffer.byteLength(encoded) > MAX_WORKERS_BYTES) throw new Error('工作者元数据超过 8 MiB 上限');
     this.#writeAtomic(this.workersPath, encoded);
     this.#workers = next;
+    return jsonCopy(records);
+  }
+
+  loadTeam() {
+    this.#assertActive();
+    return jsonCopy(this.#team);
+  }
+
+  saveTeam(metadata) {
+    this.#assertActive();
+    const encoded = JSON.stringify(metadata);
+    if (Buffer.byteLength(encoded) > MAX_TEAM_BYTES) throw new Error('团队元数据超过 128 KiB 上限');
+    const record = JSON.parse(encoded);
+    this.#writeAtomic(this.teamPath, encoded);
+    this.#team = record;
     return jsonCopy(record);
   }
 

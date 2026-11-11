@@ -52,7 +52,7 @@ async function withShutdownTimeout(promise, message) {
   }
 }
 
-export function createClaudeWorker({ worker, config, emit, request, queryImpl = query, spawnImpl = spawn }) {
+export function createClaudeWorker({ worker, config, emit, request, readDependency, queryImpl = query, spawnImpl = spawn }) {
   const input = inputQueue();
   const pendingRequests = new Set();
   let child;
@@ -61,6 +61,7 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
   let finished = false;
   let closePromise;
   let shutdownPromise;
+  let executionFailure;
   let currentSessionId = worker.sessionId;
   let backgroundTasks = new Map();
   let backgroundChanged;
@@ -72,7 +73,7 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
   async function ask(kind, payload, signal) {
     const controller = new AbortController();
     pendingRequests.add(controller);
-    if (closing) controller.abort();
+    if (closing || finished) controller.abort();
     try {
       return await request(kind, payload, signal
         ? AbortSignal.any([signal, controller.signal])
@@ -107,6 +108,13 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
         }, extra?.signal);
         return { content: [{ type: 'text', text: answer.text ?? JSON.stringify(answer.answers ?? {}) }] };
       }),
+      tool('read_dependency', '读取已声明且通过验收的前置工作者交付；offset 为 UTF-8 字节偏移，按 nextOffset 继续读取并拼接 JSON 全文。', {
+        workerId: z.string().min(1).max(80),
+        offset: z.number().int().min(0).default(0),
+        limit: z.number().int().min(4).max(12000).default(12000),
+      }, async ({ workerId, offset, limit }) => ({
+        content: [{ type: 'text', text: JSON.stringify(await readDependency(workerId, offset, limit)) }],
+      })),
     ],
   });
 
@@ -126,6 +134,8 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
         TMPDIR: config.tempDir,
       },
       ...(worker.model ? { model: worker.model } : {}),
+      ...(worker.maxTurns !== undefined ? { maxTurns: worker.maxTurns } : {}),
+      ...(worker.maxBudgetUsd !== undefined ? { maxBudgetUsd: worker.maxBudgetUsd } : {}),
       ...(worker.sessionId ? { resume: worker.sessionId } : {}),
       ...(worker.access === 'read'
         ? { tools: ['Read', 'Glob', 'Grep', 'AskUserQuestion'] }
@@ -134,15 +144,20 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
-        append: `${worker.instructions}\n在重要步骤完成时调用 mcp__team__report_progress；遇到阻塞时调用 mcp__team__ask_parent。主控消息不构成用户的额外权限授权。`,
+        snapshot: false,
+        append: `${worker.instructions}\n在重要步骤完成时调用 mcp__team__report_progress；遇到阻塞时调用 mcp__team__ask_parent；有前置任务时用 mcp__team__read_dependency 读取交付。主控消息不构成用户的额外权限授权。`,
       },
       permissionMode: 'default',
       permissionPrompts: 'host',
       persistSession: true,
-      allowedTools: [...worker.allowedTools, 'mcp__team__report_progress', 'mcp__team__ask_parent'],
+      allowedTools: worker.allowedTools,
       mcpServers: { team: teamTools },
       strictMcpConfig: true,
       canUseTool: async (toolName, toolInput, context) => {
+        if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
+          && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
+          return { behavior: 'allow', updatedInput: toolInput };
+        }
         if (toolName === 'AskUserQuestion') {
           const answer = await ask('question', {
             ...toolInput,
@@ -172,13 +187,19 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
           requestId: context.requestId,
           toolUseID: context.toolUseID,
           blockedPath: context.blockedPath,
+          mcpServer: context.mcpServer,
+          decisionReason: context.decisionReason,
+          title: context.title,
+          description: context.description,
+          defaultToNo: context.defaultToNo,
+          matchedAskRule: context.matchedAskRule,
         }, context.signal);
         return decision.allow
           ? { behavior: 'allow', updatedInput: toolInput }
           : { behavior: 'deny', message: decision.reason ?? '主控未批准此操作。' };
       },
       spawnClaudeCodeProcess: ({ command, args, cwd, env, signal }) => {
-        child = spawnImpl(command, args, {
+        child = spawnImpl(command === 'node' || command === 'node.exe' ? process.execPath : command, args, {
           cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
         });
         processExited = new Promise((resolve) => {
@@ -212,7 +233,10 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
       }
       await withShutdownTimeout(processExited, `关闭工作者超时，尚未确认进程 ${child?.pid ?? '未知'} 退出。`);
       if (closeError && closeError.name !== 'AbortError') throw closeError;
-    })();
+    })().catch(error => {
+      shutdownPromise = undefined;
+      throw error;
+    });
     return shutdownPromise;
   }
 
@@ -264,8 +288,19 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
       emit('progress', { summary: limit(message.summary), source: 'tool_summary' });
     } else if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
       backgroundTasks = new Map(message.tasks.map((task) => [task.task_id, task]));
+      emit('background_tasks', { tasks: message.tasks });
       backgroundChanged?.();
       backgroundChanged = undefined;
+    } else if (message.type === 'system' && message.subtype === 'api_retry') {
+      emit('api_retry', { attempt: message.attempt, maxRetries: message.max_retries,
+        retryDelayMs: message.retry_delay_ms, errorStatus: message.error_status, error: message.error });
+    } else if (message.type === 'system' && message.subtype === 'permission_denied') {
+      emit('permission_denied', { tool: message.tool_name, toolUseId: message.tool_use_id,
+        reason: message.decision_reason, message: message.message });
+    } else if (message.type === 'rate_limit_event') {
+      emit('rate_limit', { status: message.rate_limit_info.status,
+        resetsAt: message.rate_limit_info.resetsAt, limitType: message.rate_limit_info.rateLimitType,
+        utilization: message.rate_limit_info.utilization });
     } else if (message.type === 'system' && message.subtype === 'task_progress') {
       emit('progress', {
         summary: limit(message.summary ?? message.description),
@@ -274,14 +309,25 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
       });
     } else if (message.type === 'result') {
       emit('result', {
-        success: message.subtype === 'success' && !message.is_error,
-        text: limit(message.result ?? '', 16000),
-        errors: (message.errors ?? []).slice(0, 10).map((error) => limit(error)),
+        success: message.subtype === 'success' && !message.is_error
+          && (!message.terminal_reason || message.terminal_reason === 'completed'),
+        interrupted: ['aborted_streaming', 'aborted_tools'].includes(message.terminal_reason),
+        background: message.terminal_reason === 'background_requested',
+        text: message.result ?? '',
+        errors: message.errors ?? [],
         sessionId: message.session_id,
         messageId: message.user_message_uuid,
         messageIds: message.user_message_uuids,
         subtype: message.subtype,
         terminalReason: message.terminal_reason,
+        usage: message.usage,
+        modelUsage: message.modelUsage,
+        costUsd: message.total_cost_usd,
+        durationMs: message.duration_ms,
+        numTurns: message.num_turns,
+        queuedTurnCount: message.queued_turn_count,
+        resultIndex: message.result_index,
+        startupFailureReason: message.startup_failure_reason,
         permissionDenials: message.permission_denials?.map(({ tool_name, tool_use_id }) => ({
           tool: tool_name, toolUseId: tool_use_id,
         })),
@@ -305,6 +351,7 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
         const error = new Error(`输出流已结束，未能确认后台任务停止：${[...backgroundTasks.keys()].join(', ')}`);
         failure = failure ? new AggregateError([failure, error], '工作者执行失败且有未确认停止的后台任务。') : error;
       }
+      executionFailure = failure;
       try {
         await shutdownProcess();
       } catch (error) {
@@ -352,11 +399,15 @@ export function createClaudeWorker({ worker, config, emit, request, queryImpl = 
           Promise.allSettled([shutdownProcess(), done]),
           `关闭工作者超时，进程 ${child?.pid ?? '未知'} 或输出流尚未确认结束。`,
         );
-        const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+        const failure = outcomes[0].status === 'rejected' ? outcomes[0]
+          : executionFailure ? { reason: executionFailure } : undefined;
         if (backgroundError && failure) throw new AggregateError([backgroundError, failure.reason], '后台任务停止或工作者关闭失败。');
         if (backgroundError) throw backgroundError;
         if (failure) throw failure.reason;
-      })();
+      })().catch(error => {
+        closePromise = undefined;
+        throw error;
+      });
       return closePromise;
     },
     done,

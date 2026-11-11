@@ -1,6 +1,3 @@
 {
-  "claudeExecutable": "D:/tools/claude/claude.exe",
-  "codexExecutable": "D:/tools/codex/codex.exe",
-  "stateDir": "D:/projects/mcp-cccx-together/.team-state",
-  "tempDir": "D:/rubbish/zhongjian/temp/mcp-cccx-together/workers"
+  "notificationMode": "poll"
 }

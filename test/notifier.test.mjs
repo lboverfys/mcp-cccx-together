@@ -52,6 +52,7 @@ test('同一 tick 的多个事件合并，参数无需 shell 转义，且不会�
   assert.equal(opts.shell, false);
   assert.equal(opts.windowsHide, true);
   assert.equal(opts.timeout, 10_000);
+  assert.equal(opts.killSignal, 'SIGKILL');
   assert.equal(opts.maxBuffer, 32 * 1024);
   callback(null, 'Queued', '');
   assert.deepEqual(deliveries[0], {
@@ -120,6 +121,16 @@ test('没有父会话时不推送，不接受名称，且忽略无关事件', as
   await notifier.close();
 });
 
+test('没有 Codex 可执行入口时禁用通知，不回退执行 Node', async () => {
+  const { notifier, calls } = harness({ command: undefined });
+  assert.equal(notifier.threadId, undefined);
+  assert.equal(notifier.setThread(THREAD), undefined);
+  notifier.notify({ workerId: 'a', type: 'result', cursor: 1, data: {} });
+  notifier.flush();
+  assert.equal(calls.length, 0);
+  await notifier.close();
+});
+
 test('CLI 的唤醒警告与入队失败都显式报告，不自动重试', async () => {
   const { notifier, calls, deliveries } = harness({ resume: true });
   notifier.notify({ workerId: 'a', type: 'result', cursor: 1, data: {} });
@@ -150,6 +161,48 @@ test('关闭会取消定时通知并等待专属子进程退出', async () => {
   await sleep(20);
   assert.equal(calls.length, 1);
   assert.throws(() => notifier.setThread(THREAD), /关闭/);
+});
+
+test('通知进程忽略 SIGTERM 时只强制结束本次专属进程', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const signals = [];
+  const { notifier } = harness({
+    execFileImpl(_command, _args, _options, callback) {
+      return { pid: 4242, kill(signal) {
+        signals.push(signal);
+        if (signal === 'SIGKILL') callback(new Error('已强制关闭'));
+        return true;
+      } };
+    },
+  });
+  notifier.notify({ workerId: 'a', type: 'result', cursor: 1, data: {} });
+  notifier.flush();
+  const closing = notifier.close();
+  assert.deepEqual(signals, ['SIGTERM']);
+  t.mock.timers.tick(2000);
+  await closing;
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(notifier.inFlight, null);
+});
+
+test('通知进程未确认退出时有限超时，晚到退出后可再次收尾', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let exited;
+  const { notifier } = harness({
+    execFileImpl(_command, _args, _options, callback) {
+      exited = callback;
+      return { pid: 4242, kill() { return false; } };
+    },
+  });
+  notifier.notify({ workerId: 'a', type: 'result', cursor: 1, data: {} });
+  notifier.flush();
+  const closing = assert.rejects(notifier.close(), /关闭超时.*4242/);
+  t.mock.timers.tick(10000);
+  await closing;
+  assert.ok(notifier.inFlight);
+  exited(new Error('进程已退出'));
+  await notifier.close();
+  assert.equal(notifier.inFlight, null);
 });
 
 test('同步启动失败也报告错误；常见凭据与链接不进入摘要', async () => {
@@ -193,4 +246,16 @@ test('完成事件取代尚未发送的旧进度；关闭不会发出待投递�
   await notifier.close();
   await sleep(20);
   assert.equal(calls.length, 1);
+});
+
+test('中断和后台转移的结果通知保留实际状态', async () => {
+  const { notifier, calls } = harness();
+  notifier.notify({ workerId: 'a', type: 'result', cursor: 1, data: { success: false, interrupted: true } });
+  notifier.notify({ workerId: 'b', type: 'result', cursor: 2, data: { success: false, background: true } });
+  await waitFor(() => calls.length === 1);
+  assert.match(calls[0].args[5], /当前轮次已中断/);
+  assert.match(calls[0].args[5], /后台继续执行/);
+  assert.doesNotMatch(calls[0].args[5], /执行失败|等待主控验收/);
+  calls[0].callback(null, '', '');
+  await notifier.close();
 });

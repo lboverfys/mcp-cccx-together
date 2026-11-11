@@ -6,9 +6,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $teamRoot = $PSScriptRoot
-$teamConfig = Get-Content -LiteralPath (Join-Path $teamRoot 'team.config.json') -Raw | ConvertFrom-Json
 $projectDirectory = (Resolve-Path -LiteralPath $ProjectPath).Path
 $nodeExecutable = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+$cliPath = Join-Path $teamRoot 'src/cli.mjs'
+$registrationJson = & $nodeExecutable $cliPath print-config
+if ($LASTEXITCODE -ne 0) { throw '无法生成团队 MCP 配置，请运行 node src/cli.mjs doctor 检查环境。' }
+$registration = ($registrationJson | ConvertFrom-Json).mcpServers.cc_team
+$configModule = ([System.Uri]::new((Join-Path $teamRoot 'src/config.mjs'))).AbsoluteUri
+$resolvedConfig = & $nodeExecutable --input-type=module -e 'const { loadConfig } = await import(process.argv[1]); process.stdout.write(JSON.stringify(loadConfig()));' $configModule
+if ($LASTEXITCODE -ne 0) { throw '无法读取团队配置。' }
+$teamConfig = $resolvedConfig | ConvertFrom-Json
+if (-not $teamConfig.codexExecutable) { throw '未找到 Codex，请先安装并配置 Codex CLI。' }
 $environmentNames = @(
     'CODEX_THREAD_ID', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
     'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
@@ -22,7 +30,7 @@ $providerEnvironmentNames = Get-ChildItem Env: | Where-Object {
 $environmentNames = @(@($environmentNames) + @($providerEnvironmentNames) | Sort-Object -Unique)
 $values = [ordered]@{
     command = $nodeExecutable
-    args = @((Join-Path $teamRoot 'src\server.mjs'), (Join-Path $teamRoot 'team.config.json'))
+    args = @($registration.args)
     cwd = $teamRoot
     startup_timeout_sec = 15
     tool_timeout_sec = 40
@@ -33,7 +41,15 @@ foreach ($key in $values.Keys) {
     $encodedValue = ConvertTo-Json -InputObject $values[$key] -Compress
     $overrides += @('-c', "mcp_servers.cc_team.$key=$encodedValue")
 }
+foreach ($property in $registration.env.PSObject.Properties) {
+    $encodedValue = ConvertTo-Json -InputObject $property.Value -Compress
+    $overrides += @('-c', "mcp_servers.cc_team.env.$($property.Name)=$encodedValue")
+}
 
 # 仅本次 Codex 启动生效，不改用户级配置、PATH 或模型设置。
-& $teamConfig.codexExecutable -C $projectDirectory @overrides @CodexArguments
+if ($teamConfig.codexExecutable -match '\.[cm]?js$') {
+    & $nodeExecutable $teamConfig.codexExecutable -C $projectDirectory @overrides @CodexArguments
+} else {
+    & $teamConfig.codexExecutable -C $projectDirectory @overrides @CodexArguments
+}
 exit $LASTEXITCODE
