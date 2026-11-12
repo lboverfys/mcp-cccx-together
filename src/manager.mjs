@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { realpathSync, statSync, mkdirSync } from 'node:fs';
 import { resolve, relative, isAbsolute, sep, dirname, basename } from 'node:path';
@@ -7,6 +8,45 @@ import { ResultStore } from './results.mjs';
 
 const active = new Set(['starting', 'running', 'needs_input', 'awaiting_review', 'interrupting', 'idle']);
 const clip = (text, max = 12000) => String(text ?? '').slice(0, max);
+const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
+const VERIFY_OUTPUT_CHARS = 6000;
+// team_wait 判定：working 仍会自行推进；needsParent 必须由主控处理；settled 表示本轮已停下。
+const working = worker => Boolean(worker.verifying || worker.closingPromise)
+  || ['starting', 'running', 'interrupting', 'closing'].includes(worker.data.status);
+const needsParent = worker => Boolean(worker.lifecycleError)
+  || ['needs_input', 'failed', 'blocked', 'stopped'].includes(worker.data.status)
+  || (worker.data.status === 'awaiting_review' && !worker.verifying);
+const settled = worker => needsParent(worker) || ['idle', 'closed'].includes(worker.data.status);
+
+/** 在 cwd 用系统 shell 执行验证命令；中止或超时会结束整个进程树。 */
+function runVerify(command, cwd, signal) {
+  return new Promise(resolveRun => {
+    let output = '';
+    let timedOut = false;
+    const child = spawn(command, { cwd, shell: true, windowsHide: true, detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    const collect = data => { output = (output + data).slice(-VERIFY_OUTPUT_CHARS); };
+    child.stdout.setEncoding('utf8').on('data', collect);
+    child.stderr.setEncoding('utf8').on('data', collect);
+    const kill = () => {
+      if (child.pid === undefined || child.exitCode !== null) return;
+      try {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+        else process.kill(-child.pid, 'SIGKILL');
+      } catch { /* 进程已退出 */ }
+    };
+    const timer = setTimeout(() => { timedOut = true; kill(); }, VERIFY_TIMEOUT_MS);
+    signal.addEventListener('abort', kill, { once: true });
+    const finish = (ok, detail) => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', kill);
+      resolveRun({ ok, output: `${output}${detail ? `\n${detail}` : ''}`.trim().slice(-VERIFY_OUTPUT_CHARS) });
+    };
+    child.once('error', error => finish(false, error.message));
+    child.once('close', (code, exitSignal) => finish(code === 0,
+      code === 0 ? '' : timedOut ? `验证命令超过 ${VERIFY_TIMEOUT_MS / 60000} 分钟被终止` : `退出码 ${code ?? exitSignal}`));
+  });
+}
 const inside = (root, path) => {
   const rel = relative(root, path);
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
@@ -47,6 +87,7 @@ export class TeamManager {
     this.names = new Map();
     this.requests = new Map();
     this.waiters = new Set();
+    this.waitChecks = new Set();
     this.closing = false;
     this.scheduling = false;
   }
@@ -55,7 +96,7 @@ export class TeamManager {
     await this.store.init();
     try {
       const saved = this.store.loadTeam();
-      this.maxConcurrent = this.maxConcurrent ?? saved.maxConcurrent ?? 4;
+      this.maxConcurrent = this.maxConcurrent ?? saved.maxConcurrent ?? 8;
       this.assertConcurrency(this.maxConcurrent);
       this.updateConstraints(this.constraints ?? saved.constraints ?? '');
       for (const data of this.store.listWorkers()) {
@@ -147,8 +188,9 @@ export class TeamManager {
     return { teamId: this.teamId, maxConcurrent: this.maxConcurrent, storage: this.store.storageInfo(),
       runningCount: [...this.workers.values()].filter(worker => worker.controller).length,
       queuedCount: [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status)).length,
-      workers: selected.map(({ data, controller, deliveryWarning, lifecycleError }) => ({
+      workers: selected.map(({ data, controller, deliveryWarning, lifecycleError, verifying }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
+      review: data.review ?? 'codex', ...(data.verify ? { verify: data.verify } : {}), ...(verifying ? { verifying } : {}),
       model: data.model ?? '继承 CC 配置', status: data.status, sessionId: data.sessionId,
       pid: controller?.pid ?? null, lastPid: data.lastPid, processExited: data.processExited ?? false, updatedAt: data.updatedAt, error: data.error,
       pendingMessages: data.pendingMessages.length + (data.queuedMessages?.length ?? 0),
@@ -224,7 +266,7 @@ export class TeamManager {
     const current = [...this.workers.values()].filter(w => w.data.id !== excludeId &&
       (w.controller || ['queued', 'blocked'].includes(w.data.status) || unconfirmedResources(w.data)));
     const all = [...current.map(w => w.data), ...specs];
-    if (all.every(worker => worker.access === 'read')) return;
+    if (all.every(worker => worker.access !== 'write')) return;
     // 同一路径按拓扑顺序处理；后续写者覆盖前置所有者，避免串行长链逐对比较。
     const scopes = all.flatMap(worker => worker.scopes.map(path => ({
       worker, path: this.scopeKey(path),
@@ -234,7 +276,7 @@ export class TeamManager {
       let ancestor = path;
       for (;;) {
         const entry = index.get(ancestor);
-        for (const owner of worker.access === 'read' ? (entry?.writer ? [entry.writer] : []) : entry?.owners ?? []) {
+        for (const owner of worker.access !== 'write' ? (entry?.writer ? [entry.writer] : []) : entry?.owners ?? []) {
           if (owner !== worker && !graph.before(owner.id, worker.id) && !graph.before(worker.id, owner.id)) {
             throw new Error(`工作范围冲突：${owner.name} 与 ${worker.name}。请拆分 scope、声明串行 dependsOn 或使用独立工作区`);
           }
@@ -262,7 +304,8 @@ export class TeamManager {
     for (const spec of prepared) {
       spec.dependsOn = [...new Set((spec.dependsOn ?? []).map(reference => batchNames.get(reference) ?? this.get(reference).data.id))];
     }
-    this.assertScopes(prepared, undefined, this.dependencyGraph(prepared));
+    // 只校验依赖；范围重叠不再整批拒绝，由调度按提交顺序排队（waiting_scope）。
+    this.dependencyGraph(prepared);
     const created = prepared.map(spec => {
       const id = spec.id;
       const worker = { data: {
@@ -293,10 +336,11 @@ export class TeamManager {
     return `你是由 Codex 主控派发的 Claude Code 工作者，使用中文汇报。\n` +
       `你的名字是“${spec.name}”，主控和用户会用这个名字指代你。\n` +
       `工作目录：${spec.cwd}\n分配范围：${spec.scope.join(', ')}\n访问模式：${spec.access}\n` +
-      `只执行主控任务，先阅读适用的 AGENTS.md/CLAUDE.md，不扩大修改范围。上下文不自动共享；通过 report_progress 汇报里程碑、通过 ask_parent 请求决策。不要把报告成功视为主控已读。\n` +
+      `只执行主控任务，遵循项目约定，不扩大修改范围。上下文不自动共享；需要主控决定时通过 ask_parent 提问。\n` +
       `不要自行再创建 agent。没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
       `工具报错必须明确报告，不得虚报验证通过。结束时说明修改文件、验证结果、未完成项；你报告完成后由主控验收。清理本任务启动的服务，不得停止原有服务。\n` +
-      (spec.access === 'read' ? '当前为只读任务，不允许修改项目或运行命令。\n' : '') +
+      (spec.access === 'read' ? '当前为只读任务，不允许修改项目或运行命令。\n'
+        : spec.access === 'verify' ? '当前为验证任务：可以运行测试、构建和检查命令，不要修改项目文件。\n' : '') +
       `工作者补充约束：\n${spec.taskInstructions ?? spec.instructions ?? ''}\n` +
       `团队当前约束（约束冲突时以当前约束为准）：\n${this.constraints}`;
   }
@@ -366,7 +410,7 @@ export class TeamManager {
   }
 
   scopesOverlap(first, second) {
-    if (first.access === 'read' && second.access === 'read') return false;
+    if (first.access !== 'write' && second.access !== 'write') return false;
     const firstPaths = first.scopes.map(path => this.scopeKey(path));
     const secondPaths = second.scopes.map(path => this.scopeKey(path));
     return firstPaths.some(a => secondPaths.some(b => inside(a, b) || inside(b, a)));
@@ -383,12 +427,15 @@ export class TeamManager {
         unconfirmedResources(item.data));
       const queued = [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status))
         .sort((a, b) => graph.rank.get(a.data.id) - graph.rank.get(b.data.id));
+      // 本轮仍在排队的任务；后提交且范围重叠的任务不得越过它们，避免宽范围写入被饿死。
+      const waitingAhead = [];
       for (const worker of queued) {
         const dependencies = worker.data.dependsOn.map(id => this.get(id)).filter(dependency => !this.accepted(dependency, acceptance));
         if (dependencies.length) {
           const stale = dependencies.some(dependency => acceptance.get(dependency.data.id).staleDependencies.length);
           const failed = dependencies.some(dependency => ['failed', 'closed', 'stopped', 'blocked'].includes(dependency.data.status) || dependency.data.lastReview?.accepted === false);
           this.setQueueState(worker, failed || stale ? 'blocked' : 'queued', stale ? 'dependency_stale' : failed ? 'dependency_failed' : 'waiting_dependencies', dependencies);
+          if (worker.data.status === 'queued') waitingAhead.push(worker);
           continue;
         }
         let prepared;
@@ -405,12 +452,15 @@ export class TeamManager {
         Object.assign(worker.data, prepared);
         const running = activeWorkers.filter(item => item !== worker);
         const conflicts = running.filter(item => this.scopesOverlap(worker.data, item.data));
+        const earlier = waitingAhead.filter(item => this.scopesOverlap(worker.data, item.data));
         const capacityFull = running.length >= this.maxConcurrent;
-        if (conflicts.length || capacityFull) {
+        if (conflicts.length || earlier.length || capacityFull) {
           const canRetire = item => item.controller && item.data.status === 'idle' && item.data.lastReview?.accepted &&
             item.data.lastReview.resultId === item.data.lastResult?.resultId && !item.closingPromise;
-          const retiring = conflicts.length ? conflicts.filter(canRetire) : running.filter(canRetire).slice(0, 1);
-          this.setQueueState(worker, 'queued', conflicts.length ? 'waiting_scope' : 'waiting_capacity', conflicts);
+          const retiring = conflicts.length ? conflicts.filter(canRetire) : earlier.length ? [] : running.filter(canRetire).slice(0, 1);
+          this.setQueueState(worker, 'queued', conflicts.length || earlier.length ? 'waiting_scope' : 'waiting_capacity',
+            conflicts.length ? conflicts : earlier);
+          waitingAhead.push(worker);
           for (const item of retiring) {
             this.closeWorker(item.data.id).catch(error => {
               item.data.error = clip(error.message, 2000);
@@ -553,13 +603,107 @@ export class TeamManager {
     if ((type === 'activity' || type === 'progress') && ['starting', 'running', 'interrupting'].includes(worker.data.status)) {
       worker.data.status = 'running';
     }
+    // 先标记验证中再写事件，team_wait 不会把自动验收前的瞬间误判为待人工处理。
+    if (worker.data.review === 'auto' && worker.data.status === 'awaiting_review' && !worker.data.lastReview
+      && (type === 'result' || previousStatus !== 'awaiting_review')) {
+      worker.verifying = true;
+      queueMicrotask(() => this.autoReview(worker).catch(error => this.autoReviewFailed(worker, error)));
+    }
     if (type === 'session' || type === 'result' || type === 'background_tasks' || worker.data.status !== previousStatus) this.save(worker);
     else worker.data.updatedAt = new Date().toISOString();
     this.event(worker.data.id, type, data);
     if (type === 'result' || type === 'background_tasks') this.schedule();
   }
 
-  send(id, text) {
+  /** 自动验收：执行 verify 命令，通过即验收并放行下游；失败时发回工作者修复，超过 maxFixRounds 后拒绝并交主控。 */
+  async autoReview(worker) {
+    const resultId = worker.data.lastResult?.resultId;
+    worker.verifyAbort?.abort();
+    const abort = worker.verifyAbort = new AbortController();
+    let check = { ok: true, output: '' };
+    try {
+      if (worker.data.verify && !this.closing && worker.data.status === 'awaiting_review') {
+        check = await runVerify(worker.data.verify, worker.data.cwd, abort.signal);
+      }
+    } finally {
+      if (worker.verifyAbort === abort) {
+        worker.verifyAbort = undefined;
+        worker.verifying = false;
+      }
+    }
+    // 验证期间出现新轮次、人工验收、追加指令或关闭时放弃本次结论。
+    if (abort.signal.aborted || this.closing || worker.data.status !== 'awaiting_review' || worker.data.lastReview
+      || worker.data.lastResult?.resultId !== resultId) return;
+    const { verify, maxFixRounds = 0 } = worker.data;
+    if (check.ok) {
+      this.review(worker.data.id, true, verify ? `自动验收：${verify} 通过` : '自动验收：执行成功', undefined, resultId);
+      return;
+    }
+    worker.data.fixRounds = (worker.data.fixRounds ?? 0) + 1;
+    if (worker.data.fixRounds <= maxFixRounds && worker.controller) {
+      this.send(worker.data.id, `验证命令未通过（自动修复 ${worker.data.fixRounds}/${maxFixRounds}）：${verify}\n${check.output}\n请修复后重新报告结果。`, { automatic: true });
+      return;
+    }
+    this.review(worker.data.id, false, `自动验收未通过：${verify}\n${check.output}`, undefined, resultId);
+  }
+
+  autoReviewFailed(worker, error) {
+    worker.verifying = false;
+    this.lifecycleFailed(worker, error);
+    for (const check of [...this.waitChecks]) check();
+  }
+
+  /** 阻塞到目标全部停下或任一需要主控处理，返回精简结果；替代逐条轮询事件。 */
+  async wait({ workerIds, timeoutMs = 50000 } = {}) {
+    const targets = workerIds ? [...new Set(workerIds.map(ref => this.get(ref)))]
+      : [...this.workers.values()].filter(worker => !['idle', 'closed'].includes(worker.data.status)
+        && (worker.controller || worker.verifying || ['queued', 'blocked'].includes(worker.data.status)));
+    // 全队没有仍在推进的工作者时，继续等待也不会有变化。
+    const ready = () => this.closing || targets.some(needsParent) || targets.every(settled)
+      || ![...this.workers.values()].some(working);
+    let timedOut = false;
+    if (!ready()) {
+      await new Promise(resolveWait => {
+        const finish = () => {
+          clearTimeout(timer);
+          this.store.off('appended', check);
+          this.waitChecks.delete(check);
+          this.waiters.delete(finish);
+          resolveWait();
+        };
+        // 部分流程先写事件再更新状态（如提问），延后到当前同步步骤结束再判断。
+        const check = () => queueMicrotask(() => { if (ready()) finish(); });
+        const timer = setTimeout(() => { timedOut = true; finish(); }, timeoutMs);
+        this.store.on('appended', check);
+        this.waitChecks.add(check);
+        this.waiters.add(finish);
+      });
+    }
+    const requests = new Map();
+    for (const request of this.requests.values()) {
+      if (!requests.has(request.workerId)) requests.set(request.workerId, []);
+      requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(request.encodedPayload, 1000) });
+    }
+    return {
+      done: targets.every(worker => settled(worker) && !needsParent(worker)), timedOut,
+      ...(this.closing ? { closing: true } : {}),
+      workers: targets.map(worker => {
+        const { data } = worker;
+        return {
+          id: data.id, name: data.name, status: data.status, attention: needsParent(worker),
+          ...(data.queueReason ? { queueReason: data.queueReason } : {}),
+          ...(data.blockedBy?.length ? { blockedBy: data.blockedBy.map(item => item.name) } : {}),
+          ...(settled(worker) && data.lastResult ? { resultId: data.lastResult.resultId, summary: data.lastResult.text } : {}),
+          ...(data.error ? { error: data.error } : {}),
+          ...(data.lastReview ? { review: { accepted: data.lastReview.accepted, note: clip(data.lastReview.note, 6500) } } : {}),
+          ...(requests.has(data.id) ? { requests: requests.get(data.id) } : {}),
+          ...(worker.lifecycleError ? { lifecycleError: worker.lifecycleError } : {}),
+        };
+      }),
+    };
+  }
+
+  send(id, text, { automatic = false } = {}) {
     if (this.closing) throw new Error('团队正在关闭');
     const worker = this.get(id);
     id = worker.data.id;
@@ -589,6 +733,11 @@ export class TeamManager {
       if (conflict) throw new Error(`追加任务的工作范围与 ${conflict.data.name} 冲突，请先完成并关闭冲突工作者`);
       Object.assign(worker.data, prepared);
       this.deliver(worker, text, messageId, warnings);
+    }
+    if (!automatic) {
+      // 主控的新指令开启新一轮：取消进行中的验证并重置自动修复次数，随下次保存持久化。
+      worker.verifyAbort?.abort();
+      if (worker.data.fixRounds) worker.data.fixRounds = 0;
     }
     try { this.schedule(warnings); }
     catch (error) { warnings.push(`消息已接受，但后续调度失败：${error.message}`); }
@@ -773,8 +922,8 @@ export class TeamManager {
     if (unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活，请核实并关闭原进程后恢复`);
     }
+    // 范围冲突不再拒绝恢复，重新排队后由调度等待冲突方完成。
     const prepared = this.prepare(worker.data);
-    this.assertScopes([prepared], id);
     if (prepared.taskInstructions === undefined) {
       const marker = '主控提供的任务约束：\n';
       const offset = prepared.instructions.indexOf(marker);
@@ -793,7 +942,7 @@ export class TeamManager {
     }
     const previousData = worker.data;
     worker.data = { ...prepared, instructions: this.instructions(prepared), status: 'queued', error: undefined,
-      pendingMessages: [], queuedMessages, lastReview: undefined, cancelled: false };
+      pendingMessages: [], queuedMessages, lastReview: undefined, cancelled: false, fixRounds: 0 };
     let saved = false;
     try {
       this.save(worker);
@@ -852,6 +1001,7 @@ export class TeamManager {
 
   async finishCloseWorker(worker) {
     const id = worker.data.id;
+    worker.verifyAbort?.abort();
     if (!worker.controller) assertBackgroundTasksStopped(worker.data);
     if (!worker.controller && unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活且不由当前团队控制，请核实原进程后重试关闭`);
@@ -879,6 +1029,7 @@ export class TeamManager {
 
   async close() {
     this.closing = true;
+    for (const worker of this.workers.values()) worker.verifyAbort?.abort();
     for (const finish of [...this.waiters]) finish();
     const results = await Promise.allSettled([
       Promise.resolve().then(() => this.notifier?.close()),

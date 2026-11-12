@@ -41,8 +41,8 @@ export class ResultStore {
   }
 
   read(workerId, resultId, { offset = 0, limit = 12000 } = {}) {
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 4 || limit > 12000) {
-      throw new Error('结果分页需要非负整数 offset 和 4 至 12000 的 limit');
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 4 || limit > 100000) {
+      throw new Error('结果分页需要非负整数 offset 和 4 至 100000 的 limit');
     }
     const file = this.file(workerId, resultId);
     const totalLength = statSync(file).size;

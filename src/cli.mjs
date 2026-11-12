@@ -27,7 +27,8 @@ const help = `CC Team MCP — Codex 协调本机 Claude Code
   --version     显示版本
 
 环境变量：CC_TEAM_CONFIG、CC_TEAM_CLAUDE_EXECUTABLE、CC_TEAM_CODEX_EXECUTABLE、
-CC_TEAM_STATE_DIR、CC_TEAM_TEMP_DIR、CC_TEAM_NOTIFICATION_MODE。
+CC_TEAM_STATE_DIR、CC_TEAM_TEMP_DIR、CC_TEAM_NOTIFICATION_MODE、
+CC_TEAM_PERMISSION_MODE、CC_TEAM_WAIT_TIMEOUT_MS。
 `;
 
 function parseArgs(args) {
@@ -67,6 +68,8 @@ export function mcpConfiguration(config, name = 'cc_team', entryPath = cliPath) 
     CC_TEAM_STATE_DIR: config.stateDir,
     CC_TEAM_TEMP_DIR: config.tempDir,
     CC_TEAM_NOTIFICATION_MODE: config.notificationMode,
+    CC_TEAM_PERMISSION_MODE: config.permissionMode,
+    CC_TEAM_WAIT_TIMEOUT_MS: String(config.waitTimeoutMs),
     ...(config.claudeExecutable ? { CC_TEAM_CLAUDE_EXECUTABLE: config.claudeExecutable } : {}),
     ...(config.codexExecutable ? { CC_TEAM_CODEX_EXECUTABLE: config.codexExecutable } : {}),
   };
@@ -142,7 +145,8 @@ export async function runCli(args = process.argv.slice(2), {
       checks.stateDir = inspectDirectory(config.stateDir);
       checks.tempDir = inspectDirectory(config.tempDir);
       stdout.write(`${JSON.stringify({ checks, stateDir: config.stateDir, tempDir: config.tempDir,
-        configPath: config.configPath ?? null, notificationMode: config.notificationMode }, null, 2)}\n`);
+        configPath: config.configPath ?? null, notificationMode: config.notificationMode,
+        permissionMode: config.permissionMode, waitTimeoutMs: config.waitTimeoutMs }, null, 2)}\n`);
       return Object.values(checks).every(check => check.ok || check.optional === true) ? 0 : 1;
     }
     if (options.command === 'print-config') {
@@ -160,7 +164,8 @@ export async function runCli(args = process.argv.slice(2), {
       const registration = mcpConfiguration(config, options.name, entryPath).mcpServers[options.name];
       const envArgs = Object.entries(registration.env).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
       await call(config.codexExecutable, ['mcp', 'add', options.name, ...envArgs, '--', registration.command, ...registration.args]);
-      stdout.write(`已注册 MCP：${options.name}。请重新打开 Codex 会话后使用；可用 codex mcp get ${options.name} 查看配置。\n`);
+      stdout.write(`已注册 MCP：${options.name}。请重新打开 Codex 会话后使用；可用 codex mcp get ${options.name} 查看配置。\n` +
+        `team_wait 单次最多等待 CC_TEAM_WAIT_TIMEOUT_MS（当前 ${config.waitTimeoutMs} 毫秒）；需要更长时，在 Codex 配置的 [mcp_servers.${options.name}] 中设置 tool_timeout_sec = 600，并将该值改为 570000。\n`);
       return 0;
     }
     const runServer = runServerImpl ?? (await import('./server.mjs')).runServer;
