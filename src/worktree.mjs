@@ -53,10 +53,10 @@ function removeIndex(index) {
 export function snapshotTree(root, { tempDir, excludes = [] }) {
   const index = temporaryIndex(tempDir);
   try {
-    // 复制现有索引可复用文件状态缓存，大仓库只需重新哈希变化的文件。
-    const current = path.resolve(root, git(root, ['rev-parse', '--git-path', 'index']).trim());
-    if (existsSync(current)) copyFileSync(current, index);
+    // 从当前索引的树重建条目，不复用 stat 缓存；同尺寸的快速写入也必须重新读取。
+    const stagedTree = git(root, ['write-tree']).trim();
     const env = { GIT_INDEX_FILE: index };
+    git(root, ['read-tree', stagedTree], { env });
     let ignored = new Set();
     if (excludes.length) {
       try {

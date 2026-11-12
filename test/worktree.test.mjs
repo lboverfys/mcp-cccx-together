@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DEFAULT_LINKS, createWorktree, integrateWorktree, removeWorktree, repoRoot, worktreeChanges, worktreeDiff } from '../src/worktree.mjs';
+import { DEFAULT_LINKS, createWorktree, integrateWorktree, removeWorktree, repoRoot, snapshotTree, worktreeChanges, worktreeDiff } from '../src/worktree.mjs';
 import { gitRepository } from './fixtures/git.mjs';
 
 const lines = count => Array.from({ length: count }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
@@ -48,6 +48,25 @@ test('子目录 cwd 映射到 worktree 内的同一子目录', async t => {
   assert(existsSync(path.join(worktree.cwd, 'app/index.js')));
 });
 
+test('快照重读同尺寸且时间戳未变的文件，同时保留暂存的忽略文件', async t => {
+  const r = gitRepository(t, { 'f.txt': 'line 10\n', '.gitignore': 'private.txt\n' });
+  r.git('config', 'core.trustctime', 'false');
+  const file = path.join(r.root, 'f.txt');
+  const timestamp = new Date('2020-01-01T00:00:00Z');
+  utimesSync(file, timestamp, timestamp);
+  r.git('add', '-A');
+  r.write('private.txt', 'staged\n');
+  r.git('add', '-f', 'private.txt');
+  const before = snapshotTree(r.root, { tempDir: r.tempDir });
+
+  r.write('f.txt', 'main 10\n');
+  utimesSync(file, timestamp, timestamp);
+  const after = snapshotTree(r.root, { tempDir: r.tempDir });
+  assert.notEqual(after, before);
+  assert.equal(r.git('show', `${after}:f.txt`), 'main 10\n');
+  assert.equal(r.git('show', `${after}:private.txt`), 'staged\n');
+});
+
 test('合并只写回范围内改动并保留主工作区的并行修改，越界改动整体拒绝', async t => {
   const r = gitRepository(t, { 'src/a.txt': 'a\n', 'src/c.txt': 'c\n', 'other.txt': 'base\n', 'docs/x.txt': 'x\n' });
   const worktree = createWorktree({ cwd: r.root, root: r.worktreeRoot, tempDir: r.tempDir });
@@ -76,9 +95,15 @@ test('合并只写回范围内改动并保留主工作区的并行修改，越�
 
 test('主工作区改过同一文件时做三方合并，冲突时拒绝且不改主工作区', async t => {
   const r = gitRepository(t, { 'f.txt': lines(10) });
+  r.git('config', 'core.trustctime', 'false');
+  const file = path.join(r.root, 'f.txt');
+  const timestamp = new Date('2020-01-01T00:00:00Z');
+  utimesSync(file, timestamp, timestamp);
+  r.git('add', '-A');
   const worktree = createWorktree({ cwd: r.root, root: r.worktreeRoot, tempDir: r.tempDir });
   inWorktree(worktree, 'f.txt', lines(10).replace('line 1\n', 'worker 1\n'));
   r.write('f.txt', lines(10).replace('line 10\n', 'main 10\n'));
+  utimesSync(file, timestamp, timestamp);
   const merged = integrateWorktree(worktree, { allowed: () => true, tempDir: r.tempDir });
   assert.equal(r.read('f.txt'), lines(10).replace('line 1\n', 'worker 1\n').replace('line 10\n', 'main 10\n'));
 
