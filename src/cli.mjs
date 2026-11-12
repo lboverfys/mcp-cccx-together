@@ -10,12 +10,17 @@ const execute = promisify(execFile);
 const cliPath = fileURLToPath(import.meta.url);
 const help = `CC Team MCP — Codex 协调本机 Claude Code
 
-用法：cc-team-mcp [serve|doctor|print-config|setup] [选项]
+用法：cc-team-mcp [serve|doctor|print-config|setup|prune|recover] [选项]
 
   serve         启动标准输入/输出 MCP 服务（默认命令）
   doctor        检查客户端、运行时及目录权限；不调用模型、不创建目录
   print-config  输出通用 MCP JSON 配置
   setup         使用 codex mcp add 注册服务；保留已有同名配置
+  prune         预览已关闭团队的历史结果清理，保护仍被引用的版本
+  recover       预览异常退出团队的锁恢复，拒绝仍存活的进程
+  --team ID     prune/recover 的团队 ID
+  --keep-results N  prune 每名工作者至少保留最近 N 份结果（必填）
+  --apply       prune/recover 实际执行；省略时仅预览
   --config PATH 指定 JSON 配置文件
   --name NAME   MCP 注册名称（默认 cc_team；setup/print-config）
   --help        显示帮助
@@ -31,12 +36,13 @@ function parseArgs(args) {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (['--help', '-h', '--version', '-v'].includes(arg)) return { command: arg.includes('version') || arg === '-v' ? 'version' : 'help' };
-    if (['--config', '--name'].includes(arg)) {
+    if (['--config', '--name', '--team', '--keep-results'].includes(arg)) {
       if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(`${arg} 缺少参数`);
       options[arg.slice(2)] = args[++i];
       continue;
     }
-    if (['serve', 'doctor', 'print-config', 'setup'].includes(arg) && !commandSeen) {
+    if (arg === '--apply') { options.apply = true; continue; }
+    if (['serve', 'doctor', 'print-config', 'setup', 'prune', 'recover'].includes(arg) && !commandSeen) {
       options.command = arg;
       commandSeen = true;
       continue;
@@ -45,6 +51,12 @@ function parseArgs(args) {
   }
   if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,79}$/.test(options.name)) throw new Error('--name 只能包含字母、数字、下划线和连字符，最多 80 字符');
   if (options.name !== 'cc_team' && !['setup', 'print-config'].includes(options.command)) throw new Error('--name 仅适用于 setup 或 print-config');
+  const maintenance = ['prune', 'recover'].includes(options.command);
+  if (maintenance && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(options.team ?? '')) throw new Error('维护命令需要有效的 --team ID');
+  if (!maintenance && (options.team !== undefined || options.apply)) throw new Error('--team/--apply 仅适用于 prune 或 recover');
+  if (options.command === 'prune') {
+    if (!/^[1-9][0-9]*$/.test(options['keep-results'] ?? '') || !Number.isSafeInteger(Number(options['keep-results']))) throw new Error('prune 需要正整数 --keep-results N');
+  } else if (options['keep-results'] !== undefined) throw new Error('--keep-results 仅适用于 prune');
   return options;
 }
 
@@ -88,7 +100,16 @@ export async function runCli(args = process.argv.slice(2), {
       stdout.write(`${JSON.parse(readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).version}\n`);
       return 0;
     }
-    const config = loadConfigImpl(options.config, { requireClaude: options.command !== 'doctor', diagnostic: options.command === 'doctor' });
+    const maintenance = ['prune', 'recover'].includes(options.command);
+    const config = loadConfigImpl(options.config, { requireClaude: !maintenance && options.command !== 'doctor', diagnostic: maintenance || options.command === 'doctor' });
+    if (maintenance) {
+      const { pruneTeam, recoverTeam } = await import('./maintenance.mjs');
+      const result = options.command === 'prune'
+        ? await pruneTeam(config, options.team, { keepResults: Number(options['keep-results']), apply: options.apply })
+        : recoverTeam(config, options.team, { apply: options.apply });
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return 0;
+    }
     const call = async (executable, commandArgs) => {
       const invocation = executableCommand(executable);
       return executeImpl(invocation.command, [...invocation.args, ...commandArgs], {

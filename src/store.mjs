@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, renameSync, unlinkSync, statSync, appendFileSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, renameSync, unlinkSync, statSync, appendFileSync, existsSync, fsyncSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -9,6 +9,41 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_WORKERS_BYTES = 8 * 1024 * 1024;
 const MAX_TEAM_BYTES = 128 * 1024;
 const COMPACT_EXTRA_BYTES = 4 * 1024 * 1024;
+const RECORD_FILE = /^[0-9a-f-]{36}\.json$/;
+
+export function workerCatalog(value) {
+  if (Array.isArray(value)) return { legacy: true, records: value };
+  if (value?.format !== 'cc-team-workers-v2' || !Array.isArray(value.records)) throw new Error('workers.json 必须是工作者数组或受支持的索引');
+  const ids = new Set(), files = new Set();
+  for (const record of value.records) {
+    if (!record || typeof record.id !== 'string' || !record.id || !RECORD_FILE.test(record.file)
+      || !Number.isSafeInteger(record.bytes) || record.bytes < 1 || record.bytes > MAX_WORKERS_BYTES
+      || ids.has(record.id) || files.has(record.file)) throw new Error('工作者索引记录无效或重复');
+    ids.add(record.id); files.add(record.file);
+  }
+  return { legacy: false, records: value.records };
+}
+
+export function readWorkers(directory) {
+  let value;
+  try { value = readBoundedJson(path.join(directory, 'workers.json'), MAX_WORKERS_BYTES); }
+  catch (error) { if (isMissing(error)) return { legacy: true, records: [], workers: [] }; throw error; }
+  const catalog = workerCatalog(value);
+  const workers = catalog.legacy ? catalog.records : catalog.records.map(record => {
+    const file = path.join(directory, 'workers', record.file);
+    if (statSync(file).size !== record.bytes) throw new Error(`工作者记录长度与索引不一致：${record.id}`);
+    const worker = readBoundedJson(file, MAX_WORKERS_BYTES);
+    if (worker.id !== record.id) throw new Error(`工作者记录 ID 与索引不一致：${record.id}`);
+    return worker;
+  });
+  const ids = new Set();
+  for (const worker of workers) {
+    if (!worker || typeof worker.id !== 'string' || !worker.id) throw new Error('工作者记录缺少有效 id');
+    if (ids.has(worker.id)) throw new Error(`工作者记录 id 重复：${worker.id}`);
+    ids.add(worker.id);
+  }
+  return { ...catalog, workers };
+}
 
 function jsonCopy(value) {
   return JSON.parse(JSON.stringify(value));
@@ -23,7 +58,8 @@ function isMissing(error) {
   return error.code === 'ENOENT';
 }
 
-function processIsAlive(pid) {
+export function processIsAlive(pid) {
+  if (!pid) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -44,49 +80,50 @@ export class Store extends EventEmitter {
   #logCount = 0;
   #token;
   #active = false;
+  #files = new Map();
+  #sizes = new Map();
+  #cleanupWarnings = [];
 
   constructor(dir) {
     super();
     this.dir = path.resolve(dir);
     this.lockPath = path.join(this.dir, 'store.lock');
     this.workersPath = path.join(this.dir, 'workers.json');
+    this.recordsDir = path.join(this.dir, 'workers');
     this.teamPath = path.join(this.dir, 'team.json');
     this.eventsPath = path.join(this.dir, 'events.jsonl');
   }
 
-  async init() {
+  async init({ compactEvents = true } = {}) {
     if (this.#active) throw new Error('状态存储已初始化');
     mkdirSync(this.dir, { recursive: true });
     this.#acquireLock();
     try {
       this.#workers.clear();
+      this.#files.clear();
+      this.#sizes.clear();
+      this.#cleanupWarnings = [];
       this.#team = {};
       this.#events = [];
       this.#lastCursor = 0;
       this.#eventBytes = 0;
       this.#logBytes = 0;
       this.#logCount = 0;
-      let workers = [];
       try {
         this.#team = readBoundedJson(this.teamPath, MAX_TEAM_BYTES);
         if (!this.#team || Array.isArray(this.#team) || typeof this.#team !== 'object') throw new Error('team.json 必须是团队元数据对象');
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
-      try {
-        workers = readBoundedJson(this.workersPath, MAX_WORKERS_BYTES);
-      } catch (error) {
-        if (!isMissing(error)) throw error;
-      }
-      if (!Array.isArray(workers)) throw new Error('workers.json 必须是工作者数组');
+      const { workers, records, legacy } = readWorkers(this.dir);
+      if (!legacy) for (const record of records) this.#files.set(record.id, record);
       for (const worker of workers) {
-        if (!worker || typeof worker.id !== 'string' || !worker.id) throw new Error('工作者记录缺少有效 id');
-        if (this.#workers.has(worker.id)) throw new Error(`工作者记录 id 重复：${worker.id}`);
         this.#workers.set(worker.id, worker);
+        this.#sizes.set(worker.id, Buffer.byteLength(JSON.stringify(worker)));
       }
       await this.#loadEvents();
       this.#active = true;
-      this.#compactIfNeeded();
+      if (compactEvents) this.#compactIfNeeded();
       return this;
     } catch (error) {
       this.#active = false;
@@ -96,6 +133,7 @@ export class Store extends EventEmitter {
   }
 
   #acquireLock() {
+    if (existsSync(path.join(this.dir, 'recovery.lock'))) throw new Error('状态目录正在执行锁恢复，请等待恢复结束');
     const token = randomUUID();
     let fd;
     try {
@@ -147,7 +185,7 @@ export class Store extends EventEmitter {
     try {
       const fd = openSync(temporary, 'wx', 0o600);
       created = true;
-      try { writeFileSync(fd, text, 'utf8'); } finally { closeSync(fd); }
+      try { writeFileSync(fd, text, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
       renameSync(temporary, file);
     } catch (error) {
       if (created) {
@@ -173,11 +211,59 @@ export class Store extends EventEmitter {
       next.set(record.id, record);
       return record;
     });
-    const encoded = JSON.stringify([...next.values()]);
-    if (Buffer.byteLength(encoded) > MAX_WORKERS_BYTES) throw new Error('工作者元数据超过 8 MiB 上限');
-    this.#writeAtomic(this.workersPath, encoded);
+    const changed = new Map(records.map(record => [record.id, record]));
+    // 旧数组格式只在第一次写入时迁移；索引原子替换是整个批次的提交点。
+    for (const [id, record] of next) if (!this.#files.has(id)) changed.set(id, record);
+    const encoded = [...changed.values()].map(record => {
+      const text = JSON.stringify(record);
+      const bytes = Buffer.byteLength(text);
+      if (bytes > MAX_WORKERS_BYTES) throw new Error(`工作者 ${record.id} 元数据超过 8 MiB 上限，请拆分任务或缩小交接内容`);
+      return { text, entry: { id: record.id, file: `${randomUUID()}.json`, bytes, name: record.name, cwd: record.cwd } };
+    });
+    const files = new Map(this.#files);
+    for (const { entry } of encoded) files.set(entry.id, entry);
+    const index = JSON.stringify({ format: 'cc-team-workers-v2', records: [...files.values()] });
+    if (Buffer.byteLength(index) > MAX_WORKERS_BYTES) throw new Error('团队索引超过 8 MiB，请关闭当前团队并创建新团队');
+    mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
+    const created = [];
+    try {
+      for (const { text, entry } of encoded) {
+        const file = path.join(this.recordsDir, entry.file);
+        this.#writeAtomic(file, text);
+        created.push(file);
+      }
+      this.#writeAtomic(this.workersPath, index);
+    } catch (error) {
+      const failures = [];
+      for (const file of created) {
+        try { unlinkSync(file); } catch (cleanup) { if (!isMissing(cleanup)) failures.push(cleanup); }
+      }
+      if (failures.length) throw new AggregateError([error, ...failures], '保存工作者失败，部分未提交记录需通过 prune 清理');
+      throw error;
+    }
+    const obsolete = encoded.map(({ entry }) => this.#files.get(entry.id)?.file).filter(Boolean);
+    this.#files = files;
     this.#workers = next;
+    for (const { entry } of encoded) this.#sizes.set(entry.id, entry.bytes);
+    for (const file of obsolete) {
+      try { unlinkSync(path.join(this.recordsDir, file)); }
+      catch (error) {
+        if (!isMissing(error)) this.#cleanupWarnings = [...this.#cleanupWarnings.slice(-9), `状态已保存，旧记录 ${file} 未能清理：${error.message}`];
+      }
+    }
     return jsonCopy(records);
+  }
+
+  storageInfo() {
+    this.#assertActive();
+    return { format: this.#files.size ? 'cc-team-workers-v2' : 'legacy', workerCount: this.#workers.size,
+      workerBytes: [...this.#sizes.values()].reduce((total, bytes) => total + bytes, 0),
+      maxWorkerBytes: MAX_WORKERS_BYTES, warnings: [...this.#cleanupWarnings] };
+  }
+
+  recordFiles() {
+    this.#assertActive();
+    return new Set([...this.#files.values()].map(record => record.file));
   }
 
   loadTeam() {

@@ -29,6 +29,7 @@ function processAlive(pid) {
     throw error;
   }
 }
+const unconfirmedProcess = data => data.status !== 'closed' && !data.processExited && processAlive(data.lastPid);
 
 export class TeamManager {
   constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, notifier, platform = process.platform }) {
@@ -142,13 +143,13 @@ export class TeamManager {
       if (!requests.has(request.workerId)) requests.set(request.workerId, []);
       requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(request.encodedPayload, 2000) });
     }
-    return { teamId: this.teamId, maxConcurrent: this.maxConcurrent,
+    return { teamId: this.teamId, maxConcurrent: this.maxConcurrent, storage: this.store.storageInfo(),
       runningCount: [...this.workers.values()].filter(worker => worker.controller).length,
       queuedCount: [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status)).length,
       workers: selected.map(({ data, controller }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
       model: data.model ?? '继承 CC 配置', status: data.status, sessionId: data.sessionId,
-      pid: controller?.pid ?? null, lastPid: data.lastPid, updatedAt: data.updatedAt, error: data.error,
+      pid: controller?.pid ?? null, lastPid: data.lastPid, processExited: data.processExited ?? false, updatedAt: data.updatedAt, error: data.error,
       pendingMessages: data.pendingMessages.length + (data.queuedMessages?.length ?? 0),
       dependsOn: (data.dependsOn ?? []).map(id => ({ id, name: this.workers.get(id)?.data.name })),
       queueReason: data.queueReason, blockedBy: data.blockedBy,
@@ -218,7 +219,7 @@ export class TeamManager {
 
   assertScopes(specs, excludeId, graph = this.dependencyGraph(specs)) {
     const current = [...this.workers.values()].filter(w => w.data.id !== excludeId &&
-      (w.controller || ['queued', 'blocked'].includes(w.data.status) || (w.data.status !== 'closed' && processAlive(w.data.lastPid))));
+      (w.controller || ['queued', 'blocked'].includes(w.data.status) || unconfirmedProcess(w.data)));
     const all = [...current.map(w => w.data), ...specs];
     if (all.every(worker => worker.access === 'read')) return;
     // 同一路径按拓扑顺序处理；后续写者覆盖前置所有者，避免串行长链逐对比较。
@@ -372,7 +373,7 @@ export class TeamManager {
       const graph = this.dependencyGraph();
       const acceptance = this.acceptanceState();
       const activeWorkers = [...this.workers.values()].filter(item => item.controller || item.closingPromise ||
-        (item.data.status !== 'closed' && processAlive(item.data.lastPid)));
+        unconfirmedProcess(item.data));
       const queued = [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status))
         .sort((a, b) => graph.rank.get(a.data.id) - graph.rank.get(b.data.id));
       for (const worker of queued) {
@@ -402,7 +403,7 @@ export class TeamManager {
           const canRetire = item => item.controller && item.data.status === 'idle' && item.data.lastReview?.accepted &&
             item.data.lastReview.resultId === item.data.lastResult?.resultId && !item.closingPromise;
           const retiring = conflicts.length ? conflicts.filter(canRetire) : running.filter(canRetire).slice(0, 1);
-          this.setQueueState(worker, 'queued', conflicts.length ? 'waiting_scope' : 'waiting_capacity', conflicts.length ? conflicts : running);
+          this.setQueueState(worker, 'queued', conflicts.length ? 'waiting_scope' : 'waiting_capacity', conflicts);
           for (const item of retiring) {
             this.closeWorker(item.data.id).catch(error => {
               item.data.error = clip(error.message, 2000);
@@ -413,6 +414,8 @@ export class TeamManager {
           continue;
         }
         worker.data.status = 'starting';
+        worker.data.processExited = false;
+        worker.data.lastPid = undefined;
         worker.data.error = undefined;
         worker.data.queueReason = undefined;
         worker.data.blockedBy = [];
@@ -467,6 +470,7 @@ export class TeamManager {
         if (worker.controller !== controller) return;
         worker.generation++;
         worker.controller = null;
+        worker.data.processExited = true;
         if (worker.data.status !== 'closed' && worker.data.status !== 'closing') {
           if (!['awaiting_review', 'failed', 'idle'].includes(worker.data.status)) worker.data.status = 'stopped';
           worker.data.pendingMessages = [];
@@ -480,6 +484,7 @@ export class TeamManager {
         if (!processAlive(controller.pid)) {
           worker.generation++;
           worker.controller = null;
+          worker.data.processExited = true;
           worker.data.pendingMessages = [];
         }
         this.fail(worker, error);
@@ -563,7 +568,7 @@ export class TeamManager {
       }
       const prepared = this.prepare(worker.data);
       const conflict = [...this.workers.values()].find(other => other !== worker &&
-        (other.controller || (other.data.status !== 'closed' && processAlive(other.data.lastPid))) && this.scopesOverlap(prepared, other.data));
+        (other.controller || unconfirmedProcess(other.data)) && this.scopesOverlap(prepared, other.data));
       if (conflict) throw new Error(`追加任务的工作范围与 ${conflict.data.name} 冲突，请先完成并关闭冲突工作者`);
       Object.assign(worker.data, prepared);
       this.deliver(worker, text, messageId);
@@ -718,7 +723,7 @@ export class TeamManager {
     if (worker.data.status === 'closing' || worker.closingPromise) throw new Error('工作者正在关闭');
     if (worker.controller) throw new Error('工作进程仍在运行，请用 send 追加指令');
     if (!worker.data.sessionId && worker.data.startedAt) throw new Error('没有可恢复的 CC 会话 ID；请新建工作者重试启动');
-    if (worker.data.status !== 'closed' && processAlive(worker.data.lastPid)) {
+    if (unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活，请核实并关闭原进程后恢复`);
     }
     const prepared = this.prepare(worker.data);
@@ -772,12 +777,20 @@ export class TeamManager {
     if (accepted && this.acceptanceState().get(id).staleDependencies.length) {
       throw new Error('前置结果版本或验收已更新，请使用当前已验收的前置交付重新执行后再验收');
     }
-    worker.data.lastReview = { accepted, note, handoff, resultId: worker.data.lastResult.resultId, at: new Date().toISOString() };
-    worker.data.status = accepted ? 'idle' : 'awaiting_review';
-    this.save(worker);
-    this.event(id, 'review', worker.data.lastReview);
-    this.schedule();
-    return { id, name: worker.data.name, accepted, resultId: worker.data.lastResult.resultId, status: worker.data.status };
+    const previous = worker.data;
+    worker.data = { ...previous,
+      lastReview: { accepted, note, handoff, resultId: previous.lastResult.resultId, at: new Date().toISOString() },
+      status: accepted ? 'idle' : 'awaiting_review' };
+    try { this.save(worker); }
+    catch (error) { worker.data = previous; this.acceptanceCache = undefined; throw error; }
+    // 持久化成功即为验收提交点；辅助步骤失败不能伪报验收未生效。
+    const warnings = [];
+    try { this.event(id, 'review', worker.data.lastReview); }
+    catch (error) { warnings.push(`验收已保存，但事件记录失败：${error.message}`); }
+    try { this.schedule(); }
+    catch (error) { warnings.push(`验收已保存，但后续调度失败：${error.message}`); }
+    return { id, name: worker.data.name, accepted, resultId: worker.data.lastResult.resultId, status: worker.data.status,
+      ...(warnings.length ? { warnings } : {}) };
   }
 
   async closeWorker(id) {
@@ -789,7 +802,7 @@ export class TeamManager {
 
   async finishCloseWorker(worker) {
     const id = worker.data.id;
-    if (!worker.controller && worker.data.status !== 'closed' && processAlive(worker.data.lastPid)) {
+    if (!worker.controller && unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活且不由当前团队控制，请核实原进程后重试关闭`);
     }
     if (['queued', 'blocked'].includes(worker.data.status)) worker.data.cancelled = true;
@@ -802,6 +815,7 @@ export class TeamManager {
       worker.controller = null;
     }
     worker.data.status = 'closed';
+    worker.data.processExited = true;
     worker.data.pendingMessages = [];
     worker.data.queueReason = undefined;
     worker.data.blockedBy = [];
@@ -816,7 +830,7 @@ export class TeamManager {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => this.notifier?.close()),
       ...[...this.workers.values()].filter(w => w.controller || w.closingPromise || ['queued', 'blocked'].includes(w.data.status) ||
-        (w.data.status !== 'closed' && processAlive(w.data.lastPid))).map(w => this.closeWorker(w.data.id)),
+        unconfirmedProcess(w.data)).map(w => this.closeWorker(w.data.id)),
     ]);
     const errors = results.filter(r => r.status === 'rejected').map(r => r.reason);
     if (errors.length) throw new AggregateError(errors, '部分工作进程或通知进程未能关闭，未释放团队锁');

@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { loadConfig, executableCommand } from './config.mjs';
 import { TeamManager } from './manager.mjs';
 import { CodexNotifier } from './notifier.mjs';
+import { workerCatalog } from './store.mjs';
 
 const uuid = z.string().uuid();
 const text = z.string().min(1).max(30000);
@@ -83,8 +84,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
         const file = resolve(config.stateDir, teamId, 'workers.json');
         const info = await stat(file);
         if (info.size > 8 * 1024 * 1024) throw new Error('工作者状态文件超过大小限制');
-        const workers = JSON.parse(await readFile(file, 'utf8'));
-        if (!Array.isArray(workers)) throw new Error('工作者状态格式无效');
+        const workers = workerCatalog(JSON.parse(await readFile(file, 'utf8'))).records;
         Object.assign(summary, { updatedAt: info.mtime.toISOString(), workerCount: workers.length,
           workerNames: workers.slice(0, 10).map(worker => worker.name),
           projects: [...new Set(workers.map(worker => worker.cwd))].slice(0, 5) });
@@ -175,7 +175,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   register('team_resume', '恢复已关闭/停止的原工作者并重新排队；已取消且从未启动的任务也可按原名恢复。不得同时恢复仍运行的会话。', {
     workerId: workerReference, message: text,
   }, ({ workerId, message }) => requireTeam().resume(workerId, message));
-  register('team_review', '检查完整交付、实际diff和测试后验收，并传入读取到的resultId以防结果在审批期间变化。accepted才释放下游依赖；handoff交接接口/文件。排队任务需要时自动回收已验收进程。', {
+  register('team_review', '检查完整交付、实际diff和测试后验收，并传入读取到的resultId以防结果在审批期间变化。accepted才释放下游依赖；handoff交接接口/文件。排队任务需要时自动回收已验收进程。返回warnings时验收已持久保存，须按警告检查事件或调度状态，不要当作验收未生效而重试。', {
     workerId: workerReference, accepted: z.boolean(), note: z.string().trim().min(1).max(4000)
       .describe('实际检查的文件/差异、测试命令及结果、未验证项；不可仅复述工作者的完成声明'),
     handoff: z.string().max(12000).optional(),

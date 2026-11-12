@@ -31,7 +31,7 @@ async function fixture(t) {
   const factory = options => {
     const finished = deferred();
     const controller = {
-      options, finished, done: finished.promise, pid: 4321, sent: [], closeCalls: 0, interruptCalls: 0,
+      options, finished, done: finished.promise, sent: [], closeCalls: 0, interruptCalls: 0,
       send(text, messageId) { this.sent.push({ text, messageId }); },
       interrupt() { this.interruptCalls += 1; return Promise.resolve({ interrupted: true }); },
       async close() {
@@ -591,6 +591,7 @@ test('异常停止记录的 PID 仍存活时阻止重复启动', async t => {
   f.controllers[0].finished.resolve();
   await tick();
   manager.get(worker.id).data.lastPid = process.pid;
+  manager.get(worker.id).data.processExited = false;
   assert.throws(() => manager.resume(worker.id, '继续'), /PID.*仍存活/);
   assert.throws(() => manager.dispatch([f.spec('B', { access: 'write', scope: ['front'] })]), /冲突/);
   await assert.rejects(manager.closeWorker(worker.id), /PID.*仍存活/);
@@ -915,13 +916,102 @@ test('成功结果之后进程自然退出仍可验收并释放依赖', async t 
   const f = await fixture(t);
   const manager = await f.create();
   const [a, b] = manager.dispatch([f.spec('A', { access: 'write' }), f.spec('B', { access: 'write', dependsOn: ['A'] })]);
+  f.controllers[0].pid = process.pid;
   f.controllers[0].emit('result', { success: true, text: '已完成完整交付', sessionId: 'session-a' });
   f.controllers[0].finished.resolve();
   await tick();
   assert.equal(manager.get(a.id).controller, null);
+  assert.equal(manager.get(a.id).data.lastPid, process.pid);
+  assert.equal(manager.get(a.id).data.processExited, true);
   assert.equal(manager.get(a.id).data.status, 'awaiting_review');
   manager.review(a.id, true, '检查通过');
   assert.equal(manager.get(b.id).data.status, 'running');
+});
+
+test('验收写盘失败保持待验收，后续调度和重开均不能放行下游', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })]);
+  f.controllers[0].emit('result', { success: true, text: '交付', sessionId: 'session-a' });
+  const before = structuredClone(manager.get(a.id).data);
+  const original = manager.store.saveWorker;
+  manager.store.saveWorker = () => { throw new Error('模拟写盘失败'); };
+  try { assert.throws(() => manager.review(a.id, true, '已检查', undefined, before.lastResult.resultId), /模拟写盘失败/); }
+  finally { manager.store.saveWorker = original; }
+  assert.deepEqual(manager.get(a.id).data, before);
+  assert.equal(manager.status().workers.find(w => w.id === a.id).acceptedCurrent, false);
+  assert.equal(manager.store.listWorkers().find(w => w.id === a.id).lastReview, undefined);
+  manager.updateMaxConcurrent(4);
+  assert.equal(manager.get(b.id).data.status, 'queued');
+  assert.equal(f.controllers.length, 1);
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal(reopened.status().workers.find(w => w.id === a.id).acceptedCurrent, false);
+  assert.equal(f.controllers.length, 1);
+});
+
+test('验收提交后事件写入失败明确返回已保存和警告，不误报审批未生效', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  f.controllers[0].emit('result', { success: true, text: '交付' });
+  const original = manager.store.append;
+  manager.store.append = () => { throw new Error('模拟事件写入失败'); };
+  let result;
+  try { result = manager.review(a.id, true, '已检查', undefined, manager.get(a.id).data.lastResult.resultId); }
+  finally { manager.store.append = original; }
+  assert.equal(result.accepted, true);
+  assert.match(result.warnings[0], /验收已保存.*事件.*失败/);
+  assert.equal(manager.store.listWorkers()[0].lastReview.accepted, true);
+  assert.equal(manager.status().workers[0].acceptedCurrent, true);
+});
+
+test('已确认退出的历史 PID 被复用时，重开仍能恢复；新进程重置退出标记', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  f.controllers[0].pid = process.pid;
+  f.controllers[0].emit('session', { sessionId: 'session-a' });
+  f.controllers[0].finished.resolve();
+  await tick();
+  assert.equal(manager.get(a.id).data.processExited, true);
+  await manager.close();
+  const reopened = await f.create();
+  reopened.resume(a.id, '继续');
+  assert.equal(reopened.get(a.id).data.status, 'running');
+  assert.equal(reopened.get(a.id).data.processExited, false);
+  assert.equal(reopened.get(a.id).data.lastPid, undefined);
+});
+
+test('64 个排队任务连续完成和验收，并发不超限且重开保留全部结果', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 4 });
+  const capacityEvents = new Map();
+  manager.store.on('appended', event => {
+    if (event.type === 'queued' && event.data.reason === 'waiting_capacity') capacityEvents.set(event.workerId, (capacityEvents.get(event.workerId) ?? 0) + 1);
+  });
+  const workers = manager.dispatch(Array.from({ length: 64 }, (_, index) => f.spec(`任务${index}`)));
+  const reviewed = new Set();
+  for (let step = 0; step < 128 && reviewed.size < workers.length; step++) {
+    for (const worker of [...manager.workers.values()]) {
+      if (worker.data.status !== 'running') continue;
+      const controller = worker.controller;
+      controller.emit('result', { success: true, text: `完成 ${worker.data.id}`, messageId: controller.sent.at(-1).messageId });
+      manager.review(worker.data.id, true, '核对任务标识和结果', undefined, worker.data.lastResult.resultId);
+      reviewed.add(worker.data.id);
+      assert(manager.status().runningCount <= 4);
+    }
+    await tick();
+  }
+  assert.equal(reviewed.size, 64);
+  assert([...capacityEvents.values()].every(count => count === 1), '容量等待原因未变化时不重复写入整批排队状态');
+  assert.equal(manager.status().queuedCount, 0);
+  assert(manager.status().workers.every(worker => worker.acceptedCurrent));
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal(reopened.status().workers.length, 64);
+  assert(reopened.status().workers.every(worker => worker.acceptedCurrent));
+  assert.equal(reopened.status().runningCount, 0);
 });
 
 test('恢复未启动队列保留断连前已接受的所有追加要求', async t => {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -151,4 +151,47 @@ test('团队元数据原子保存并跨重启保留，读取返回副本', async
   store.close();
   const restored = await f.create();
   assert.equal(restored.loadTeam().constraints, '保留用户已有修改');
+});
+
+test('旧数组格式迁移为索引，单个工作者更新不重写其他记录', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.dir, 'workers.json'), JSON.stringify([{ id: 'a', prompt: '旧任务' }, { id: 'b', prompt: '保留' }]));
+  const store = await f.create();
+  store.saveWorker({ id: 'a', prompt: '新版' });
+  const first = JSON.parse(readFileSync(store.workersPath, 'utf8'));
+  const b = first.records.find(r => r.id === 'b');
+  store.saveWorker({ id: 'a', prompt: '再次更新' });
+  const next = JSON.parse(readFileSync(store.workersPath, 'utf8'));
+  assert.deepEqual(next.records.find(r => r.id === 'b'), b);
+  assert.equal(readdirSync(store.recordsDir).length, 2);
+  store.close();
+  assert.deepEqual((await f.create()).listWorkers(), [{ id: 'a', prompt: '再次更新' }, { id: 'b', prompt: '保留' }]);
+});
+
+test('团队记录合计超过 8 MiB 仍可保存恢复，单记录上限继续生效', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  const payload = 'x'.repeat(800000);
+  store.saveWorkers(Array.from({ length: 12 }, (_, index) => ({ id: `worker-${index}`, prompt: payload })));
+  assert(store.storageInfo().workerBytes > 8 * 1024 * 1024);
+  assert(statSync(store.workersPath).size < 10000);
+  assert.throws(() => store.saveWorker({ id: 'oversize', prompt: 'x'.repeat(8 * 1024 * 1024) }), /8 MiB/);
+  assert.equal(store.listWorkers().length, 12);
+  store.close();
+  const reopened = await f.create();
+  assert.equal(reopened.listWorkers().length, 12);
+  assert.equal(reopened.listWorkers()[11].prompt, payload);
+});
+
+test('批次索引提交失败保留原始数据，不遗留部分提交的新记录', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  store.saveWorker({ id: 'a', prompt: '原始' });
+  const before = readFileSync(store.workersPath, 'utf8');
+  const token = JSON.parse(readFileSync(store.lockPath, 'utf8')).token;
+  mkdirSync(`${store.workersPath}.${token}.tmp`);
+  assert.throws(() => store.saveWorkers([{ id: 'a', prompt: '改变' }, { id: 'b', prompt: '新增' }]));
+  assert.equal(readFileSync(store.workersPath, 'utf8'), before);
+  assert.deepEqual(store.listWorkers(), [{ id: 'a', prompt: '原始' }]);
+  assert.equal(readdirSync(store.recordsDir).length, 1);
 });
