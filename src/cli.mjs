@@ -17,7 +17,7 @@ const help = `CC Team MCP — Codex 协调本机 Claude Code
   print-config  输出通用 MCP JSON 配置
   setup         使用 codex mcp add 注册服务；保留已有同名配置
   prune         预览已关闭团队的历史结果清理，保护仍被引用的版本
-  recover       预览异常退出团队的锁恢复，拒绝仍存活的进程
+  recover       预览异常退出团队的锁及日志尾行恢复，拒绝未完成收尾的任务
   --team ID     prune/recover 的团队 ID
   --keep-results N  prune 每名工作者至少保留最近 N 份结果（必填）
   --apply       prune/recover 实际执行；省略时仅预览
@@ -106,7 +106,7 @@ export async function runCli(args = process.argv.slice(2), {
       const { pruneTeam, recoverTeam } = await import('./maintenance.mjs');
       const result = options.command === 'prune'
         ? await pruneTeam(config, options.team, { keepResults: Number(options['keep-results']), apply: options.apply })
-        : recoverTeam(config, options.team, { apply: options.apply });
+        : await recoverTeam(config, options.team, { apply: options.apply });
       stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return 0;
     }

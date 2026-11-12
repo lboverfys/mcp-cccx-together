@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFile, open } from 'node:fs/promises';
 import path from 'node:path';
-import { Store, processIsAlive, readWorkers } from './store.mjs';
+import { Store, processIsAlive, readWorkers, assertBackgroundTasksStopped, scanEventLog } from './store.mjs';
 import { ResultStore } from './results.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -16,6 +17,7 @@ function teamDirectory(config, teamId) {
 
 function assertStopped(workers) {
   for (const worker of workers) {
+    assertBackgroundTasksStopped(worker);
     if (worker.status === 'closed' || worker.processExited) continue;
     if (worker.lastPid && processIsAlive(worker.lastPid)) throw new Error(`工作者 ${worker.name ?? worker.id} 的 PID ${worker.lastPid} 仍存活，未执行维护`);
     if (worker.startedAt && !worker.lastPid) throw new Error(`工作者 ${worker.name ?? worker.id} 缺少退出确认及 PID，请先核实并关闭原进程`);
@@ -97,26 +99,51 @@ function staleLock(directory) {
   const owner = JSON.parse(readFileSync(file, 'utf8'));
   if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0 || typeof owner.token !== 'string' || !owner.token) throw new Error('锁文件格式异常，未修改');
   if (processIsAlive(owner.pid)) throw new Error(`团队持有进程 ${owner.pid} 仍存活，不能恢复锁`);
-  assertStopped(readWorkers(directory).workers);
   return owner;
 }
 
-export function recoverTeam(config, teamId, { apply = false } = {}) {
+async function repairEventLog(filePath, eventLog) {
+  const backup = `${filePath}.recovered-${randomUUID()}.bak`;
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  await copyFile(filePath, backup, constants.COPYFILE_EXCL);
+  let created = false;
+  try {
+    const saved = await open(backup, 'r+');
+    try { await saved.sync(); } finally { await saved.close(); }
+    await copyFile(backup, temporary, constants.COPYFILE_EXCL);
+    created = true;
+    const file = await open(temporary, 'r+');
+    try {
+      if (eventLog.tailAction === 'truncate') await file.truncate(eventLog.completeBytes);
+      else await file.write(Buffer.from('\n'), 0, 1, eventLog.bytes);
+      await file.sync();
+    } finally { await file.close(); }
+    renameSync(temporary, filePath);
+    created = false;
+    return backup;
+  } catch (error) {
+    throw new Error(`日志恢复失败，原日志备份保留在 ${backup}：${error.message}`, { cause: error });
+  } finally { if (created) unlinkSync(temporary); }
+}
+
+export async function recoverTeam(config, teamId, { apply = false } = {}) {
   const directory = teamDirectory(config, teamId);
   const gate = path.join(directory, 'recovery.lock');
-  if (!apply) {
-    if (existsSync(gate)) throw new Error('已有恢复操作或未完成的恢复锁，请先核实 recovery.lock');
-    const owner = staleLock(directory);
-    return { teamId, applied: false, recoverable: Boolean(owner), owner };
-  }
-  // 恢复操作互斥；普通打开也检查此锁，避免移走另一个恢复者刚创建的正常锁。
-  const handle = openSync(gate, 'wx', 0o600);
+  if (!apply && existsSync(gate)) throw new Error('已有恢复操作或未完成的恢复锁，请先核实 recovery.lock');
+  // 修复期间阻止团队打开，完成全部检查后才替换日志和移走旧锁。
+  const handle = apply ? openSync(gate, 'wx', 0o600) : undefined;
   try {
-    writeFileSync(handle, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    if (apply) writeFileSync(handle, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
     const owner = staleLock(directory);
-    if (!owner) return { teamId, applied: false, recoverable: false, owner: null };
-    const backup = `store.lock.recovered-${randomUUID()}.json`;
-    renameSync(path.join(directory, 'store.lock'), path.join(directory, backup));
-    return { teamId, applied: true, recovered: true, owner, backup: path.join(directory, backup) };
-  } finally { closeSync(handle); unlinkSync(gate); }
+    assertStopped(readWorkers(directory).workers);
+    const eventsPath = path.join(directory, 'events.jsonl');
+    if (existsSync(eventsPath) && !lstatSync(eventsPath).isFile()) throw new Error('事件日志必须是普通文件，不能经链接恢复');
+    const eventLog = await scanEventLog(eventsPath, { allowIncompleteTail: true });
+    const plan = { teamId, applied: false, recoverable: Boolean(owner || eventLog.tailAction), owner, eventLog };
+    if (!apply || !plan.recoverable) return plan;
+    const eventsBackup = eventLog.tailAction ? await repairEventLog(eventsPath, eventLog) : undefined;
+    const backup = owner ? path.join(directory, `store.lock.recovered-${randomUUID()}.json`) : undefined;
+    if (backup) renameSync(path.join(directory, 'store.lock'), backup);
+    return { ...plan, applied: true, recovered: true, ...(backup ? { backup } : {}), ...(eventsBackup ? { eventsBackup } : {}) };
+  } finally { if (handle !== undefined) { closeSync(handle); unlinkSync(gate); } }
 }

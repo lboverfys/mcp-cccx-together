@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { realpathSync, statSync, mkdirSync } from 'node:fs';
 import { resolve, relative, isAbsolute, sep, dirname, basename } from 'node:path';
-import { Store } from './store.mjs';
+import { Store, assertBackgroundTasksStopped } from './store.mjs';
 import { createClaudeWorker } from './claude-worker.mjs';
 import { ResultStore } from './results.mjs';
 
@@ -30,6 +30,7 @@ function processAlive(pid) {
   }
 }
 const unconfirmedProcess = data => data.status !== 'closed' && !data.processExited && processAlive(data.lastPid);
+const unconfirmedResources = data => data.backgroundTasks?.length || unconfirmedProcess(data);
 
 export class TeamManager {
   constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, notifier, platform = process.platform }) {
@@ -219,7 +220,7 @@ export class TeamManager {
 
   assertScopes(specs, excludeId, graph = this.dependencyGraph(specs)) {
     const current = [...this.workers.values()].filter(w => w.data.id !== excludeId &&
-      (w.controller || ['queued', 'blocked'].includes(w.data.status) || unconfirmedProcess(w.data)));
+      (w.controller || ['queued', 'blocked'].includes(w.data.status) || unconfirmedResources(w.data)));
     const all = [...current.map(w => w.data), ...specs];
     if (all.every(worker => worker.access === 'read')) return;
     // 同一路径按拓扑顺序处理；后续写者覆盖前置所有者，避免串行长链逐对比较。
@@ -373,7 +374,7 @@ export class TeamManager {
       const graph = this.dependencyGraph();
       const acceptance = this.acceptanceState();
       const activeWorkers = [...this.workers.values()].filter(item => item.controller || item.closingPromise ||
-        unconfirmedProcess(item.data));
+        unconfirmedResources(item.data));
       const queued = [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status))
         .sort((a, b) => graph.rank.get(a.data.id) - graph.rank.get(b.data.id));
       for (const worker of queued) {
@@ -568,7 +569,7 @@ export class TeamManager {
       }
       const prepared = this.prepare(worker.data);
       const conflict = [...this.workers.values()].find(other => other !== worker &&
-        (other.controller || unconfirmedProcess(other.data)) && this.scopesOverlap(prepared, other.data));
+        (other.controller || unconfirmedResources(other.data)) && this.scopesOverlap(prepared, other.data));
       if (conflict) throw new Error(`追加任务的工作范围与 ${conflict.data.name} 冲突，请先完成并关闭冲突工作者`);
       Object.assign(worker.data, prepared);
       this.deliver(worker, text, messageId);
@@ -722,6 +723,7 @@ export class TeamManager {
     id = worker.data.id;
     if (worker.data.status === 'closing' || worker.closingPromise) throw new Error('工作者正在关闭');
     if (worker.controller) throw new Error('工作进程仍在运行，请用 send 追加指令');
+    assertBackgroundTasksStopped(worker.data);
     if (!worker.data.sessionId && worker.data.startedAt) throw new Error('没有可恢复的 CC 会话 ID；请新建工作者重试启动');
     if (unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活，请核实并关闭原进程后恢复`);
@@ -802,6 +804,7 @@ export class TeamManager {
 
   async finishCloseWorker(worker) {
     const id = worker.data.id;
+    if (!worker.controller) assertBackgroundTasksStopped(worker.data);
     if (!worker.controller && unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活且不由当前团队控制，请核实原进程后重试关闭`);
     }
@@ -812,6 +815,7 @@ export class TeamManager {
     if (worker.controller) {
       const controller = worker.controller;
       await controller.close();
+      assertBackgroundTasksStopped(worker.data);
       worker.controller = null;
     }
     worker.data.status = 'closed';
@@ -830,10 +834,10 @@ export class TeamManager {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => this.notifier?.close()),
       ...[...this.workers.values()].filter(w => w.controller || w.closingPromise || ['queued', 'blocked'].includes(w.data.status) ||
-        unconfirmedProcess(w.data)).map(w => this.closeWorker(w.data.id)),
+        unconfirmedResources(w.data)).map(w => this.closeWorker(w.data.id)),
     ]);
     const errors = results.filter(r => r.status === 'rejected').map(r => r.reason);
-    if (errors.length) throw new AggregateError(errors, '部分工作进程或通知进程未能关闭，未释放团队锁');
+    if (errors.length) throw new AggregateError(errors, `部分工作进程、后台任务或通知进程未能关闭，未释放团队锁：${errors.map(error => error.message).join('; ')}`);
     this.store.close();
   }
 }

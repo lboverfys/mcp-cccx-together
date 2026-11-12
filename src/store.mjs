@@ -70,6 +70,68 @@ export function processIsAlive(pid) {
   }
 }
 
+export function assertBackgroundTasksStopped(worker) {
+  if (worker.backgroundTasks?.length) {
+    throw new Error(`工作者 ${worker.name ?? worker.id} 的后台任务尚未确认停止：${worker.backgroundTasks.map(task => task.task_id).join(', ')}；请先核实并处理原后台任务`);
+  }
+}
+
+function validateEvent(event, lastCursor) {
+  if (!event || !Number.isSafeInteger(event.cursor) || event.cursor <= lastCursor || typeof event.type !== 'string') {
+    throw new Error('事件日志的游标或类型无效');
+  }
+}
+
+export async function scanEventLog(filePath, { allowIncompleteTail = false, onEvent } = {}) {
+  const summary = { bytes: 0, count: 0, lastCursor: 0, completeBytes: 0, tailBytes: 0, tailAction: null };
+  let file;
+  try { file = await open(filePath, 'r'); } catch (error) {
+    if (isMissing(error)) return summary;
+    throw error;
+  }
+  const chunk = Buffer.allocUnsafe(MAX_EVENT_BYTES);
+  let pending = Buffer.alloc(0);
+  try {
+    for (;;) {
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      summary.bytes += bytesRead;
+      const data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      let start = 0;
+      for (;;) {
+        const end = data.indexOf(10, start);
+        if (end === -1) break;
+        const line = data.subarray(start, end);
+        if (line.length + 1 > MAX_EVENT_BYTES) throw new Error('事件日志含超过 64 KiB 的记录');
+        const event = JSON.parse(line.toString('utf8'));
+        validateEvent(event, summary.lastCursor);
+        onEvent?.(event, line.length + 1);
+        summary.lastCursor = event.cursor;
+        summary.count++;
+        summary.completeBytes += line.length + 1;
+        start = end + 1;
+      }
+      pending = Buffer.from(data.subarray(start));
+      if (pending.length >= MAX_EVENT_BYTES) throw new Error('事件日志含超过 64 KiB 的记录');
+    }
+    summary.tailBytes = pending.length;
+    if (pending.length) {
+      if (!allowIncompleteTail) throw new Error('事件日志尾行不完整，请使用 recover 预览并备份修复');
+      let event;
+      try { event = JSON.parse(pending.toString('utf8')); }
+      catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        summary.tailAction = 'truncate';
+      }
+      if (summary.tailAction !== 'truncate') {
+        validateEvent(event, summary.lastCursor);
+        summary.tailAction = 'append_newline';
+      }
+    }
+    return summary;
+  } finally { await file.close(); }
+}
+
 export class Store extends EventEmitter {
   #workers = new Map();
   #team = {};
@@ -156,6 +218,7 @@ export class Store extends EventEmitter {
     }
     try {
       writeFileSync(fd, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), 'utf8');
+      if (existsSync(path.join(this.dir, 'recovery.lock'))) throw new Error('状态目录正在执行恢复，请等待恢复结束');
       this.#token = token;
     } catch (error) {
       closeSync(fd);
@@ -296,40 +359,9 @@ export class Store extends EventEmitter {
   }
 
   async #loadEvents() {
-    let file;
-    try { file = await open(this.eventsPath, 'r'); } catch (error) {
-      if (isMissing(error)) return;
-      throw error;
-    }
-    const chunk = Buffer.allocUnsafe(MAX_EVENT_BYTES);
-    let pending = Buffer.alloc(0);
-    try {
-      for (;;) {
-        const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
-        if (!bytesRead) break;
-        this.#logBytes += bytesRead;
-        const data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
-        let start = 0;
-        for (;;) {
-          const end = data.indexOf(10, start);
-          if (end === -1) break;
-          const line = data.subarray(start, end);
-          if (line.length + 1 > MAX_EVENT_BYTES) throw new Error('事件日志含超过 64 KiB 的记录');
-          const event = JSON.parse(line.toString('utf8'));
-          if (!Number.isSafeInteger(event.cursor) || event.cursor <= this.#lastCursor || typeof event.type !== 'string') {
-            throw new Error('事件日志的游标或类型无效');
-          }
-          this.#remember(event, line.length + 1);
-          this.#logCount += 1;
-          start = end + 1;
-        }
-        pending = Buffer.from(data.subarray(start));
-        if (pending.length >= MAX_EVENT_BYTES) throw new Error('事件日志含超过 64 KiB 的记录');
-      }
-      if (pending.length) throw new Error('事件日志尾行不完整，请保留文件并检查异常退出原因');
-    } finally {
-      await file.close();
-    }
+    const summary = await scanEventLog(this.eventsPath, { onEvent: (event, bytes) => this.#remember(event, bytes) });
+    this.#logBytes = summary.bytes;
+    this.#logCount = summary.count;
   }
 
   #compactIfNeeded() {

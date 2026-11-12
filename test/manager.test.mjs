@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, realpathSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { TeamManager } from '../src/manager.mjs';
@@ -890,6 +890,59 @@ test('中断和后台任务结果不能验收，后台结束后可继续发送�
   assert.throws(() => manager.review(a.id, true, '不应通过'), /待验收/);
   controller.emit('background_tasks', { tasks: [] });
   assert.equal(manager.get(a.id).data.status, 'idle');
+});
+
+test('后台任务未确认停止时，进程退出不能放行关闭、恢复或冲突任务，重开仍保留阻塞', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  let reopened;
+  const [a, b] = manager.dispatch([
+    f.spec('A', { access: 'write', scope: ['front'] }),
+    f.spec('B', { access: 'write', scope: ['back'] }),
+  ]);
+  const controller = f.controllers[0];
+  controller.emit('session', { sessionId: 'session-a' });
+  controller.emit('background_tasks', { tasks: [{ task_id: 'unconfirmed-build' }] });
+  controller.finished.reject(new Error('输出流已结束，未能确认后台任务停止'));
+  await tick();
+  try {
+    assert.equal(manager.get(a.id).controller, null);
+    assert.equal(manager.get(a.id).data.processExited, true);
+    await assert.rejects(manager.closeWorker(a.id), /unconfirmed-build/);
+    assert.equal(manager.get(a.id).data.status, 'failed');
+    assert.throws(() => manager.resume(a.id, '继续'), /unconfirmed-build/);
+    assert.throws(() => manager.dispatch([f.spec('C', { access: 'write', scope: ['front'] })]), /冲突/);
+    await assert.rejects(manager.close(), error => error instanceof AggregateError
+      && error.errors.some(item => /unconfirmed-build/.test(item.message)));
+    assert(existsSync(manager.store.lockPath));
+    assert.equal(manager.get(b.id).data.status, 'closed');
+    assert.equal(manager.store.listWorkers().find(worker => worker.id === a.id).backgroundTasks.length, 1);
+    manager.store.close(); // 模拟管理进程退出后重新打开持久状态。
+    reopened = await f.create();
+    assert.throws(() => reopened.resume(a.id, '重开后继续'), /unconfirmed-build/);
+    await assert.rejects(reopened.close(), /后台任务/);
+    assert(existsSync(reopened.store.lockPath));
+  } finally {
+    // 模拟任务没有实际进程；仅清理本测试的未完成记录以释放 fixture。
+    manager.get(a.id).data.backgroundTasks = [];
+    if (reopened) reopened.get(a.id).data.backgroundTasks = [];
+  }
+});
+
+test('关闭收到后台任务空快照后可以确认收尾', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('background_tasks', { tasks: [{ task_id: 'owned-build' }] });
+  controller.close = async () => {
+    controller.emit('background_tasks', { tasks: [] });
+    controller.finished.resolve();
+  };
+  assert.equal((await manager.closeWorker(a.id)).status, 'closed');
+  assert.deepEqual(manager.get(a.id).data.backgroundTasks, []);
+  await manager.close();
+  assert(!existsSync(manager.store.lockPath));
 });
 
 test('新会话打开保存的队列只恢复记录，需显式resume再运行', async t => {

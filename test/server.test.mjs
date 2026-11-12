@@ -114,14 +114,14 @@ async function fixture(t) {
   const controllers = [];
   const notifiers = [];
   const factory = options => {
-    let finish;
+    let finish, fail;
     const controller = {
-      options, done: new Promise(resolve => { finish = resolve; }),
+      options, done: new Promise((resolve, reject) => { finish = resolve; fail = reject; }),
       sent: [], closeCalls: 0, interruptCalls: 0,
       send(text, messageId) { this.sent.push({ text, messageId }); },
       async interrupt() { this.interruptCalls++; return { interrupted: true }; },
       async close() { this.closeCalls++; finish(); },
-      emit: options.emit, request: options.request,
+      emit: options.emit, request: options.request, fail(error) { fail(error); },
     };
     controllers.push(controller);
     return controller;
@@ -169,6 +169,31 @@ async function fixture(t) {
   const spec = (name, extra = {}) => ({ name, cwd, prompt: `执行 ${name}`, ...extra });
   return { dir, cwd, config, controllers, notifiers, connect, spec };
 }
+
+test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回明确失败', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'unfinished-background', notifications: false });
+  const { workers: [worker] } = await endpoint.call('team_dispatch', { workers: [f.spec('构建cc')] });
+  const controller = f.controllers[0];
+  controller.emit('background_tasks', { tasks: [{ task_id: 'unfinished-build' }] });
+  controller.fail(new Error('输出流结束，后台任务未确认停止'));
+  await tick();
+  try {
+    const closed = await endpoint.call('team_close', { workerIds: [worker.id] });
+    assert.equal(closed.workers[0].closed, false);
+    assert.match(closed.workers[0].error, /unfinished-build/);
+    const shutdown = await endpoint.raw('team_shutdown');
+    assert.equal(shutdown.isError, true);
+    assert.match(shutdown.content[0].text, /unfinished-build/);
+    const state = await endpoint.call('team_status');
+    assert.equal(state.workers[0].processExited, true);
+    assert.equal(state.workers[0].backgroundTasks.length, 1);
+    assert(existsSync(path.join(f.config.stateDir, 'unfinished-background', 'store.lock')));
+  } finally {
+    controller.options.worker.backgroundTasks = []; // 仅清理没有实际进程的模拟任务。
+  }
+});
 
 test('MCP 传递 mct/ctm 委派说明并暴露全部 14 个工具，未打开团队时返回工具错误', async t => {
   const f = await fixture(t);
