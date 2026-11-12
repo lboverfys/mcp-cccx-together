@@ -54,20 +54,32 @@ async function withShutdownTimeout(promise, message) {
 
 export function createClaudeWorker({ worker, config, emit, request, readDependency, queryImpl = query, spawnImpl = spawn }) {
   const input = inputQueue();
+  const abortController = new AbortController();
   const pendingRequests = new Set();
   let child;
   let processExited = Promise.resolve();
+  let stderrEnded = Promise.resolve();
   let closing = false;
   let finished = false;
   let closePromise;
   let shutdownPromise;
   let executionFailure;
+  let stderrFailure;
   let currentSessionId = worker.sessionId;
   let backgroundTasks = new Map();
   let backgroundChanged;
 
   function cancelRequests() {
     for (const controller of pendingRequests) controller.abort();
+  }
+
+  function recordStderr(text) {
+    if (!text || stderrFailure) return;
+    try { emit('stderr', { text: limit(text, 4000) }); }
+    catch (error) {
+      stderrFailure = error;
+      abortController.abort();
+    }
   }
 
   async function ask(kind, payload, signal) {
@@ -121,6 +133,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
   const stream = queryImpl({
     prompt: input,
     options: {
+      abortController,
       cwd: worker.cwd,
       pathToClaudeCodeExecutable: config.claudeExecutable,
       extraArgs: { name: worker.name },
@@ -211,12 +224,18 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
         });
         const decoder = new StringDecoder('utf8');
         child.stderr.on('data', (data) => {
-          const text = decoder.write(data);
-          if (text) emit('stderr', { text: limit(text, 4000) });
+          recordStderr(decoder.write(data));
         });
-        child.stderr.once('end', () => {
-          const text = decoder.end();
-          if (text) emit('stderr', { text: limit(text, 4000) });
+        stderrEnded = new Promise(resolve => {
+          let ended = false;
+          const finish = () => {
+            if (ended) return;
+            ended = true;
+            recordStderr(decoder.end());
+            resolve();
+          };
+          child.stderr.once('end', finish);
+          child.stderr.once('close', finish);
         });
         return child;
       },
@@ -231,7 +250,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
       } catch (error) {
         closeError = error;
       }
-      await withShutdownTimeout(processExited, `关闭工作者超时，尚未确认进程 ${child?.pid ?? '未知'} 退出。`);
+      await withShutdownTimeout(Promise.all([processExited, stderrEnded]), `关闭工作者超时，尚未确认进程 ${child?.pid ?? '未知'} 退出或错误输出结束。`);
       if (closeError && closeError.name !== 'AbortError') throw closeError;
     })().catch(error => {
       shutdownPromise = undefined;
@@ -340,7 +359,8 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     try {
       for await (const message of stream) handle(message);
     } catch (error) {
-      if (!closing || error.name !== 'AbortError') failure = error;
+      if (stderrFailure) failure = stderrFailure;
+      else if (!closing || error.name !== 'AbortError') failure = error;
     } finally {
       finished = true;
       backgroundChanged?.();
@@ -356,6 +376,11 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
         await shutdownProcess();
       } catch (error) {
         failure = failure ? new AggregateError([failure, error], '工作者执行失败，进程收尾也未完成。') : error;
+      }
+      if (stderrFailure && executionFailure !== stderrFailure) {
+        executionFailure = executionFailure
+          ? new AggregateError([executionFailure, stderrFailure], '工作者执行失败且错误输出保存失败。') : stderrFailure;
+        failure = failure ? new AggregateError([failure, stderrFailure], '工作者收尾或错误输出保存失败。') : stderrFailure;
       }
     }
     if (failure) throw failure;

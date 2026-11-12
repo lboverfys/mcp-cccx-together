@@ -35,7 +35,7 @@ function outputQueue() {
   };
 }
 
-function harness({ workerOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand } = {}) {
+function harness({ workerOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand, stderrError } = {}) {
   const events = [];
   const messages = [];
   const waiters = [];
@@ -68,6 +68,7 @@ function harness({ workerOverrides = {}, request, readDependency, autoExit = tru
     request: request ?? (async () => ({ allow: false, reason: '未授权' })),
     readDependency,
     emit(type, data) {
+      if (type === 'stderr' && stderrError) throw stderrError;
       events.push({ type, data });
       for (let i = waiters.length - 1; i >= 0; i--) {
         if (waiters[i].predicate(events)) waiters.splice(i, 1)[0].resolve();
@@ -79,6 +80,7 @@ function harness({ workerOverrides = {}, request, readDependency, autoExit = tru
     },
     queryImpl({ prompt, options }) {
       queryOptions = options;
+      options.abortController?.signal.addEventListener('abort', () => output.end(options.abortController.signal.reason), { once: true });
       options.spawnClaudeCodeProcess({
         command: spawnCommand ?? options.pathToClaudeCodeExecutable,
         args: ['--input-format', 'stream-json'],
@@ -362,6 +364,59 @@ test('stderr 按 UTF-8 解码且限制单个事件长度', async () => {
   assert.equal(stderr[0].data.text, '中文');
   assert.equal(stderr[1].data.text.length, 4000);
   await h.instance.close();
+});
+
+test('stderr 事件保存失败进入工作者收尾，不从流回调抛出且保留原始错误', async () => {
+  const failure = new Error('模拟 stderr 写盘失败');
+  const h = harness({ stderrError: failure });
+  const stopped = assert.rejects(h.instance.done, error => error === failure);
+  assert.doesNotThrow(() => h.child.stderr.write('诊断输出'));
+  await stopped;
+  assert.equal(h.child.exitCode, 0);
+  assert.equal(h.closeCount, 1);
+  await assert.rejects(h.instance.close(), error => error === failure);
+});
+
+test('关闭时 stderr 尾部解码的保存失败仍传播，不误报关闭成功', async () => {
+  const failure = new Error('模拟 stderr 尾部写盘失败');
+  const h = harness({ stderrError: failure });
+  h.child.stderr.write(Buffer.from('中').subarray(0, 2));
+  const stopped = assert.rejects(h.instance.done, error => error === failure);
+  await assert.rejects(h.instance.close(), error => error === failure);
+  await stopped;
+  assert.equal(h.child.exitCode, 0);
+  assert.equal(h.closeCount, 1);
+});
+
+test('真实 SDK 在初始化期间遇到 stderr 保存失败会退出自有子进程并报告原始错误', { timeout: 15000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'cc-team-stderr-'));
+  const cli = join(dir, 'cli.mjs');
+  writeFileSync(cli, "process.stderr.write('诊断输出\\n');\nsetInterval(() => {}, 1000);\n", { flag: 'wx' });
+  const failure = new Error('模拟 stderr 存储故障');
+  let child;
+  const worker = createClaudeWorker({
+    worker: { id: 'stderr-worker', name: '故障验证cc', cwd: dir, instructions: '验证进程收尾', access: 'read', allowedTools: [] },
+    config: { claudeExecutable: cli, tempDir: dir },
+    emit(type) { if (type === 'stderr') throw failure; },
+    request() { assert.fail('初始化故障不应触发工具请求'); },
+    spawnImpl(command, args, options) { child = spawn(command, args, options); return child; },
+  });
+  t.after(async () => {
+    const [closed] = await Promise.allSettled([worker.close()]);
+    if (child?.exitCode === null && child.signalCode === null) {
+      const exited = new Promise(resolve => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await exited;
+    }
+    if (child?.pid) assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
+    unlinkSync(cli);
+    rmdirSync(dir);
+    if (closed.status === 'rejected' && closed.reason !== failure) throw closed.reason;
+  });
+  await assert.rejects(worker.done, error => error === failure);
+  assert(child?.pid);
+  assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
+  await assert.rejects(worker.close(), error => error === failure);
 });
 
 test('单题自由文本转换为 answers，多题拒绝不完整回答', async () => {

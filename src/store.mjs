@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, renameSync, unlinkSync, statSync, appendFileSync, existsSync, fsyncSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, renameSync, unlinkSync, statSync, appendFileSync, existsSync, fsyncSync, truncateSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -140,6 +140,7 @@ export class Store extends EventEmitter {
   #eventBytes = 0;
   #logBytes = 0;
   #logCount = 0;
+  #eventWriteError;
   #token;
   #active = false;
   #files = new Map();
@@ -171,6 +172,7 @@ export class Store extends EventEmitter {
       this.#eventBytes = 0;
       this.#logBytes = 0;
       this.#logCount = 0;
+      this.#eventWriteError = undefined;
       try {
         this.#team = readBoundedJson(this.teamPath, MAX_TEAM_BYTES);
         if (!this.#team || Array.isArray(this.#team) || typeof this.#team !== 'object') throw new Error('team.json 必须是团队元数据对象');
@@ -373,6 +375,16 @@ export class Store extends EventEmitter {
     this.#eventBytes = this.#logBytes;
   }
 
+  #rollbackEventAppend() {
+    try { truncateSync(this.eventsPath, this.#logBytes); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || this.#logBytes !== 0) {
+        throw new AggregateError([this.#eventWriteError, error], '事件日志写入及残片回退失败，修复前拒绝追加；恢复存储可写后重试，或关闭后使用 recover');
+      }
+    }
+    this.#eventWriteError = undefined;
+  }
+
   append(workerId, type, data) {
     this.#assertActive();
     if (typeof type !== 'string' || !type) throw new Error('事件类型不能为空');
@@ -382,7 +394,13 @@ export class Store extends EventEmitter {
     const bytes = Buffer.byteLength(encoded);
     if (bytes > MAX_EVENT_BYTES) throw new Error('单条事件超过 64 KiB 上限');
     const record = JSON.parse(encoded);
-    appendFileSync(this.eventsPath, encoded, { encoding: 'utf8', mode: 0o600 });
+    if (this.#eventWriteError) this.#rollbackEventAppend();
+    try { appendFileSync(this.eventsPath, encoded, { encoding: 'utf8', mode: 0o600 }); }
+    catch (error) {
+      this.#eventWriteError = error;
+      this.#rollbackEventAppend();
+      throw error;
+    }
     this.#remember(record, bytes);
     this.#logBytes += bytes;
     this.#logCount += 1;

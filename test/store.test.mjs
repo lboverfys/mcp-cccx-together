@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { Store } from '../src/store.mjs';
+import { Store, scanEventLog } from '../src/store.mjs';
 
 const tempRoot = process.env.TEMP || process.env.TMP || tmpdir();
 
@@ -122,6 +124,77 @@ test('事件写入失败传播，内存游标不前进', async t => {
   assert.throws(() => store.append('a', 'progress', {}));
   assert.deepEqual(store.events().events, []);
   assert.equal(store.events().nextCursor, 0);
+});
+
+test('事件部分写入失败回退残片，重试及重开后日志和游标保持一致', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  store.append('a', 'progress', { text: '已保存' });
+  const before = readFileSync(store.eventsPath, 'utf8');
+  const failure = Object.assign(new Error('模拟磁盘写满'), { code: 'ENOSPC' });
+  const append = fs.appendFileSync;
+  const fault = t.mock.method(fs, 'appendFileSync', (file, data, options) => {
+    append(file, Buffer.from(data).subarray(0, 24), options);
+    throw failure;
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => store.append('a', 'progress', { text: '写入失败' }), error => error === failure);
+  } finally { fault.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(readFileSync(store.eventsPath, 'utf8'), before);
+  assert.equal(store.events().nextCursor, 1);
+  assert.equal(store.append('a', 'result', { text: '恢复可写' }).cursor, 2);
+  store.close();
+  const reopened = await f.create();
+  assert.deepEqual(reopened.events().events.map(event => event.data.text), ['已保存', '恢复可写']);
+  assert.equal(reopened.append('a', 'progress', {}).cursor, 3);
+});
+
+test('首次事件未能创建文件时保留原始写入错误，恢复后从首个游标开始', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  const failure = Object.assign(new Error('模拟日志文件创建失败'), { code: 'ENOSPC' });
+  const fault = t.mock.method(fs, 'appendFileSync', () => { throw failure; });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => store.append('a', 'progress', {}), error => error === failure);
+    assert.equal(existsSync(store.eventsPath), false);
+  } finally { fault.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(store.append('a', 'result', {}).cursor, 1);
+  store.close();
+  assert.equal((await f.create()).events().nextCursor, 1);
+});
+
+test('日志残片回退失败时拒绝继续追加，恢复可写后先修复再写入', async t => {
+  const f = await fixture(t);
+  const store = await f.create();
+  store.append('a', 'progress', { text: '已保存' });
+  const failure = Object.assign(new Error('模拟部分写入失败'), { code: 'ENOSPC' });
+  const rollbackFailure = Object.assign(new Error('模拟无法回退残片'), { code: 'EACCES' });
+  const append = fs.appendFileSync;
+  const appendFault = t.mock.method(fs, 'appendFileSync', (file, data, options) => {
+    append(file, Buffer.from(data).subarray(0, 24), options);
+    throw failure;
+  });
+  const rollbackFault = t.mock.method(fs, 'truncateSync', () => { throw rollbackFailure; });
+  syncBuiltinESMExports();
+  try {
+    const check = error => error instanceof AggregateError && error.errors.includes(failure) && error.errors.includes(rollbackFailure);
+    assert.throws(() => store.append('a', 'progress', {}), check);
+    const partial = readFileSync(store.eventsPath, 'utf8');
+    assert.throws(() => store.append('a', 'result', {}), check);
+    assert.equal(appendFault.mock.callCount(), 1);
+    assert.equal(readFileSync(store.eventsPath, 'utf8'), partial);
+    assert.equal(store.events().nextCursor, 1);
+    assert.equal((await scanEventLog(store.eventsPath, { allowIncompleteTail: true })).tailAction, 'truncate');
+  } finally {
+    appendFault.mock.restore();
+    rollbackFault.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(store.append('a', 'result', { text: '恢复可写' }).cursor, 2);
+  store.close();
+  assert.deepEqual((await f.create()).events().events.map(event => event.data.text), ['已保存', '恢复可写']);
 });
 
 test('超大事件拒绝写入，不消耗游标；损坏尾行不静默丢弃', async t => {
