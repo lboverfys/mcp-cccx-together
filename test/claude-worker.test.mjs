@@ -200,7 +200,7 @@ test('复用现有 exe、配置与环境，read 工作者移除写入和再委�
   assert.equal(h.options.systemPrompt.snapshot, false);
   assert.deepEqual(Object.keys(h.options.mcpServers), ['team']);
   assert.deepEqual(h.options.allowedTools, []);
-  assert.deepEqual(h.options.settings, { disableAllHooks: true });
+  assert.deepEqual(h.options.settings, { disableAllHooks: true, disableSkillShellExecution: true });
   await h.instance.close();
 });
 
@@ -316,7 +316,7 @@ test('问答保留原问题并返回答案，权限拒绝不伪装成功', async
   } });
   const context = { signal: new AbortController().signal, requestId: 'request-1', toolUseID: 'tool-1' };
   assert.equal(h.options.strictMcpConfig, true);
-  assert.deepEqual(h.options.settings, { disableAllHooks: true });
+  assert.deepEqual(h.options.settings, { disableAllHooks: true, disableSkillShellExecution: true });
   for (const toolName of ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency']) {
     const input = { summary: '协调消息' };
     assert.deepEqual(await h.options.canUseTool(toolName, input, { ...context, mcpServer: { name: 'team', source: 'sdk' } }), { behavior: 'allow', updatedInput: input });

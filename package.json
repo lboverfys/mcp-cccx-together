@@ -1,6 +1,7 @@
 {
   "name": "cc-team-mcp",
   "version": "0.2.0",
+  "license": "MIT",
   "type": "module",
   "description": "Cross-platform MCP server for Codex to coordinate local Claude Code workers",
   "bin": { "cc-team-mcp": "src/cli.mjs" },

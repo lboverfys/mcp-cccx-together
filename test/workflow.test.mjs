@@ -73,6 +73,7 @@ test('真实 MCP 与 SDK 完成依赖交接、权限、长结果、失败修复�
     let offset = 0, text = '', pages = 0;
     for (;;) {
       const part = await call('team_result', { workerId, ...(resultId ? { resultId } : {}), offset, limit: 4096 });
+      resultId ??= part.resultId;
       assert.equal(part.offsetUnit, 'utf8-bytes');
       text += part.text;
       pages++;

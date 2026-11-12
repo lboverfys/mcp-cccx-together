@@ -235,6 +235,43 @@ test('大量提示仍保持 Windows 命令行长度有界，并保留最大游�
   await notifier.close();
 });
 
+test('通知摘要隐藏 JSON 与引号包裹的完整凭据，包含空格、转义和被截断的值', async () => {
+  const { notifier, calls } = harness();
+  const summaries = [
+    JSON.stringify({ public: 'safe-summary', password: 'private passphrase with spaces', api_key: 'private json key' }),
+    "auth_token='private single quoted value' secret=\"private escaped \\\"quote\\\" value\"",
+    '{"password": "private truncated passphrase',
+  ];
+  summaries.forEach((summary, index) => notifier.notify({
+    workerId: String(index), type: 'progress', cursor: index + 1, data: { summary },
+  }));
+  await waitFor(() => calls.length === 1);
+  assert.match(calls[0].args[5], /safe-summary/);
+  assert.match(calls[0].args[5], /已隐藏凭据/);
+  assert.doesNotMatch(calls[0].args[5], /private|passphrase|quoted|escaped|truncated/);
+  calls[0].callback(null, '', '');
+  await notifier.close();
+});
+
+test('投递记录写入失败显式报告且不抛出回调异常，保留实际入队结果并继续处理', async () => {
+  const { notifier, calls } = harness({
+    onDelivery() { throw new Error('事件日志不可写 password="private recording secret"'); },
+  });
+  for (const queueError of [null, new Error('通知 CLI 拒绝')]) {
+    const count = calls.length + 1;
+    notifier.notify({ workerId: 'a', type: 'result', cursor: count, data: {} });
+    await waitFor(() => calls.length === count);
+    assert.doesNotThrow(() => calls.at(-1).callback(queueError, '', ''));
+    assert.equal(notifier.lastDelivery.queued, queueError === null);
+    assert.equal(notifier.lastDelivery.status, queueError === null ? 'warning' : 'failed');
+    assert.equal(notifier.lastDelivery.recorded, false);
+    assert.match(notifier.lastDelivery.recordingError, /事件日志不可写/);
+    assert.doesNotMatch(notifier.lastDelivery.recordingError, /private recording secret/);
+    assert.equal(notifier.inFlight, null);
+  }
+  await notifier.close();
+});
+
 test('完成事件取代尚未发送的旧进度；关闭不会发出待投递消息', async () => {
   const { notifier, calls } = harness();
   notifier.notify({ workerId: 'a', type: 'progress', cursor: 1, data: { summary: 'outdated' } });

@@ -170,10 +170,21 @@ async function fixture(t) {
   return { dir, cwd, config, controllers, notifiers, connect, spec };
 }
 
-test('MCP 暴露全部 14 个工具，未打开团队时返回工具错误', async t => {
+test('MCP 传递 mct/ctm 委派说明并暴露全部 14 个工具，未打开团队时返回工具错误', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   const { tools } = await endpoint.client.listTools();
+  const instructions = endpoint.client.getInstructions();
+  for (const alias of ['mct', 'ctm']) {
+    assert.ok(instructions.includes(`使用 ${alias}`));
+    for (const name of ['team_open', 'team_dispatch']) {
+      assert.ok(tools.find(tool => tool.name === name).description.includes(alias));
+    }
+  }
+  assert.match(instructions, /不区分大小写/);
+  assert.match(instructions, /通过本 MCP 委派 Claude Code（CC）子 agent/);
+  assert.match(instructions, /team_open.*team_dispatch/);
+  assert.match(instructions, /无需再次确认是否启用/);
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'team_open', 'team_dispatch', 'team_status', 'team_events', 'team_send', 'team_reply',
     'team_request', 'team_interrupt', 'team_resume', 'team_review', 'team_close', 'team_shutdown', 'team_list', 'team_result',
@@ -210,6 +221,61 @@ test('派发经 MCP 立即返回，schema 默认只读，批量任务保留各�
   assert.deepEqual(status.workers.map(worker => worker.status), ['running', 'running']);
   assert.equal(f.notifiers[0].threadId, parentThreadId);
   assert.equal(status.workers[0].pendingMessages, 1);
+});
+
+test('写任务缺少显式 scope 时整批拒绝，明确范围后才能启动', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { notifications: false });
+  const invalid = await endpoint.raw('team_dispatch', { workers: [f.spec('读取'), f.spec('修改', { access: 'write' })] });
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content[0].text, /scope/);
+  assert.equal(f.controllers.length, 0);
+  assert.deepEqual((await endpoint.call('team_status')).workers, []);
+  await endpoint.call('team_dispatch', { workers: [f.spec('修改', { access: 'write', scope: ['src'] })] });
+  assert.equal(f.controllers.length, 1);
+  assert.deepEqual(f.controllers[0].options.worker.scope, ['src']);
+});
+
+test('完整结果续页和验收必须绑定结果版本，缺失参数不放行下游', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('实现'), f.spec('验证', { dependsOn: ['实现cc'] })] });
+  f.controllers[0].emit('result', { success: true, text: '已完成实现'.repeat(50) });
+  const first = await endpoint.call('team_result', { workerId: '实现cc', limit: 80 });
+  assert.equal(first.hasMore, true);
+  const unpinnedPage = await endpoint.raw('team_result', { workerId: '实现cc', offset: first.nextOffset });
+  assert.equal(unpinnedPage.isError, true);
+  assert.match(unpinnedPage.content[0].text, /resultId/);
+  const unpinnedReview = await endpoint.raw('team_review', { workerId: '实现cc', accepted: true, note: '未指定版本' });
+  assert.equal(unpinnedReview.isError, true);
+  assert.equal(f.controllers.length, 1);
+  await endpoint.call('team_send', { workerId: '实现cc', message: '更新实现' });
+  f.controllers[0].emit('result', { success: true, text: '新一轮结果' });
+  const oldPage = await endpoint.call('team_result', { workerId: '实现cc', resultId: first.resultId, offset: first.nextOffset });
+  assert.equal(JSON.parse(first.text + oldPage.text).text, '已完成实现'.repeat(50));
+  const stale = await endpoint.raw('team_review', { workerId: '实现cc', resultId: first.resultId, accepted: true, note: '旧版本' });
+  assert.equal(stale.isError, true);
+  assert.equal(f.controllers.length, 1);
+  const current = await endpoint.call('team_result', { workerId: '实现cc' });
+  await endpoint.call('team_review', { workerId: '实现cc', resultId: current.resultId, accepted: true, note: '已核对新版结果' });
+  assert.equal(f.controllers.length, 2);
+});
+
+test('多选问题通过 MCP 传递数组，空数组被拒绝且请求仍可回答', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('提问')] });
+  const pending = f.controllers[0].request('question', { questions: [{ question: '选择验证平台', multiSelect: true }] });
+  const requestId = (await endpoint.call('team_status')).workers[0].requests[0].id;
+  const invalid = await endpoint.raw('team_reply', { requestId, answers: { '选择验证平台': [] } });
+  assert.equal(invalid.isError, true);
+  assert.equal((await endpoint.call('team_status')).workers[0].requests.length, 1);
+  const answers = { '选择验证平台': ['Windows', 'macOS'] };
+  await endpoint.call('team_reply', { requestId, answers });
+  assert.deepEqual(await pending, { answers });
 });
 
 test('超过旧批次上限后仍可按需追加、恢复及批量筛选关闭工作者', async t => {
@@ -315,7 +381,8 @@ test('验收、关闭和 shutdown 保留会话，重开后可以恢复同一个�
   controller.emit('session', { sessionId });
   controller.emit('result', { success: true, text: '完成', messageIds: [controller.sent[0].messageId] });
   assert.equal((await endpoint.call('team_status')).workers[0].status, 'awaiting_review');
-  const reviewed = await endpoint.call('team_review', { workerId: worker.id, accepted: true, note: '核对验证通过' });
+  const { resultId } = await endpoint.call('team_result', { workerId: worker.id });
+  const reviewed = await endpoint.call('team_review', { workerId: worker.id, resultId, accepted: true, note: '核对验证通过' });
   assert.equal(reviewed.status, 'idle');
   const closed = await endpoint.call('team_close', { workerIds: [worker.id] });
   assert.equal(closed.workers[0].retained, true);
@@ -435,7 +502,8 @@ test('按名字完成查看、追加、事件筛选、验收、关闭及重开�
   assert.equal(notice.workerName, '接口开发cc');
   assert.equal(notice.data.workerName, '接口开发cc');
   controller.emit('result', { success: true, text: '验证通过', messageIds: controller.sent.map(message => message.messageId) });
-  const review = await endpoint.call('team_review', { workerId: '接口开发cc', accepted: true, note: '已检查' });
+  const { resultId } = await endpoint.call('team_result', { workerId: '接口开发cc' });
+  const review = await endpoint.call('team_review', { workerId: '接口开发cc', resultId, accepted: true, note: '已检查' });
   assert.equal(review.id, worker.id);
   const closed = await endpoint.call('team_close', { workerIds: ['接口开发cc', worker.id] });
   assert.equal(closed.workers.length, 1);

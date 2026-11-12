@@ -8,7 +8,7 @@ function shortText(value, limit) {
   return String(value ?? '')
     .replace(/\b(?:(?:sk|sess)-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}/g, '[已隐藏凭据]')
     .replace(/\b(?:Bearer|Basic)\s+\S+/gi, '[已隐藏凭据]')
-    .replace(/((?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*[=:]\s*)[^\s,;]+/gi, '$1[已隐藏凭据]')
+    .replace(/((?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;}\]]+)/gi, '$1[已隐藏凭据]')
     .replace(/https?:\/\/[^\s]+/gi, '[链接已省略]')
     .replace(/[\r\n\t\u0000-\u001f]+/g, ' ')
     .trim()
@@ -153,8 +153,14 @@ export class CodexNotifier {
       };
       this.lastDelivery = delivery;
       this.inFlight = null;
+      try {
+        this.onDelivery?.(delivery);
+      } catch (error) {
+        delivery.status = delivery.queued ? 'warning' : 'failed';
+        delivery.recorded = false;
+        delivery.recordingError = shortText(error.message, 800);
+      }
       finish(delivery);
-      this.onDelivery?.(delivery);
       this.schedule();
     };
     try {

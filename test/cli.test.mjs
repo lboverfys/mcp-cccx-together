@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { runCli } from '../src/cli.mjs';
+import { mcpConfiguration, runCli } from '../src/cli.mjs';
+import { loadConfig } from '../src/config.mjs';
 
 function harness(overrides = {}) {
   let stdout = '', stderr = '';
@@ -56,6 +57,25 @@ test('无配置文件时固定已发现入口，避免 MCP 客户端精简 PATH 
   assert.equal(actual.env.CC_TEAM_CLAUDE_EXECUTABLE, process.execPath);
 });
 
+test('配置文件注册后保留显式环境目录覆盖，同时继续读取配置文件更新', t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-registration-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'config.json');
+  const stored = { claudeExecutable: process.execPath, stateDir: path.join(directory, 'state'),
+    tempDir: path.join(directory, 'old-temp'), notificationMode: 'poll' };
+  writeFileSync(file, JSON.stringify(stored));
+  const tempDir = path.join(directory, 'environment-temp');
+  const options = { env: { CC_TEAM_TEMP_DIR: tempDir }, home: directory, temporaryRoot: directory };
+  const config = loadConfig(file, options);
+  const registration = mcpConfiguration(config).mcpServers.cc_team;
+  assert.deepEqual(registration.env, { CC_TEAM_TEMP_DIR: tempDir });
+  const newState = path.join(directory, 'updated-state');
+  writeFileSync(file, JSON.stringify({ ...stored, stateDir: newState }));
+  const restarted = loadConfig(file, { ...options, env: registration.env });
+  assert.equal(restarted.tempDir, tempDir);
+  assert.equal(restarted.stateDir, newState);
+});
+
 test('doctor 只调用 --version，Codex 是可选客户端，Claude 缺失返回失败', async () => {
   const h = harness({ codexExecutable: undefined });
   const calls = [];
@@ -66,9 +86,28 @@ test('doctor 只调用 --version，Codex 是可选客户端，Claude 缺失返�
   assert.equal(calls[0].options.shell, false);
   assert.equal(calls[0].options.env.DISABLE_AUTOUPDATER, '1');
   assert.equal(JSON.parse(h.stdout).checks.claude.ok, true);
+  assert.equal(JSON.parse(h.stdout).checks.codex.optional, true);
   const absent = harness({ claudeExecutable: undefined, codexExecutable: undefined });
   assert.equal(await runCli(['doctor'], absent.options), 1);
   assert.equal(JSON.parse(absent.stdout).checks.claude.ok, false);
+});
+
+test('doctor 找到 Codex 但版本命令失败时不能报告环境检查通过', async () => {
+  const h = harness({ codexExecutable: path.join(tmpdir(), 'broken-codex') });
+  const calls = [];
+  assert.equal(await runCli(['doctor'], { ...h.options, executeImpl: async (command, args) => {
+    calls.push({ command, args });
+    if (command === h.config.codexExecutable) throw new Error('模拟 Codex 无法执行');
+    return { stdout: 'Claude Code test version', stderr: '' };
+  } }), 1);
+  assert.equal(calls.length, 2);
+  const { checks } = JSON.parse(h.stdout);
+  assert.equal(checks.claude.ok, true);
+  assert.equal(checks.codex.ok, false);
+  assert.equal(checks.codex.optional, false);
+  assert.match(checks.codex.error, /Codex 无法执行/);
+  assert.equal(checks.stateDir.ok, true);
+  assert.equal(checks.tempDir.ok, true);
 });
 
 test('doctor 明确检查可选 queue 通知能力，失败可定位到通知设置', async () => {
@@ -81,6 +120,46 @@ test('doctor 明确检查可选 queue 通知能力，失败可定位到通知设
   } }), 1);
   assert.deepEqual(calls.at(-1), ['queue', '--help']);
   assert.equal(JSON.parse(h.stdout).checks.notifications.ok, false);
+});
+
+test('doctor 汇总错误入口与目录检查，不启动错误客户端或创建目录', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-doctor-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'config.json');
+  const stateDir = path.join(directory, 'missing-state');
+  const tempDir = path.join(directory, 'file-instead-of-directory');
+  writeFileSync(tempDir, 'keep');
+  writeFileSync(file, JSON.stringify({ claudeExecutable: path.join(directory, 'missing-claude'),
+    codexExecutable: path.join(directory, 'missing-codex'), stateDir, tempDir, notificationMode: 'codex-queue' }));
+  const h = harness();
+  assert.equal(await runCli(['doctor', '--config', file], { ...h.options,
+    loadConfigImpl: (configPath, options) => loadConfig(configPath, { ...options, env: {}, home: directory, temporaryRoot: directory }),
+    executeImpl() { assert.fail('错误的入口不应执行'); },
+  }), 1);
+  const { checks } = JSON.parse(h.stdout);
+  assert.equal(checks.node.ok, true);
+  assert.equal(checks.claude.ok, false);
+  assert.match(checks.claude.error, /missing-claude/);
+  assert.equal(checks.codex.ok, false);
+  assert.equal(checks.notifications.ok, false);
+  assert.deepEqual(checks.stateDir, { ok: true, path: stateDir, exists: false, checkedPath: directory });
+  assert.equal(checks.tempDir.ok, false);
+  assert.match(checks.tempDir.error, /不是目录/);
+  assert.equal(existsSync(stateDir), false);
+  assert.equal(readFileSync(tempDir, 'utf8'), 'keep');
+
+  writeFileSync(file, JSON.stringify({ claudeExecutable: process.execPath,
+    codexExecutable: path.join(directory, 'missing-codex'), stateDir, tempDir: path.join(directory, 'missing-temp') }));
+  const optional = harness();
+  assert.equal(await runCli(['doctor', '--config', file], { ...optional.options,
+    loadConfigImpl: (configPath, options) => loadConfig(configPath, { ...options, env: {}, home: directory, temporaryRoot: directory }),
+    executeImpl: async () => ({ stdout: 'test version' }),
+  }), 1);
+  const optionalChecks = JSON.parse(optional.stdout).checks;
+  assert.equal(optionalChecks.claude.ok, true);
+  assert.equal(optionalChecks.codex.optional, false);
+  assert.equal(optionalChecks.stateDir.ok, true);
+  assert.equal(optionalChecks.tempDir.ok, true);
 });
 
 test('setup 先检查同名配置，已有注册或查询错误时保持原配置', async () => {

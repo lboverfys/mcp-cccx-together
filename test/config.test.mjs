@@ -67,6 +67,35 @@ test('缺少 Claude 的诊断可继续，正常启动给出可执行的修复提
   assert.throws(() => loadConfig(f.write('queue.json', JSON.stringify({ claudeExecutable: process.execPath, notificationMode: 'codex-queue' })), f.options), /Codex 可执行入口/);
 });
 
+test('诊断模式汇总失效客户端入口，正常运行仍拒绝错误配置', t => {
+  const f = fixture(t);
+  const file = f.write('broken-clients.json', JSON.stringify({
+    claudeExecutable: path.join(f.directory, 'missing-claude'),
+    codexExecutable: path.join(f.directory, 'missing-codex'), notificationMode: 'codex-queue',
+  }));
+  assert.throws(() => loadConfig(file, f.options), /claudeExecutable 不是可运行的入口/);
+  const config = loadConfig(file, { ...f.options, diagnostic: true });
+  assert.equal(config.claudeExecutable, undefined);
+  assert.equal(config.codexExecutable, undefined);
+  assert.match(config.executableErrors.claude, /missing-claude/);
+  assert.match(config.executableErrors.codex, /missing-codex/);
+  assert.equal(existsSync(config.stateDir), false);
+});
+
+test('注册环境只保留显式 MCP 覆盖和自动发现所需 PATH，不复制模型密钥', t => {
+  const f = fixture(t);
+  const executable = f.write(process.platform === 'win32' ? 'bin/claude.exe' : 'bin/claude');
+  chmodSync(executable, 0o755);
+  const file = f.write('config.json', '{}');
+  const env = { PATH: path.dirname(executable), CC_TEAM_TEMP_DIR: path.join(f.directory, 'custom-temp'),
+    ANTHROPIC_API_KEY: 'test-key-must-not-be-copied' };
+  const discovered = loadConfig(file, { ...f.options, env });
+  assert.deepEqual(discovered.registrationEnv, { CC_TEAM_TEMP_DIR: env.CC_TEAM_TEMP_DIR, PATH: env.PATH });
+  f.write('config.json', JSON.stringify({ claudeExecutable: executable }));
+  const explicit = loadConfig(file, { ...f.options, env });
+  assert.deepEqual(explicit.registrationEnv, { CC_TEAM_TEMP_DIR: env.CC_TEAM_TEMP_DIR });
+});
+
 test('Windows npm shim 通过已安装包的 bin 映射解析，不执行 shell 内容', t => {
   const f = fixture(t);
   const shim = f.write('bin/claude.cmd', '@echo malicious shim must never execute');

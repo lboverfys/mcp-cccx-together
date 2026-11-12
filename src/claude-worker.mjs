@@ -125,7 +125,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
       pathToClaudeCodeExecutable: config.claudeExecutable,
       extraArgs: { name: worker.name },
       settingSources: ['user', 'project', 'local'],
-      settings: { disableAllHooks: true },
+      settings: { disableAllHooks: true, disableSkillShellExecution: true },
       env: {
         ...process.env,
         DISABLE_AUTOUPDATER: '1',

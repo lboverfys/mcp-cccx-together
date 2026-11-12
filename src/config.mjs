@@ -84,19 +84,23 @@ export function executableCommand(executable) {
 // Configuration reads are side-effect free; the team creates state only when opened.
 export function loadConfig(configPath, {
   env = process.env, platform = process.platform, home = homedir(), temporaryRoot = tmpdir(),
-  legacyConfigPath = path.join(projectRoot, 'team.config.json'), requireClaude = true,
+  legacyConfigPath = path.join(projectRoot, 'team.config.json'), requireClaude = true, diagnostic = false,
 } = {}) {
   const selectedPath = configPath ?? env.CC_TEAM_CONFIG ?? (existsSync(legacyConfigPath) ? legacyConfigPath : undefined);
   const resolvedPath = selectedPath === undefined ? undefined : path.resolve(selectedPath);
   const stored = resolvedPath ? JSON.parse(readFileSync(resolvedPath, 'utf8')) : {};
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)) throw new Error('配置文件必须是 JSON 对象');
   const config = { ...defaultDirectories({ platform, env, home, temporaryRoot }), ...stored };
+  const registrationEnv = {};
   for (const [key, variable] of Object.entries({
     stateDir: 'CC_TEAM_STATE_DIR', tempDir: 'CC_TEAM_TEMP_DIR',
     claudeExecutable: 'CC_TEAM_CLAUDE_EXECUTABLE', codexExecutable: 'CC_TEAM_CODEX_EXECUTABLE',
     notificationMode: 'CC_TEAM_NOTIFICATION_MODE',
   })) {
-    if (env[variable] !== undefined) config[key] = env[variable];
+    if (env[variable] !== undefined) {
+      config[key] = env[variable];
+      registrationEnv[variable] = env[variable];
+    }
   }
   for (const key of ['stateDir', 'tempDir']) {
     if (typeof config[key] !== 'string' || !path.isAbsolute(config[key])) throw new Error(`配置 ${key} 必须是绝对路径`);
@@ -104,9 +108,24 @@ export function loadConfig(configPath, {
   }
   config.notificationMode ??= 'poll';
   if (!['poll', 'codex-queue'].includes(config.notificationMode)) throw new Error('notificationMode 必须为 poll 或 codex-queue');
-  config.claudeExecutable = findExecutable('claude', { configured: config.claudeExecutable, env, platform, home });
-  config.codexExecutable = findExecutable('codex', { configured: config.codexExecutable, env, platform, home });
-  if (requireClaude && !config.claudeExecutable) throw new Error('未找到 Claude Code。请先安装并登录 Claude Code，或设置 CC_TEAM_CLAUDE_EXECUTABLE 为其绝对路径；运行 cc-team-mcp doctor 查看环境。');
-  if (config.notificationMode === 'codex-queue' && !config.codexExecutable) throw new Error('codex-queue 通知需要 Codex 可执行入口，请设置 codexExecutable 或使用 poll');
-  return { ...config, ...(resolvedPath ? { configPath: resolvedPath } : {}) };
+  const executableErrors = {};
+  let discoveredExecutable = false;
+  for (const name of ['claude', 'codex']) {
+    const key = `${name}Executable`;
+    const configured = config[key];
+    try {
+      config[key] = findExecutable(name, { configured, env, platform, home });
+      if (configured === undefined && config[key]) discoveredExecutable = true;
+    } catch (error) {
+      if (!diagnostic) throw error;
+      executableErrors[name] = error.message;
+      config[key] = undefined;
+    }
+  }
+  const lookupPath = Object.entries(env).find(([key]) => key.toUpperCase() === 'PATH')?.[1];
+  if (resolvedPath && discoveredExecutable && lookupPath) registrationEnv.PATH = lookupPath;
+  if (!diagnostic && requireClaude && !config.claudeExecutable) throw new Error('未找到 Claude Code。请先安装并登录 Claude Code，或设置 CC_TEAM_CLAUDE_EXECUTABLE 为其绝对路径；运行 cc-team-mcp doctor 查看环境。');
+  if (!diagnostic && config.notificationMode === 'codex-queue' && !config.codexExecutable) throw new Error('codex-queue 通知需要 Codex 可执行入口，请设置 codexExecutable 或使用 poll');
+  return { ...config, registrationEnv, ...(Object.keys(executableErrors).length ? { executableErrors } : {}),
+    ...(resolvedPath ? { configPath: resolvedPath } : {}) };
 }

@@ -31,13 +31,14 @@ function processAlive(pid) {
 }
 
 export class TeamManager {
-  constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, notifier }) {
+  constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, notifier, platform = process.platform }) {
     this.config = config;
     this.teamId = teamId;
     this.constraints = constraints;
     this.maxConcurrent = maxConcurrent;
     this.factory = factory;
     this.notifier = notifier;
+    this.caseInsensitiveScopes = platform === 'win32' || platform === 'darwin';
     this.store = new Store(resolve(config.stateDir, teamId));
     this.results = new ResultStore(resolve(config.stateDir, teamId, 'results'));
     this.workers = new Map();
@@ -139,7 +140,7 @@ export class TeamManager {
     const requests = new Map();
     for (const request of this.requests.values()) {
       if (!requests.has(request.workerId)) requests.set(request.workerId, []);
-      requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(JSON.stringify(request.payload), 2000) });
+      requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(request.encodedPayload, 2000) });
     }
     return { teamId: this.teamId, maxConcurrent: this.maxConcurrent,
       runningCount: [...this.workers.values()].filter(worker => worker.controller).length,
@@ -222,7 +223,7 @@ export class TeamManager {
     if (all.every(worker => worker.access === 'read')) return;
     // 同一路径按拓扑顺序处理；后续写者覆盖前置所有者，避免串行长链逐对比较。
     const scopes = all.flatMap(worker => worker.scopes.map(path => ({
-      worker, path: process.platform === 'win32' ? path.toLowerCase() : path,
+      worker, path: this.scopeKey(path),
     }))).sort((a, b) => a.path.length - b.path.length || graph.rank.get(a.worker.id) - graph.rank.get(b.worker.id));
     const index = new Map();
     for (const { worker, path } of scopes) {
@@ -352,9 +353,15 @@ export class TeamManager {
     this.event(worker.data.id, status, { reason, blockedBy });
   }
 
+  scopeKey(path) {
+    return this.caseInsensitiveScopes ? path.toLowerCase() : path;
+  }
+
   scopesOverlap(first, second) {
     if (first.access === 'read' && second.access === 'read') return false;
-    return first.scopes.some(a => second.scopes.some(b => inside(a, b) || inside(b, a)));
+    const firstPaths = first.scopes.map(path => this.scopeKey(path));
+    const secondPaths = second.scopes.map(path => this.scopeKey(path));
+    return firstPaths.some(a => secondPaths.some(b => inside(a, b) || inside(b, a)));
   }
 
   schedule() {
@@ -448,8 +455,12 @@ export class TeamManager {
       worker.controller = this.factory({
         worker: worker.data, config: { ...this.config, tempDir },
         emit: (type, data) => { if (worker.generation === generation) this.receive(worker, type, data); },
-        request: (kind, payload, signal) => this.request(worker, kind, payload, signal),
-        readDependency: (reference, offset, limit) => this.readDependency(worker, reference, offset, limit),
+        request: (kind, payload, signal) => worker.generation === generation
+          ? this.request(worker, kind, payload, signal) : Promise.reject(new Error('原工作进程已结束，请求已取消')),
+        readDependency: (reference, offset, limit) => {
+          if (worker.generation !== generation) throw new Error('原工作进程已结束，不能读取当前依赖');
+          return this.readDependency(worker, reference, offset, limit);
+        },
       });
       const controller = worker.controller;
       controller.done.then(() => {
@@ -584,28 +595,32 @@ export class TeamManager {
   }
 
   request(worker, kind, payload, signal) {
-    if (this.closing || signal?.aborted) return Promise.reject(new Error('请求已取消'));
+    if (this.closing || ['closing', 'closed'].includes(worker.data.status) || signal?.aborted) return Promise.reject(new Error('请求已取消'));
     const id = randomUUID();
     return new Promise((resolveRequest, reject) => {
+      const encodedPayload = JSON.stringify(payload);
       const abort = () => {
         const item = this.requests.get(id);
         if (!item) return;
         this.requests.delete(id);
         signal?.removeEventListener('abort', abort);
-        if (worker.data.status === 'needs_input' && ![...this.requests.values()].some(r => r.workerId === worker.data.id)) {
-          worker.data.status = 'running';
-          this.save(worker);
+        try {
+          if (worker.data.status === 'needs_input' && ![...this.requests.values()].some(r => r.workerId === worker.data.id)) {
+            worker.data.status = 'running';
+            this.save(worker);
+          }
+          this.event(worker.data.id, 'request_cancelled', { requestId: id });
+          reject(new Error('请求已取消'));
+        } catch (error) {
+          reject(error);
         }
-        reject(new Error('请求已取消'));
-        this.event(worker.data.id, 'request_cancelled', { requestId: id });
       };
-      this.requests.set(id, { id, workerId: worker.data.id, kind, payload, resolve: resolveRequest, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
+      this.requests.set(id, { id, workerId: worker.data.id, kind, payload, encodedPayload, resolve: resolveRequest, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
       signal?.addEventListener('abort', abort, { once: true });
       const previousStatus = worker.data.status;
       try {
-        const encoded = JSON.stringify(payload);
         this.event(worker.data.id, 'request', { requestId: id, kind,
-          ...(encoded.length <= 6000 ? { payload } : { preview: encoded.slice(0, 6000), truncated: true }),
+          ...(encodedPayload.length <= 6000 ? { payload } : { preview: encodedPayload.slice(0, 6000), truncated: true }),
           summary: kind === 'permission' ? `工具 ${payload.toolName} 等待授权` : '工作者等待主控回答' });
         worker.data.status = 'needs_input';
         this.save(worker);
@@ -621,7 +636,7 @@ export class TeamManager {
   requestDetails(requestId, offset = 0, limit = 12000) {
     const item = this.requests.get(requestId);
     if (!item) throw new Error('请求不存在或已取消');
-    const json = JSON.stringify(item.payload);
+    const json = item.encodedPayload;
     return { requestId, workerId: item.workerId, kind: item.kind, offset,
       text: json.slice(offset, offset + limit), nextOffset: Math.min(json.length, offset + limit),
       totalLength: json.length, hasMore: offset + limit < json.length };
@@ -634,14 +649,20 @@ export class TeamManager {
     if (item.kind === 'question' && !(typeof answer.text === 'string' && answer.text.trim()) && !answer.answers) throw new Error('问题答复必须提供非空 text 或 answers');
     if (item.kind === 'question' && item.payload.questions?.length > 1 && !answer.answers) throw new Error('多个问题必须逐项提供 answers');
     if (item.kind === 'question' && answer.answers && (Object.keys(answer.answers).length === 0 ||
-      item.payload.questions?.some(q => typeof answer.answers[q.question] !== 'string' || !answer.answers[q.question].trim()))) {
+      item.payload.questions?.some(q => {
+        const value = answer.answers[q.question];
+        return !(typeof value === 'string' && value.trim()) && !(Array.isArray(value) && value.length &&
+          value.every(option => typeof option === 'string' && option.trim()));
+      }))) {
       throw new Error('answers 必须包含每个问题的非空回答');
     }
+    const worker = this.get(item.workerId);
+    const previousStatus = worker.data.status;
+    worker.data.status = [...this.requests.values()].some(r => r.id !== requestId && r.workerId === item.workerId) ? 'needs_input' : 'running';
+    try { this.save(worker); }
+    catch (error) { worker.data.status = previousStatus; throw error; }
     this.requests.delete(requestId);
     item.cleanup();
-    const worker = this.get(item.workerId);
-    worker.data.status = [...this.requests.values()].some(r => r.workerId === item.workerId) ? 'needs_input' : 'running';
-    this.save(worker);
     item.resolve(answer);
     this.event(item.workerId, 'request_answered', { requestId, kind: item.kind });
     return { requestId, answered: true };
@@ -702,20 +723,40 @@ export class TeamManager {
     }
     const prepared = this.prepare(worker.data);
     this.assertScopes([prepared], id);
-    Object.assign(worker.data, prepared);
-    if (worker.data.taskInstructions === undefined) {
+    if (prepared.taskInstructions === undefined) {
       const marker = '主控提供的任务约束：\n';
-      const offset = worker.data.instructions.indexOf(marker);
-      worker.data.taskInstructions = offset >= 0 ? worker.data.instructions.slice(offset + marker.length) : worker.data.instructions;
+      const offset = prepared.instructions.indexOf(marker);
+      prepared.taskInstructions = offset >= 0 ? prepared.instructions.slice(offset + marker.length) : prepared.instructions;
     }
-    worker.data.instructions = this.instructions(worker.data);
-    worker.data.status = 'queued';
-    worker.data.error = undefined;
-    worker.data.pendingMessages = [];
-    worker.data.lastReview = undefined;
-    worker.data.cancelled = false;
-    this.save(worker);
-    return this.send(id, worker.data.startedAt || worker.data.queuedMessages.length ? prompt : `${worker.data.prompt}\n\n主控继续指令：\n${prompt}`);
+    const queuedMessages = prepared.queuedMessages.slice();
+    let messageId;
+    if (queuedMessages.length === 32) {
+      const last = queuedMessages.at(-1);
+      messageId = last.messageId;
+      queuedMessages[queuedMessages.length - 1] = { ...last, text: `${last.text}\n\n主控恢复补充指令：\n${prompt}` };
+    } else {
+      messageId = randomUUID();
+      queuedMessages.push({ messageId, text: prepared.startedAt || queuedMessages.length
+        ? prompt : `${prepared.prompt}\n\n主控继续指令：\n${prompt}` });
+    }
+    const previousData = worker.data;
+    worker.data = { ...prepared, instructions: this.instructions(prepared), status: 'queued', error: undefined,
+      pendingMessages: [], queuedMessages, lastReview: undefined, cancelled: false };
+    let saved = false;
+    try {
+      this.save(worker);
+      saved = true;
+      this.event(id, 'message_queued', { messageId, summary: clip(prompt, 1000), waitingToStart: true });
+    } catch (error) {
+      worker.data = previousData;
+      if (saved) {
+        try { this.store.saveWorker(previousData); }
+        catch (rollbackError) { throw new AggregateError([error, rollbackError], '恢复任务失败，原状态未能写回；任务未启动'); }
+      }
+      throw error;
+    }
+    this.schedule();
+    return { id, name: worker.data.name, messageId, status: 'queued', processed: false };
   }
 
   review(id, accepted, note, handoff, expectedResultId) {
@@ -762,7 +803,6 @@ export class TeamManager {
     }
     worker.data.status = 'closed';
     worker.data.pendingMessages = [];
-    worker.data.queuedMessages = [];
     worker.data.queueReason = undefined;
     worker.data.blockedBy = [];
     this.save(worker);

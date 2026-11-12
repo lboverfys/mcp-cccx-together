@@ -92,6 +92,49 @@ test('范围索引允许同一工作者的嵌套范围，仍阻止祖先写入�
   assert.ok(sibling.id);
 });
 
+test('Windows和macOS对未创建范围保守忽略大小写，原始路径不变且显式依赖可串行', async t => {
+  for (const platform of ['win32', 'darwin']) {
+    const f = await fixture(t);
+    const manager = await f.create({ platform });
+    assert.throws(() => manager.dispatch([
+      f.spec('写入甲', { access: 'write', scope: ['front/NewFeature'] }),
+      f.spec('写入乙', { access: 'write', scope: ['front/newfeature/component.js'] }),
+    ]), /冲突/);
+    assert.equal(f.controllers.length, 0);
+    const [a, b] = manager.dispatch([
+      f.spec('写入甲', { access: 'write', scope: ['front/NewFeature'] }),
+      f.spec('写入乙', { access: 'write', scope: ['front/newfeature/component.js'], dependsOn: ['写入甲'] }),
+    ]);
+    assert.deepEqual(manager.get(a.id).data.scope, ['front/NewFeature']);
+    assert.equal(path.basename(manager.get(a.id).data.scopes[0]), 'NewFeature');
+    assert.equal(manager.scopesOverlap(manager.get(a.id).data, manager.get(b.id).data), true);
+    f.controllers[0].emit('result', { success: true, text: '完成' });
+    manager.review(a.id, true, '通过');
+    await tick();
+    assert.equal(f.controllers[0].closeCalls, 1);
+    assert.equal(manager.get(b.id).data.status, 'running');
+  }
+});
+
+test('macOS追加任务也检查大小写重叠，同时保留只读共享范围', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ platform: 'darwin' });
+  const [a, b] = manager.dispatch([
+    f.spec('写入甲', { access: 'write', scope: ['front/NewFile.js'] }),
+    f.spec('写入乙', { access: 'write', scope: ['front/OtherFile.js'] }),
+  ]);
+  manager.get(b.id).data.scope = ['front/newfile.js'];
+  assert.throws(() => manager.send(b.id, '继续'), /工作范围.*冲突/);
+  assert.equal(f.controllers[1].sent.length, 1);
+  assert.equal(manager.scopesOverlap(
+    { ...manager.get(a.id).data, access: 'read' },
+    { ...manager.get(b.id).data, access: 'read', scopes: [path.join(f.cwd, 'front/newfile.js')] },
+  ), false);
+  assert.equal(manager.scopeKey(path.join(f.cwd, 'front/NewFile.js')), manager.scopeKey(path.join(f.cwd, 'front/newfile.js')));
+  const linux = new TeamManager({ config: f.config, teamId: 'case-sensitive', platform: 'linux' });
+  assert.notEqual(linux.scopeKey('/project/NewFile.js'), linux.scopeKey('/project/newfile.js'));
+});
+
 test('多个工作者分别跟踪消息，完成报告进入待验收且同会话可继续', async t => {
   const f = await fixture(t);
   const manager = await f.create();
@@ -171,6 +214,70 @@ test('取消最后一个澄清请求后恢复运行状态，迟到答复被拒�
   assert.equal(manager.status().workers[0].requests.length, 0);
   assert.equal(manager.get(a.id).data.status, 'running');
   assert.throws(() => manager.reply(requestId, { text: '继续' }), /不存在或已取消/);
+});
+
+test('答复写盘失败保留原请求，恢复后可以重试且只答复一次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  manager.dispatch([f.spec('A')]);
+  let resolved = false;
+  const waiting = f.controllers[0].request('permission', { toolName: 'Write', input: {} })
+    .then(answer => { resolved = true; return answer; });
+  const requestId = manager.status().workers[0].requests[0].id;
+  const saveWorker = manager.store.saveWorker;
+  manager.store.saveWorker = () => { throw new Error('模拟磁盘写入失败'); };
+  try {
+    assert.throws(() => manager.reply(requestId, { allow: false }), /模拟磁盘写入失败/);
+    await tick();
+    assert.equal(resolved, false);
+    assert.equal(manager.status().workers[0].status, 'needs_input');
+    assert.equal(manager.status().workers[0].requests[0].id, requestId);
+    assert.equal(manager.requestDetails(requestId).kind, 'permission');
+  } finally {
+    manager.store.saveWorker = saveWorker;
+  }
+  manager.reply(requestId, { allow: false });
+  assert.deepEqual(await waiting, { allow: false });
+  assert.equal(manager.status().workers[0].status, 'running');
+  assert.throws(() => manager.reply(requestId, { allow: true }), /不存在或已取消/);
+});
+
+test('取消请求时写盘或事件失败仍结束等待并传播原始错误', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  manager.dispatch([f.spec('A')]);
+  for (const method of ['saveWorker', 'append']) {
+    const abort = new AbortController();
+    const waiting = f.controllers[0].request('question', { question: '继续吗？' }, abort.signal);
+    const rejected = assert.rejects(waiting, /模拟取消写入失败/);
+    const original = manager.store[method];
+    manager.store[method] = () => { throw new Error('模拟取消写入失败'); };
+    try {
+      assert.doesNotThrow(() => abort.abort());
+      await rejected;
+      assert.equal(manager.requests.size, 0);
+      assert.equal(manager.status().workers[0].status, 'running');
+    } finally {
+      manager.store[method] = original;
+    }
+  }
+});
+
+test('多选问题接受非空字符串数组，空数组或空项不会消费请求', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  manager.dispatch([f.spec('A')]);
+  const waiting = f.controllers[0].request('question', { questions: [
+    { question: '验证哪些平台？', multiSelect: true }, { question: '如何验证？', multiSelect: false },
+  ] });
+  const requestId = manager.status().workers[0].requests[0].id;
+  for (const invalid of [[], [''], ['Windows', ' '], [42]]) {
+    assert.throws(() => manager.reply(requestId, { answers: { '验证哪些平台？': invalid, '如何验证？': '自动测试' } }), /非空回答/);
+    assert.equal(manager.requests.has(requestId), true);
+  }
+  const answer = { answers: { '验证哪些平台？': ['Windows', 'macOS'], '如何验证？': '自动测试' } };
+  manager.reply(requestId, answer);
+  assert.deepEqual(await waiting, answer);
 });
 
 test('关闭等待实际 close 完成，关闭期间不能恢复启动另一个进程', async t => {
@@ -334,6 +441,8 @@ test('大于 64 KiB 的权限输入保存摘要，详情分页可完整重组并
   const [a] = manager.dispatch([f.spec('A')]);
   const payload = { toolName: 'Write', input: { file_path: path.join(f.cwd, 'large.txt'), content: '内容\n'.repeat(14000) } };
   const encoded = JSON.stringify(payload);
+  let serializations = 0;
+  Object.defineProperty(payload, 'toJSON', { value() { serializations++; return { ...this }; } });
   assert.ok(Buffer.byteLength(encoded) > 64 * 1024);
   const waiting = f.controllers[0].request('permission', payload);
   const request = manager.status().workers[0].requests[0];
@@ -357,6 +466,7 @@ test('大于 64 KiB 的权限输入保存摘要，详情分页可完整重组并
   }
   assert.equal(reconstructed, encoded);
   assert.deepEqual(JSON.parse(reconstructed), payload);
+  assert.equal(serializations, 1);
   manager.reply(request.id, { allow: false, reason: '测试不写入文件' });
   assert.deepEqual(await waiting, { allow: false, reason: '测试不写入文件' });
   assert.equal(manager.status().workers[0].requests.length, 0);
@@ -667,10 +777,11 @@ test('依赖失败与拒绝验收显示阻塞，修复通过后下游自动继�
   assert.equal(f.controllers.length, 2);
 });
 
-test('取消尚未启动任务不会创建进程，原名resume保留原任务并允许重新排队', async t => {
+test('取消尚未启动任务不会创建进程，原名resume保留原任务和追加要求再排队', async t => {
   const f = await fixture(t);
   const manager = await f.create({ maxConcurrent: 1 });
   const [a, b, c] = manager.dispatch([f.spec('A'), f.spec('B'), f.spec('C', { dependsOn: ['B'] })]);
+  manager.send(b.id, '保留这条补充要求');
   await manager.closeWorker(b.id);
   assert.equal(f.controllers.length, 1);
   assert.equal(manager.get(c.id).data.status, 'blocked');
@@ -679,8 +790,70 @@ test('取消尚未启动任务不会创建进程，原名resume保留原任务�
   assert.equal(manager.get(c.id).data.status, 'queued');
   await manager.closeWorker(a.id);
   assert.equal(f.controllers.length, 2);
-  assert.match(f.controllers[1].sent[0].text, /执行 B/);
-  assert.match(f.controllers[1].sent[0].text, /请继续/);
+  assert.deepEqual(f.controllers[1].sent.map(message => message.text), ['执行 B', '保留这条补充要求', '请继续']);
+});
+
+test('正常shutdown后重开保留未投递要求，显式resume前不启动任务', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  manager.send(b.id, '关机前追加要求');
+  await manager.close();
+  const restored = await f.create();
+  assert.equal(restored.get(b.id).data.status, 'closed');
+  assert.equal(restored.get(b.id).data.queuedMessages.length, 2);
+  assert.equal(restored.status().runningCount, 0);
+  assert.equal(f.controllers.length, 1);
+  restored.resume(b.id, '请恢复');
+  assert.deepEqual(f.controllers.at(-1).sent.map(message => message.text), ['执行 B', '关机前追加要求', '请恢复']);
+});
+
+test('满32条队列仍能恢复，补充并入末条未投递消息且返回对应ID', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  for (let index = 1; index <= 31; index++) manager.send(b.id, `追加要求${index}`);
+  await manager.closeWorker(b.id);
+  const queued = manager.get(b.id).data.queuedMessages.map(message => ({ ...message }));
+  const resumed = manager.resume(b.id, '恢复时务必检查所有要求');
+  assert.equal(resumed.messageId, queued.at(-1).messageId);
+  assert.equal(manager.get(b.id).data.queuedMessages.length, 32);
+  assert.equal(f.controllers.length, 1);
+  await manager.closeWorker(a.id);
+  assert.equal(f.controllers.length, 2);
+  assert.equal(f.controllers[1].sent.length, 32);
+  assert.deepEqual(f.controllers[1].sent.slice(0, -1), queued.slice(0, -1));
+  assert.deepEqual(f.controllers[1].sent.at(-1), {
+    messageId: resumed.messageId,
+    text: '追加要求31\n\n主控恢复补充指令：\n恢复时务必检查所有要求',
+  });
+});
+
+test('恢复写盘或记录事件失败保留closed和完整队列，其他调度不会偷偷启动', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  for (let index = 1; index <= 31; index++) manager.send(b.id, `追加要求${index}`);
+  await manager.closeWorker(b.id);
+  const previous = JSON.parse(JSON.stringify(manager.get(b.id).data));
+  for (const method of ['saveWorker', 'append']) {
+    const original = manager.store[method];
+    manager.store[method] = () => { throw new Error('模拟恢复写入失败'); };
+    try {
+      assert.throws(() => manager.resume(b.id, '未成功恢复的补充'), /模拟恢复写入失败/);
+    } finally {
+      manager.store[method] = original;
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(manager.get(b.id).data)), previous);
+    assert.deepEqual(manager.store.listWorkers().find(worker => worker.id === b.id), previous);
+  }
+  await manager.closeWorker(a.id);
+  assert.equal(f.controllers.length, 1);
+  assert.equal(manager.get(b.id).data.status, 'closed');
+  manager.resume(b.id, '重试恢复');
+  assert.equal(f.controllers.length, 2);
+  assert.match(f.controllers[1].sent.at(-1).text, /重试恢复/);
+  assert.doesNotMatch(f.controllers[1].sent.at(-1).text, /未成功恢复的补充/);
 });
 
 test('显式send传入更新后的团队约束，不另开模型轮次并使旧验收失效', async t => {
@@ -902,11 +1075,19 @@ test('迟到进展不会复活待验收或已关闭状态，旧进程事件不�
   manager.review(a.id, true, '通过');
   controller.emit('activity', { tool: 'Read' });
   assert.equal(manager.get(a.id).data.status, 'idle');
-  await manager.closeWorker(a.id);
+  controller.closeGate = deferred();
+  const closing = manager.closeWorker(a.id);
+  await assert.rejects(controller.request('permission', { toolName: 'Write', input: {} }), /请求已取消/);
+  assert.equal(manager.get(a.id).data.status, 'closing');
+  controller.closeGate.resolve();
+  await closing;
   controller.emit('progress', { summary: '关闭后进度' });
   assert.equal(manager.get(a.id).data.status, 'closed');
   manager.resume(a.id, '新一轮');
   controller.emit('result', { success: false, text: '旧进程失败' });
+  await assert.rejects(controller.request('permission', { toolName: 'Write', input: {} }), /原工作进程已结束/);
+  assert.throws(() => controller.options.readDependency('A'), /原工作进程已结束/);
+  assert.equal(manager.status().workers[0].requests.length, 0);
   assert.equal(manager.get(a.id).data.status, 'running');
   assert.equal(manager.get(a.id).data.error, undefined);
 });
