@@ -147,7 +147,7 @@ export class TeamManager {
     return { teamId: this.teamId, maxConcurrent: this.maxConcurrent, storage: this.store.storageInfo(),
       runningCount: [...this.workers.values()].filter(worker => worker.controller).length,
       queuedCount: [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status)).length,
-      workers: selected.map(({ data, controller, deliveryWarning }) => ({
+      workers: selected.map(({ data, controller, deliveryWarning, lifecycleError }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
       model: data.model ?? '继承 CC 配置', status: data.status, sessionId: data.sessionId,
       pid: controller?.pid ?? null, lastPid: data.lastPid, processExited: data.processExited ?? false, updatedAt: data.updatedAt, error: data.error,
@@ -159,6 +159,7 @@ export class TeamManager {
       staleDependencies: acceptance.get(data.id).staleDependencies,
       backgroundTasks: data.backgroundTasks ?? [],
       ...(deliveryWarning ? { deliveryWarning } : {}),
+      ...(lifecycleError ? { lifecycleError } : {}),
       requests: requests.get(data.id) ?? [],
     })) };
   }
@@ -415,7 +416,7 @@ export class TeamManager {
               item.data.error = clip(error.message, 2000);
               this.save(item);
               this.event(item.data.id, 'close_failed', { summary: item.data.error });
-            });
+            }).catch(error => this.lifecycleFailed(item, error));
           }
           continue;
         }
@@ -461,6 +462,7 @@ export class TeamManager {
     const generation = worker.generation = (worker.generation ?? 0) + 1;
     try {
       mkdirSync(tempDir, { recursive: true });
+      worker.lifecycleError = undefined;
       worker.controller = this.factory({
         worker: worker.data, config: { ...this.config, tempDir },
         emit: (type, data) => { if (worker.generation === generation) this.receive(worker, type, data); },
@@ -485,7 +487,7 @@ export class TeamManager {
         }
         this.cancelRequests(worker.data.id, '工作进程已退出');
         this.schedule();
-      }).catch(error => {
+      }, error => {
         if (worker.controller !== controller) return;
         if (!processAlive(controller.pid)) {
           worker.generation++;
@@ -494,8 +496,16 @@ export class TeamManager {
           worker.data.pendingMessages = [];
         }
         this.fail(worker, error);
-      });
+      }).catch(error => this.lifecycleFailed(worker, error));
     } catch (error) { this.fail(worker, error); }
+  }
+
+  lifecycleFailed(worker, error) {
+    const errors = [error.message];
+    try { this.cancelRequests(worker.data.id, '工作进程收尾失败'); }
+    catch (cleanupError) { errors.push(cleanupError.message); }
+    // 存储可能已不可用；保留可查询错误，关闭时重试持久化，不递归写日志。
+    worker.lifecycleError = clip(errors.join('; '), 4000);
   }
 
   fail(worker, error) {
@@ -697,18 +707,26 @@ export class TeamManager {
     this.requests.delete(requestId);
     item.cleanup();
     item.resolve(answer);
-    this.event(item.workerId, 'request_answered', { requestId, kind: item.kind });
-    return { requestId, answered: true };
+    const warnings = [];
+    try { this.event(item.workerId, 'request_answered', { requestId, kind: item.kind }); }
+    catch (error) {
+      worker.deliveryWarning = `请求 ${requestId} 的答复已送达工作者，但事件记录失败：${error.message}`;
+      warnings.push(worker.deliveryWarning);
+    }
+    return { requestId, answered: true, ...(warnings.length ? { warnings } : {}) };
   }
 
   cancelRequests(workerId, reason) {
+    const errors = [];
     for (const [id, item] of this.requests) {
       if (item.workerId !== workerId) continue;
       this.requests.delete(id);
       item.cleanup();
       item.reject(new Error(reason));
-      this.event(workerId, 'request_cancelled', { requestId: id, reason });
+      try { this.event(workerId, 'request_cancelled', { requestId: id, reason }); }
+      catch (error) { errors.push(error); }
     }
+    if (errors.length) throw new AggregateError(errors, `取消请求的事件记录失败：${errors.map(error => error.message).join('; ')}`);
   }
 
   async events(options = {}) {
@@ -855,6 +873,7 @@ export class TeamManager {
     worker.data.blockedBy = [];
     this.save(worker);
     this.event(id, 'closed', { summary: '工作进程已关闭，会话记录保留', sessionId: worker.data.sessionId });
+    worker.lifecycleError = undefined;
     return { id, name: worker.data.name, status: 'closed', sessionId: worker.data.sessionId, retained: true };
   }
 
@@ -863,7 +882,7 @@ export class TeamManager {
     for (const finish of [...this.waiters]) finish();
     const results = await Promise.allSettled([
       Promise.resolve().then(() => this.notifier?.close()),
-      ...[...this.workers.values()].filter(w => w.controller || w.closingPromise || ['queued', 'blocked'].includes(w.data.status) ||
+      ...[...this.workers.values()].filter(w => w.controller || w.closingPromise || w.lifecycleError || ['queued', 'blocked'].includes(w.data.status) ||
         unconfirmedResources(w.data)).map(w => this.closeWorker(w.data.id)),
     ]);
     const errors = results.filter(r => r.status === 'rejected').map(r => r.reason);

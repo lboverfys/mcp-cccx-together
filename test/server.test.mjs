@@ -84,6 +84,69 @@ test('追加消息状态保存失败通过 MCP 返回错误且不投递，纠正
   assert.equal(f.controllers[0].sent.at(-1).messageId, result.messageId);
 });
 
+test('工作者失败叠加写盘失败仍可通过 MCP 查询和收尾，不遗留待答复请求', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'async-save-failure', notifications: false, maxConcurrent: 2 });
+  await endpoint.call('team_dispatch', { workers: [f.spec('甲'), f.spec('乙'), f.spec('丙', { dependsOn: ['甲cc'] })] });
+  const waiting = Promise.allSettled([
+    f.controllers[0].request('permission', { toolName: 'Write', input: {} }),
+    f.controllers[0].request('question', { questions: [{ question: '继续吗？' }] }),
+  ]);
+  const fault = t.mock.method(Store.prototype, 'saveWorker', () => { throw new Error('模拟状态写盘失败'); });
+  try {
+    f.controllers[0].fail(new Error('模拟工作者输出流失败'));
+    await tick();
+    const state = await endpoint.call('team_status');
+    assert.equal(state.workers[0].status, 'failed');
+    assert.match(state.workers[0].error, /工作者输出流失败/);
+    assert.match(state.workers[0].lifecycleError, /状态写盘失败/);
+    assert.equal(state.workers[0].processExited, true);
+    assert.deepEqual(state.workers[0].requests, []);
+    assert((await waiting).every(result => result.status === 'rejected'));
+    assert.equal(state.workers[1].status, 'running');
+    assert.equal(f.controllers.length, 2);
+    const shutdown = await endpoint.raw('team_shutdown');
+    assert.equal(shutdown.isError, true);
+    assert.match(shutdown.content[0].text, /未释放团队锁/);
+    assert(existsSync(path.join(f.config.stateDir, 'async-save-failure', 'store.lock')));
+  } finally { fault.mock.restore(); }
+  assert.equal((await endpoint.call('team_shutdown')).closed, true);
+  assert(!existsSync(path.join(f.config.stateDir, 'async-save-failure', 'store.lock')));
+});
+
+test('权限和问题答复送达后日志失败返回已答复及警告，不能重复消费请求', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'reply-event-failure', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('甲')] });
+  const original = Store.prototype.append;
+  const fault = t.mock.method(Store.prototype, 'append', function (id, type, data) {
+    if (type === 'request_answered') throw new Error('模拟答复日志失败');
+    return original.call(this, id, type, data);
+  });
+  try {
+    for (const answer of [{ allow: true }, { allow: false }, { text: '继续检查' }]) {
+      const permission = typeof answer.allow === 'boolean';
+      const waiting = f.controllers[0].request(permission ? 'permission' : 'question', permission
+        ? { toolName: 'Write', input: {} } : { questions: [{ question: '下一步？' }] });
+      const requestId = (await endpoint.call('team_status')).workers[0].requests[0].id;
+      const result = await endpoint.call('team_reply', { requestId, ...answer });
+      assert.equal(result.answered, true);
+      assert.equal(result.requestId, requestId);
+      assert.match(result.warnings[0], /答复已送达.*日志失败/);
+      assert.deepEqual(await waiting, answer);
+      const state = (await endpoint.call('team_status')).workers[0];
+      assert.deepEqual(state.requests, []);
+      assert.equal(state.deliveryWarning, result.warnings[0]);
+      assert(state.deliveryWarning.includes(requestId));
+      const retry = await endpoint.raw('team_reply', { requestId, ...answer });
+      assert.equal(retry.isError, true);
+      assert.match(retry.content[0].text, /请求不存在/);
+    }
+  } finally { fault.mock.restore(); }
+});
+
 test('默认轮询不启用专属通知，历史团队列表分页且无需先打开团队', async t => {
   const f = await fixture(t);
   delete f.config.notificationMode;

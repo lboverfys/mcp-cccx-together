@@ -723,6 +723,61 @@ test('进程退出时清空待处理消息，保留会话以便恢复', async t 
   assert.equal(status.sessionId, 'session-a');
 });
 
+test('进程正常退出后日志失败仍显示收尾错误并取消全部请求，恢复后可关闭', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A')]);
+  const waiting = Promise.allSettled([
+    f.controllers[0].request('question', { questions: [{ question: '问题一？' }] }),
+    f.controllers[0].request('question', { questions: [{ question: '问题二？' }] }),
+  ]);
+  const fault = t.mock.method(manager.store, 'append', () => { throw new Error('模拟事件日志失败'); });
+  try {
+    f.controllers[0].finished.resolve();
+    await tick();
+    const state = manager.status().workers[0];
+    assert.equal(state.status, 'stopped');
+    assert.equal(state.processExited, true);
+    assert.match(state.lifecycleError, /事件日志失败/);
+    assert.match(state.lifecycleError, /取消请求/);
+    assert.deepEqual(state.requests, []);
+    assert((await waiting).every(result => result.status === 'rejected'));
+    await assert.rejects(manager.close(), /未释放团队锁/);
+    assert(existsSync(manager.store.lockPath));
+  } finally { fault.mock.restore(); }
+  await manager.closeWorker(worker.id);
+  assert.equal(manager.status().workers[0].lifecycleError, undefined);
+  await manager.close();
+  assert(!existsSync(manager.store.lockPath));
+});
+
+test('自动回收失败叠加状态写盘失败保留错误和原控制器，不提前释放容量', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [worker] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '完成' });
+  const closeFault = t.mock.method(controller, 'close', async () => { throw new Error('模拟自动回收失败'); });
+  const original = manager.store.saveWorker;
+  const saveFault = t.mock.method(manager.store, 'saveWorker', function (data) {
+    if (data.error?.includes('自动回收失败')) throw new Error('模拟收尾状态写盘失败');
+    return original.call(this, data);
+  });
+  try {
+    manager.review(worker.id, true, '检查通过');
+    await tick();
+    const state = manager.status();
+    assert.match(state.workers[0].error, /自动回收失败/);
+    assert.match(state.workers[0].lifecycleError, /收尾状态写盘失败/);
+    assert.equal(manager.get(worker.id).controller, controller);
+    assert.equal(state.runningCount, 1);
+    assert.equal(state.workers[1].status, 'queued');
+    assert.equal(f.controllers.length, 1);
+  } finally { closeFault.mock.restore(); saveFault.mock.restore(); }
+  await manager.close();
+  assert(!existsSync(manager.store.lockPath));
+});
+
 test('团队约束持久保存，更新约束后恢复工作者使用当前约束和原补充要求', async t => {
   const f = await fixture(t);
   const manager = await f.create({ constraints: '只读检查，不安装依赖' });

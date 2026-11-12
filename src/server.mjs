@@ -153,7 +153,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   register('team_send', '向运行中或待命的工作者追加指令。入队不等于已处理；不能代替team_reply回答阻塞问题。返回warnings时消息已接受，请按messageId检查状态，不要重复发送。', {
     workerId: workerReference, message: text,
   }, ({ workerId, message }) => requireTeam().send(workerId, message));
-  register('team_reply', '回答指定请求。权限请求必须显式allow，问题使用text或以原问题文本为键的answers；多选答案使用字符串数组。不得扩大用户授权。', {
+  register('team_reply', '回答指定请求。权限请求必须显式allow，问题使用text或以原问题文本为键的answers；多选答案使用字符串数组。不得扩大用户授权。返回answered:true及warnings时答复已送达，警告说明后续事件记录失败，不要重复答复。', {
     requestId: uuid, allow: z.boolean().optional(), reason: z.string().max(4000).optional(),
     text: z.string().max(12000).optional(), answers: z.record(z.string(), z.union([
       z.string().min(1).max(12000), z.array(z.string().min(1).max(12000)).min(1).max(100),
