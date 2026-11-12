@@ -36,7 +36,8 @@ test('真实 MCP 与 SDK 完成依赖交接、权限、长结果、失败修复�
   };
   async function connect() {
     const env = { ...process.env, CC_TEAM_CONFIG: configPath, CC_TEAM_STATE_DIR: stateDir, CC_TEAM_TEMP_DIR: tempDir,
-      CC_TEAM_CLAUDE_EXECUTABLE: fixturePath, CC_TEAM_NOTIFICATION_MODE: 'poll', CC_TEAM_WORKFLOW_LOG_DIR: logs };
+      CC_TEAM_CLAUDE_EXECUTABLE: fixturePath, CC_TEAM_NOTIFICATION_MODE: 'poll', CC_TEAM_WORKFLOW_LOG_DIR: logs,
+      CC_TEAM_PERMISSION_MODE: 'default' };
     transport = new StdioClientTransport({ command: process.execPath,
       args: [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), '--config', configPath], cwd: workspace, stderr: 'pipe', env });
     transport.stderr.on('data', chunk => { stderr += chunk.toString(); });
@@ -87,9 +88,9 @@ test('真实 MCP 与 SDK 完成依赖交接、权限、长结果、失败修复�
     await call('team_open', { teamId: 'workflow', constraints: 'CURRENT-CONSTRAINT-A', maxConcurrent: 2 });
     activeTeam = true;
     const dispatched = await call('team_dispatch', { workers: [
-      { name: '设计', cwd: workspace, prompt: 'TASK_DESIGN', scope: ['.'] },
-      { name: '实现', cwd: workspace, prompt: 'TASK_IMPLEMENT', access: 'write', scope: ['.'], dependsOn: ['设计cc'] },
-      { name: '验证', cwd: workspace, prompt: 'TASK_VERIFY', scope: ['.'], dependsOn: ['实现cc'] },
+      { name: '设计', cwd: workspace, prompt: 'TASK_DESIGN', scope: ['.'], review: 'codex' },
+      { name: '实现', cwd: workspace, prompt: 'TASK_IMPLEMENT', access: 'write', scope: ['.'], dependsOn: ['设计cc'], review: 'codex' },
+      { name: '验证', cwd: workspace, prompt: 'TASK_VERIFY', scope: ['.'], dependsOn: ['实现cc'], review: 'codex' },
     ] });
     assert.deepEqual(dispatched.workers.map(worker => worker.name), ['设计cc', '实现cc', '验证cc']);
     await waitFor(state => {

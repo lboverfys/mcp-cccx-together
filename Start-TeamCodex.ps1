@@ -33,7 +33,7 @@ $values = [ordered]@{
     args = @($registration.args)
     cwd = $teamRoot
     startup_timeout_sec = 15
-    tool_timeout_sec = 40
+    tool_timeout_sec = 600
     env_vars = $environmentNames
 }
 $overrides = @()
@@ -42,9 +42,12 @@ foreach ($key in $values.Keys) {
     $overrides += @('-c', "mcp_servers.cc_team.$key=$encodedValue")
 }
 foreach ($property in $registration.env.PSObject.Properties) {
+    # team_wait 的等待上限与上面的 tool_timeout_sec 配套，单独覆盖。
+    if ($property.Name -eq 'CC_TEAM_WAIT_TIMEOUT_MS') { continue }
     $encodedValue = ConvertTo-Json -InputObject $property.Value -Compress
     $overrides += @('-c', "mcp_servers.cc_team.env.$($property.Name)=$encodedValue")
 }
+$overrides += @('-c', 'mcp_servers.cc_team.env.CC_TEAM_WAIT_TIMEOUT_MS="570000"')
 
 # 仅本次 Codex 启动生效，不改用户级配置、PATH 或模型设置。
 if ($teamConfig.codexExecutable -match '\.[cm]?js$') {

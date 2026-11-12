@@ -95,7 +95,8 @@ export function loadConfig(configPath, {
   for (const [key, variable] of Object.entries({
     stateDir: 'CC_TEAM_STATE_DIR', tempDir: 'CC_TEAM_TEMP_DIR',
     claudeExecutable: 'CC_TEAM_CLAUDE_EXECUTABLE', codexExecutable: 'CC_TEAM_CODEX_EXECUTABLE',
-    notificationMode: 'CC_TEAM_NOTIFICATION_MODE',
+    notificationMode: 'CC_TEAM_NOTIFICATION_MODE', permissionMode: 'CC_TEAM_PERMISSION_MODE',
+    waitTimeoutMs: 'CC_TEAM_WAIT_TIMEOUT_MS',
   })) {
     if (env[variable] !== undefined) {
       config[key] = env[variable];
@@ -108,6 +109,12 @@ export function loadConfig(configPath, {
   }
   config.notificationMode ??= 'poll';
   if (!['poll', 'codex-queue'].includes(config.notificationMode)) throw new Error('notificationMode 必须为 poll 或 codex-queue');
+  config.permissionMode ??= 'bypassPermissions';
+  if (!['default', 'acceptEdits', 'bypassPermissions'].includes(config.permissionMode)) throw new Error('permissionMode 必须为 default、acceptEdits 或 bypassPermissions');
+  config.waitTimeoutMs = Number(config.waitTimeoutMs ?? 50000);
+  if (!Number.isSafeInteger(config.waitTimeoutMs) || config.waitTimeoutMs < 1000 || config.waitTimeoutMs > 3600000) {
+    throw new Error('waitTimeoutMs 必须是 1000 到 3600000 之间的整数毫秒');
+  }
   const executableErrors = {};
   let discoveredExecutable = false;
   for (const name of ['claude', 'codex']) {

@@ -124,3 +124,23 @@ test('本机标准 .local/bin 可在精简 PATH 下发现客户端', t => {
   chmodSync(executable, 0o755);
   assert.equal(findExecutable('claude', { env: {}, home: f.directory }), executable);
 });
+
+test('权限模式默认免审批、等待上限默认 50 秒，均可由配置或环境变量覆盖并校验', t => {
+  const f = fixture(t);
+  const options = { ...f.options, requireClaude: false };
+  const defaults = loadConfig(undefined, options);
+  assert.equal(defaults.permissionMode, 'bypassPermissions');
+  assert.equal(defaults.waitTimeoutMs, 50000);
+  const configured = loadConfig(f.write('modes.json', '{"permissionMode":"acceptEdits","waitTimeoutMs":570000}'), options);
+  assert.equal(configured.permissionMode, 'acceptEdits');
+  assert.equal(configured.waitTimeoutMs, 570000);
+  const env = { ...options.env, CC_TEAM_PERMISSION_MODE: 'default', CC_TEAM_WAIT_TIMEOUT_MS: '120000' };
+  const overridden = loadConfig(undefined, { ...options, env });
+  assert.equal(overridden.permissionMode, 'default');
+  assert.equal(overridden.waitTimeoutMs, 120000);
+  assert.equal(overridden.registrationEnv.CC_TEAM_WAIT_TIMEOUT_MS, '120000');
+  assert.throws(() => loadConfig(f.write('bad-permission.json', '{"permissionMode":"yolo"}'), options), /permissionMode/);
+  for (const value of ['"soon"', '500', '3600001']) {
+    assert.throws(() => loadConfig(f.write('bad-wait.json', `{"waitTimeoutMs":${value}}`), options), /waitTimeoutMs/);
+  }
+});

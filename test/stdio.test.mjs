@@ -36,7 +36,7 @@ test('真实 stdio 入口完成握手、团队恢复与 EOF 收尾，零模型�
     await client.connect(transport);
     pid = transport.pid;
     assert(pid && alive(pid));
-    assert.equal((await client.listTools()).tools.length, 14);
+    assert.equal((await client.listTools()).tools.length, 15);
     assert.deepEqual((await call('team_list')).teams, []);
     const opened = await call('team_open', { teamId: 'portable', constraints: '保留跨会话约束' });
     assert.equal(opened.notifications, false);

@@ -35,7 +35,7 @@ function outputQueue() {
   };
 }
 
-function harness({ workerOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand, stderrError } = {}) {
+function harness({ workerOverrides = {}, configOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand, stderrError } = {}) {
   const events = [];
   const messages = [];
   const waiters = [];
@@ -64,7 +64,7 @@ function harness({ workerOverrides = {}, request, readDependency, autoExit = tru
       id: 'worker-1', name: '接口开发cc', cwd: process.cwd(), instructions: '完成指定任务', allowedTools: [],
       ...workerOverrides,
     },
-    config: { claudeExecutable: 'D:/tools/claude.exe', tempDir: 'D:/task/temp' },
+    config: { claudeExecutable: 'D:/tools/claude.exe', tempDir: 'D:/task/temp', permissionMode: 'default', ...configOverrides },
     request: request ?? (async () => ({ allow: false, reason: '未授权' })),
     readDependency,
     emit(type, data) {
@@ -191,8 +191,9 @@ test('复用现有 exe、配置与环境，read 工作者移除写入和再委�
   const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === 'path');
   assert.equal(h.options.env[pathKey], process.env[pathKey]);
   assert.deepEqual(h.options.settingSources, ['user', 'project', 'local']);
-  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'AskUserQuestion']);
+  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep']);
   assert.ok(h.options.disallowedTools.includes('Agent'));
+  assert.ok(h.options.disallowedTools.includes('AskUserQuestion'));
   assert.equal(h.options.resume, 'saved-session');
   assert.deepEqual(h.options.extraArgs, { name: '接口开发cc' });
   assert.equal(h.options.model, 'custom-model');
@@ -310,11 +311,22 @@ test('同名外部 MCP 工具仍须审批，并向主控保留权限来源和原
   await h.instance.close();
 });
 
-test('问答保留原问题并返回答案，权限拒绝不伪装成功', async () => {
+test('默认免权限模式不再经主控审批，verify 工作者可运行命令', async () => {
+  const h = harness({ configOverrides: { permissionMode: undefined }, workerOverrides: { access: 'verify' } });
+  assert.equal(h.options.permissionMode, 'bypassPermissions');
+  assert.equal(h.options.allowDangerouslySkipPermissions, true);
+  assert.equal(h.options.permissionPrompts, 'none');
+  assert.equal(h.options.canUseTool, undefined);
+  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'Bash']);
+  assert.doesNotMatch(h.options.systemPrompt.append, /report_progress/);
+  await h.instance.close();
+});
+
+test('团队工具直接放行，权限拒绝不伪装成功', async () => {
   const calls = [];
   const h = harness({ request: async (kind, payload) => {
     calls.push({ kind, payload });
-    return kind === 'question' ? { answers: { '选择方案': 'A' } } : { allow: false, reason: '未获授权' };
+    return { allow: false, reason: '未获授权' };
   } });
   const context = { signal: new AbortController().signal, requestId: 'request-1', toolUseID: 'tool-1' };
   assert.equal(h.options.strictMcpConfig, true);
@@ -323,13 +335,10 @@ test('问答保留原问题并返回答案，权限拒绝不伪装成功', async
     const input = { summary: '协调消息' };
     assert.deepEqual(await h.options.canUseTool(toolName, input, { ...context, mcpServer: { name: 'team', source: 'sdk' } }), { behavior: 'allow', updatedInput: input });
   }
-  const questions = [{ question: '选择方案', options: [{ label: 'A', description: '' }], multiSelect: false }];
-  const answer = await h.options.canUseTool('AskUserQuestion', { questions }, context);
-  assert.deepEqual(answer, { behavior: 'allow', updatedInput: { questions, answers: { '选择方案': 'A' } } });
   const denied = await h.options.canUseTool('Bash', { command: 'git push' }, context);
   assert.deepEqual(denied, { behavior: 'deny', message: '未获授权' });
-  assert.deepEqual(calls.map((call) => call.kind), ['question', 'permission']);
-  assert.equal(calls[1].payload.toolName, 'Bash');
+  assert.deepEqual(calls.map((call) => call.kind), ['permission']);
+  assert.equal(calls[0].payload.toolName, 'Bash');
   await h.instance.close();
 });
 
@@ -417,22 +426,6 @@ test('真实 SDK 在初始化期间遇到 stderr 保存失败会退出自有子�
   assert(child?.pid);
   assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
   await assert.rejects(worker.close(), error => error === failure);
-});
-
-test('单题自由文本转换为 answers，多题拒绝不完整回答', async () => {
-  let response = { text: '自由文本回答' };
-  const h = harness({ request: async () => response });
-  const context = { signal: new AbortController().signal, requestId: 'question-1', toolUseID: 'tool-1' };
-  const questions = [{ question: '第一个问题' }];
-  const answer = await h.options.canUseTool('AskUserQuestion', { questions }, context);
-  assert.deepEqual(answer.updatedInput, { questions, answers: { 第一个问题: '自由文本回答' } });
-  const multiple = { questions: [...questions, { question: '第二个问题' }] };
-  await assert.rejects(h.options.canUseTool('AskUserQuestion', multiple, context), /每个问题/);
-  response = { answers: { 第一个问题: '回答一' } };
-  await assert.rejects(h.options.canUseTool('AskUserQuestion', multiple, context), /每个问题/);
-  response = { answers: { 第一个问题: '回答一', 第二个问题: '回答二' } };
-  assert.deepEqual((await h.options.canUseTool('AskUserQuestion', multiple, context)).updatedInput.answers, response.answers);
-  await h.instance.close();
 });
 
 test('流异常先关闭并确认工作者进程退出，再拒绝 done', async () => {
@@ -630,7 +623,10 @@ lines.on('line', line => {
         tasks: [{ task_id: 'local-build', task_type: 'local_bash', description: '模拟后台构建', run_id: 'first-run' }] });
       result([message], {}, { terminal_reason: 'background_requested' });
     } else if (task.action === 'options') {
-      result([message], { maxTurns: process.argv.find(arg => arg.startsWith('--max-turns=')),
+      result([message], { permissionMode: process.argv.find(arg => arg.startsWith('--permission-mode')),
+        skipPermissions: process.argv.includes('--allow-dangerously-skip-permissions'),
+        promptTool: process.argv.find(arg => arg.startsWith('--permission-prompt-tool')),
+        maxTurns: process.argv.find(arg => arg.startsWith('--max-turns=')),
         maxBudgetUsd: process.argv.find(arg => arg.startsWith('--max-budget-usd=')),
         snapshot: initialization.systemPromptSnapshot, append: initialization.appendSystemPrompt });
     } else {
@@ -657,12 +653,12 @@ lines.on('close', () => process.exit(0));
     const failed = results.find(result => result.status === 'rejected');
     if (failed) throw failed.reason;
   });
-  function start(sessionId, { request, workerOverrides = {} } = {}) {
+  function start(sessionId, { request, workerOverrides = {}, config = {} } = {}) {
     const events = [];
     let failure;
     const worker = createClaudeWorker({
       worker: { id: 'sdk-worker', name: '协议验证cc', cwd: dir, instructions: '仅处理模拟协议', access: 'read', allowedTools: [], sessionId, ...workerOverrides },
-      config: { claudeExecutable: cli, tempDir: dir },
+      config: { claudeExecutable: cli, tempDir: dir, permissionMode: 'default', ...config },
       emit: (type, data) => events.push({ type, data }),
       request: request ?? (async () => { throw new Error('当前模拟轮次不应请求工具审批'); }),
       spawnImpl(command, args, options) {
@@ -717,25 +713,35 @@ lines.on('close', () => process.exit(0));
   assert.equal(questions[0].payload.decisionReason, '需要主控决定');
   controlled.worker.send(JSON.stringify({ action: 'permission', command: 'denied-command' }), '4188dcba-1dbb-4426-94bf-bf88d8a5978b');
   assert.equal(JSON.parse((await controlled.result(2)).text).response.behavior, 'deny');
-  controlled.worker.send(JSON.stringify({ action: 'question' }), 'f7796ab1-fdd4-4b03-8b35-9a718f43edcf');
-  assert.deepEqual(JSON.parse((await controlled.result(3)).text).response.updatedInput.answers, { 请选择执行方案: 'A' });
   controlled.worker.send(JSON.stringify({ action: 'batch' }), '2711c3e4-68f5-4779-b9f8-6b2d3e6e8884');
   controlled.worker.send(JSON.stringify({ action: 'batch' }), 'cb2f73ec-afd2-4028-8f64-209b750ab9b6');
-  assert.deepEqual((await controlled.result(4)).messageIds, ['2711c3e4-68f5-4779-b9f8-6b2d3e6e8884', 'cb2f73ec-afd2-4028-8f64-209b750ab9b6']);
+  assert.deepEqual((await controlled.result(3)).messageIds, ['2711c3e4-68f5-4779-b9f8-6b2d3e6e8884', 'cb2f73ec-afd2-4028-8f64-209b750ab9b6']);
   controlled.worker.send(JSON.stringify({ action: 'failure' }), 'ce574c1d-e4ef-47bb-9b0f-fbfced823975');
-  assert.equal((await controlled.result(5)).success, false);
+  assert.equal((await controlled.result(4)).success, false);
   controlled.worker.send('失败后新任务', '738f2b72-aeae-4c37-beed-608c00295f06');
-  assert.equal((await controlled.result(6)).success, true);
+  assert.equal((await controlled.result(5)).success, true);
   controlled.worker.send(JSON.stringify({ action: 'options' }), 'b12838ac-9752-4f54-a811-78b27852d634');
-  const options = JSON.parse((await controlled.result(7)).text);
+  const options = JSON.parse((await controlled.result(6)).text);
   assert.equal(options.maxTurns, '--max-turns=7');
   assert.equal(options.maxBudgetUsd, '--max-budget-usd=0.25');
   assert.equal(options.snapshot, false);
+  assert.equal(options.permissionMode, '--permission-mode=default');
+  assert.equal(options.skipPermissions, false);
+  assert.equal(options.promptTool, '--permission-prompt-tool=stdio');
   controlled.worker.send(JSON.stringify({ action: 'background' }), '7d287742-1818-4bc6-a4f7-4726277b3311');
-  const backgroundResult = await controlled.result(8);
+  const backgroundResult = await controlled.result(7);
   assert.equal(backgroundResult.success, false);
   assert.equal(backgroundResult.background, true);
   await controlled.worker.close();
   assert.deepEqual(controlled.events.filter(event => event.type === 'background_tasks').at(-1).data.tasks, []);
   assert.equal(children[2].exitCode, 0);
+
+  const bypass = start(undefined, { config: { permissionMode: 'bypassPermissions' } });
+  bypass.worker.send(JSON.stringify({ action: 'options' }), '3f1f8f0e-5b7c-4f43-9a51-2b1f3c6d7e80');
+  const bypassOptions = JSON.parse((await bypass.result(1)).text);
+  assert.equal(bypassOptions.permissionMode, '--permission-mode=bypassPermissions');
+  assert.equal(bypassOptions.skipPermissions, true);
+  assert.equal(bypassOptions.promptTool, undefined);
+  await bypass.worker.close();
+  assert.equal(children[3].exitCode, 0);
 });

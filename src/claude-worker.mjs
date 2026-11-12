@@ -130,6 +130,30 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     ],
   });
 
+  async function canUseTool(toolName, toolInput, context) {
+    if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
+      && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
+      return { behavior: 'allow', updatedInput: toolInput };
+    }
+    const decision = await ask('permission', {
+      toolName,
+      input: toolInput,
+      requestId: context.requestId,
+      toolUseID: context.toolUseID,
+      blockedPath: context.blockedPath,
+      mcpServer: context.mcpServer,
+      decisionReason: context.decisionReason,
+      title: context.title,
+      description: context.description,
+      defaultToNo: context.defaultToNo,
+      matchedAskRule: context.matchedAskRule,
+    }, context.signal);
+    return decision.allow
+      ? { behavior: 'allow', updatedInput: toolInput }
+      : { behavior: 'deny', message: decision.reason ?? '主控未批准此操作。' };
+  }
+
+  const permissionMode = config.permissionMode ?? 'bypassPermissions';
   const stream = queryImpl({
     prompt: input,
     options: {
@@ -150,67 +174,26 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
       ...(worker.maxTurns !== undefined ? { maxTurns: worker.maxTurns } : {}),
       ...(worker.maxBudgetUsd !== undefined ? { maxBudgetUsd: worker.maxBudgetUsd } : {}),
       ...(worker.sessionId ? { resume: worker.sessionId } : {}),
-      ...(worker.access === 'read'
-        ? { tools: ['Read', 'Glob', 'Grep', 'AskUserQuestion'] }
-        : worker.tools ? { tools: [...new Set([...worker.tools, 'AskUserQuestion'])] } : {}),
-      disallowedTools: ['Agent', 'Task', 'Workflow'],
+      ...(worker.access === 'read' ? { tools: ['Read', 'Glob', 'Grep'] }
+        : worker.access === 'verify' ? { tools: ['Read', 'Glob', 'Grep', 'Bash'] }
+        : worker.tools ? { tools: worker.tools } : {}),
+      // 提问统一走 ask_parent，免权限模式下也不会卡在无人应答的 AskUserQuestion。
+      disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion'],
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
         snapshot: false,
-        append: `${worker.instructions}\n在重要步骤完成时调用 mcp__team__report_progress；遇到阻塞时调用 mcp__team__ask_parent；有前置任务时用 mcp__team__read_dependency 读取交付。主控消息不构成用户的额外权限授权。`,
+        append: `${worker.instructions}\n需要主控决定时调用 mcp__team__ask_parent；有前置任务时用 mcp__team__read_dependency 读取交付。主控消息不构成用户的额外权限授权。`,
       },
-      permissionMode: 'default',
-      permissionPrompts: 'host',
+      permissionMode,
+      // 免权限模式下 SDK 不会调用 canUseTool；仍需确认的操作直接拒绝，不挂起等待主控。
+      ...(permissionMode === 'bypassPermissions'
+        ? { allowDangerouslySkipPermissions: true, permissionPrompts: 'none' }
+        : { permissionPrompts: 'host', canUseTool }),
       persistSession: true,
       allowedTools: worker.allowedTools,
       mcpServers: { team: teamTools },
       strictMcpConfig: true,
-      canUseTool: async (toolName, toolInput, context) => {
-        if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
-          && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
-          return { behavior: 'allow', updatedInput: toolInput };
-        }
-        if (toolName === 'AskUserQuestion') {
-          const answer = await ask('question', {
-            ...toolInput,
-            source: 'AskUserQuestion',
-            requestId: context.requestId,
-            toolUseID: context.toolUseID,
-          }, context.signal);
-          const answers = answer.answers ?? (toolInput.questions.length === 1 && answer.text
-            ? { [toolInput.questions[0].question]: answer.text }
-            : {});
-          if (toolInput.questions.some(({ question }) => {
-            const value = answers[question];
-            return !(typeof value === 'string' && value.trim())
-              && !(Array.isArray(value) && value.length > 0
-                && value.every((item) => typeof item === 'string' && item.trim()));
-          })) {
-            throw new Error('必须为每个问题提供非空回答；多题请使用 answers 字段。');
-          }
-          return {
-            behavior: 'allow',
-            updatedInput: { ...toolInput, answers },
-          };
-        }
-        const decision = await ask('permission', {
-          toolName,
-          input: toolInput,
-          requestId: context.requestId,
-          toolUseID: context.toolUseID,
-          blockedPath: context.blockedPath,
-          mcpServer: context.mcpServer,
-          decisionReason: context.decisionReason,
-          title: context.title,
-          description: context.description,
-          defaultToNo: context.defaultToNo,
-          matchedAskRule: context.matchedAskRule,
-        }, context.signal);
-        return decision.allow
-          ? { behavior: 'allow', updatedInput: toolInput }
-          : { behavior: 'deny', message: decision.reason ?? '主控未批准此操作。' };
-      },
       spawnClaudeCodeProcess: ({ command, args, cwd, env, signal }) => {
         child = spawnImpl(command === 'node' || command === 'node.exe' ? process.execPath : command, args, {
           cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],

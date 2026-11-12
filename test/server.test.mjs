@@ -276,9 +276,35 @@ async function fixture(t) {
     assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
     rmSync(dir, { recursive: true, force: true });
   });
-  const spec = (name, extra = {}) => ({ name, cwd, prompt: `执行 ${name}`, ...extra });
+  // 现有用例覆盖人工验收流程；自动验收单独测试。
+  const spec = (name, extra = {}) => ({ name, cwd, prompt: `执行 ${name}`, review: 'codex', ...extra });
   return { dir, cwd, config, controllers, notifiers, connect, spec };
 }
+
+test('team_dispatch 未打开团队时自动打开，team_wait 等到自动验收完成并返回精简结果', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 1000;
+  const endpoint = await f.connect();
+  const dispatched = await endpoint.call('team_dispatch', { workers: [
+    f.spec('实现', { review: 'auto', access: 'verify', verify: `"${process.execPath}" -e "process.exit(0)"` }),
+  ] });
+  assert.equal(dispatched.opened, true);
+  assert.match(dispatched.teamId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(f.controllers[0].options.worker.access, 'verify');
+  const started = Date.now();
+  const early = await endpoint.call('team_wait', { timeoutMs: 999999 });
+  assert.ok(Date.now() - started < 2000, '等待时间应受 waitTimeoutMs 上限约束');
+  assert.equal(early.timedOut, true);
+  assert.equal(early.workers[0].attention, false);
+  const waiting = endpoint.call('team_wait');
+  f.controllers[0].emit('result', { success: true, text: '实现完成' });
+  const result = await waiting;
+  assert.equal(result.done, true);
+  assert.deepEqual(Object.keys(result.workers[0]).sort(), ['attention', 'id', 'name', 'resultId', 'review', 'status', 'summary']);
+  assert.equal(result.workers[0].status, 'idle');
+  assert.equal(result.workers[0].review.accepted, true);
+  assert.equal((await endpoint.call('team_result', { workerId: '实现cc' })).hasMore, false);
+});
 
 test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回明确失败', async t => {
   const f = await fixture(t);
@@ -305,7 +331,7 @@ test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回�
   }
 });
 
-test('MCP 传递 mct/ctm 委派说明并暴露全部 14 个工具，未打开团队时返回工具错误', async t => {
+test('MCP 传递 mct/ctm 委派说明并暴露全部 15 个工具，未打开团队时返回工具错误', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   const { tools } = await endpoint.client.listTools();
@@ -318,13 +344,15 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 14 个工具，未打开团
   }
   assert.match(instructions, /不区分大小写/);
   assert.match(instructions, /通过本 MCP 委派 Claude Code（CC）子 agent/);
-  assert.match(instructions, /team_open.*team_dispatch/);
-  assert.match(instructions, /无需再次确认是否启用/);
+  assert.match(instructions, /team_dispatch.*team_wait/);
+  assert.match(instructions, /无需再次确认/);
+  assert.doesNotMatch(instructions, /不要使用绕过权限模式/);
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'team_open', 'team_dispatch', 'team_status', 'team_events', 'team_send', 'team_reply',
     'team_request', 'team_interrupt', 'team_resume', 'team_review', 'team_close', 'team_shutdown', 'team_list', 'team_result',
+    'team_wait',
   ].sort());
-  for (const name of ['team_status', 'team_events', 'team_request']) {
+  for (const name of ['team_status', 'team_events', 'team_request', 'team_wait']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
   }
   const result = await endpoint.raw('team_status');

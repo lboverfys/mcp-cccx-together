@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, realpathSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { TeamManager } from '../src/manager.mjs';
@@ -61,21 +61,39 @@ async function fixture(t) {
   return { dir, cwd, config, controllers, create, spec };
 }
 
-test('批量派发先验证全部范围，冲突错误不产生部分工作者', async t => {
+test('批量派发的重叠写入范围按提交顺序排队，不整批拒绝', async t => {
   const f = await fixture(t);
   const manager = await f.create();
-  assert.throws(() => manager.dispatch([
+  const [front, nested, back] = manager.dispatch([
     f.spec('前端', { access: 'write', scope: ['front'] }),
     f.spec('重叠', { access: 'write', scope: ['front/components'] }),
-  ]), /冲突/);
-  assert.equal(f.controllers.length, 0);
-  assert.deepEqual(manager.status().workers, []);
-  assert.deepEqual(manager.store.listWorkers(), []);
-  const result = manager.dispatch([
-    f.spec('前端', { access: 'write', scope: ['front'] }),
     f.spec('后端', { access: 'write', scope: ['back'] }),
   ]);
-  assert.equal(result.length, 2);
+  assert.equal(f.controllers.length, 2);
+  assert.equal(manager.get(back.id).data.status, 'running');
+  assert.equal(manager.get(nested.id).data.status, 'queued');
+  assert.equal(manager.get(nested.id).data.queueReason, 'waiting_scope');
+  assert.equal(manager.get(nested.id).data.blockedBy[0].name, '前端');
+  f.controllers[0].emit('result', { success: true, text: '完成' });
+  manager.review(front.id, true, '通过');
+  await tick();
+  assert.equal(f.controllers[0].closeCalls, 1);
+  assert.equal(manager.get(nested.id).data.status, 'running');
+});
+
+test('后提交的重叠任务不越过仍在排队的宽范围写入', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader, root, later] = manager.dispatch([
+    f.spec('读前端', { scope: ['front'] }),
+    f.spec('写根目录', { access: 'write', scope: ['.'] }),
+    f.spec('写后端', { access: 'write', scope: ['back'] }),
+  ]);
+  assert.equal(manager.get(reader.id).data.status, 'running');
+  assert.equal(manager.get(root.id).data.queueReason, 'waiting_scope');
+  assert.equal(manager.get(later.id).data.status, 'queued');
+  assert.equal(manager.get(later.id).data.blockedBy[0].name, '写根目录');
+  assert.equal(f.controllers.length, 1);
 });
 
 test('批量保存失败不登记任务；提交后创建事件失败仍返回完整批次和警告', async t => {
@@ -263,23 +281,26 @@ test('范围索引允许同一工作者的嵌套范围，仍阻止祖先写入�
   const manager = await f.create();
   const readers = manager.dispatch(Array.from({ length: 24 }, (_, i) => f.spec(`只读${i}`, { scope: ['front'] })));
   assert.equal(readers.length, 24);
-  assert.throws(() => manager.dispatch([f.spec('写入根', { access: 'write', scope: ['.'] })]), /冲突/);
-  assert.throws(() => manager.dispatch([f.spec('写入子', { access: 'write', scope: ['front/new.js'] })]), /冲突/);
-  const [writer] = manager.dispatch([f.spec('后端写入', { access: 'write', scope: ['back', 'back/nested', 'back'] })]);
-  assert.ok(writer.id);
-  assert.throws(() => manager.dispatch([f.spec('读取后端', { scope: ['back/nested/file.js'] })]), /冲突/);
-  const [sibling] = manager.dispatch([f.spec('相邻目录', { access: 'write', scope: ['back-other'] })]);
-  assert.ok(sibling.id);
+  const prepared = (name, extra) => manager.prepare(f.spec(name, extra));
+  const reader = manager.get(readers[0].id).data;
+  assert.equal(manager.scopesOverlap(prepared('写入根', { access: 'write', scope: ['.'] }), reader), true);
+  assert.equal(manager.scopesOverlap(prepared('写入子', { access: 'write', scope: ['front/new.js'] }), reader), true);
+  const writer = prepared('后端写入', { access: 'write', scope: ['back', 'back/nested', 'back'] });
+  assert.equal(manager.scopesOverlap(writer, reader), false);
+  assert.equal(manager.scopesOverlap(prepared('读取后端', { scope: ['back/nested/file.js'] }), writer), true);
+  assert.equal(manager.scopesOverlap(prepared('相邻目录', { access: 'write', scope: ['back-other'] }), writer), false);
+  const [root] = manager.dispatch([f.spec('写入根', { access: 'write', scope: ['.'] })]);
+  assert.equal(manager.get(root.id).data.queueReason, 'waiting_scope');
 });
 
 test('Windows和macOS对未创建范围保守忽略大小写，原始路径不变且显式依赖可串行', async t => {
   for (const platform of ['win32', 'darwin']) {
     const f = await fixture(t);
     const manager = await f.create({ platform });
-    assert.throws(() => manager.dispatch([
-      f.spec('写入甲', { access: 'write', scope: ['front/NewFeature'] }),
-      f.spec('写入乙', { access: 'write', scope: ['front/newfeature/component.js'] }),
-    ]), /冲突/);
+    assert.equal(manager.scopesOverlap(
+      manager.prepare(f.spec('写入甲', { access: 'write', scope: ['front/NewFeature'] })),
+      manager.prepare(f.spec('写入乙', { access: 'write', scope: ['front/newfeature/component.js'] })),
+    ), true);
     assert.equal(f.controllers.length, 0);
     const [a, b] = manager.dispatch([
       f.spec('写入甲', { access: 'write', scope: ['front/NewFeature'] }),
@@ -596,10 +617,10 @@ test('目录联接按真实路径检测重叠和越界，包含尚未创建的�
       created.push(link);
       assert.equal(realpathSync(link), realpathSync(target));
     }
-    assert.throws(() => manager.dispatch([
-      f.spec('实际目录', { access: 'write', scope: ['front'] }),
-      f.spec('联接目录', { access: 'write', scope: ['front-alias/new-folder/file.js'] }),
-    ]), /冲突/);
+    assert.equal(manager.scopesOverlap(
+      manager.prepare(f.spec('实际目录', { access: 'write', scope: ['front'] })),
+      manager.prepare(f.spec('联接目录', { access: 'write', scope: ['front-alias/new-folder/file.js'] })),
+    ), true);
     assert.equal(f.controllers.length, 0);
     assert.throws(() => manager.dispatch([
       f.spec('越界联接', { access: 'write', scope: ['outside-link/new-folder/file.js'] }),
@@ -798,7 +819,7 @@ test('团队约束持久保存，更新约束后恢复工作者使用当前约�
   assert.equal(cleared.constraints, '');
 });
 
-test('恢复时重新解析范围，目录联接改变后的重叠会被拒绝', async t => {
+test('恢复时重新解析范围，目录联接改变后的重叠排队等待', async t => {
   const f = await fixture(t);
   const manager = await f.create();
   const link = path.join(f.cwd, 'current');
@@ -810,7 +831,8 @@ test('恢复时重新解析范围，目录联接改变后的重叠会被拒绝',
     unlinkSync(link);
     symlinkSync(path.join(f.cwd, 'back'), link, 'junction');
     manager.dispatch([f.spec('B', { access: 'write', scope: ['back'] })]);
-    assert.throws(() => manager.resume(first.id, '继续'), /冲突/);
+    assert.equal(manager.resume(first.id, '继续').status, 'queued');
+    assert.equal(manager.get(first.id).data.queueReason, 'waiting_scope');
     assert.equal(f.controllers.length, 2);
   } finally {
     assert.ok(lstatSync(link).isSymbolicLink());
@@ -828,7 +850,8 @@ test('异常停止记录的 PID 仍存活时阻止重复启动', async t => {
   manager.get(worker.id).data.lastPid = process.pid;
   manager.get(worker.id).data.processExited = false;
   assert.throws(() => manager.resume(worker.id, '继续'), /PID.*仍存活/);
-  assert.throws(() => manager.dispatch([f.spec('B', { access: 'write', scope: ['front'] })]), /冲突/);
+  const [queued] = manager.dispatch([f.spec('B', { access: 'write', scope: ['front'] })]);
+  assert.equal(manager.get(queued.id).data.queueReason, 'waiting_scope');
   await assert.rejects(manager.closeWorker(worker.id), /PID.*仍存活/);
   await assert.rejects(manager.close(), /未能关闭/);
   assert.equal(manager.get(worker.id).data.status, 'stopped');
@@ -876,23 +899,23 @@ test('初始化期间写入失败会释放状态锁，可重试打开', async t 
   await f.create();
 });
 
-test('默认最多四个真实工作进程，验收后按需关闭待命进程并自动启动队列', async t => {
+test('默认最多八个真实工作进程，验收后按需关闭待命进程并自动启动队列', async t => {
   const f = await fixture(t);
   const manager = await f.create();
-  const workers = manager.dispatch(Array.from({ length: 6 }, (_, i) => f.spec(`任务${i}`)));
-  assert.equal(manager.maxConcurrent, 4);
-  assert.equal(f.controllers.length, 4);
-  assert.deepEqual(workers.map(worker => worker.status), ['running', 'running', 'running', 'running', 'queued', 'queued']);
+  const workers = manager.dispatch(Array.from({ length: 10 }, (_, i) => f.spec(`任务${i}`)));
+  assert.equal(manager.maxConcurrent, 8);
+  assert.equal(f.controllers.length, 8);
+  assert.deepEqual(workers.map(worker => worker.status), [...Array(8).fill('running'), 'queued', 'queued']);
   assert.equal(manager.status().queuedCount, 2);
-  assert.equal(manager.status().workers[4].queueReason, 'waiting_capacity');
+  assert.equal(manager.status().workers[8].queueReason, 'waiting_capacity');
   const first = f.controllers[0];
   first.emit('result', { success: true, text: '完成', sessionId: 'session-first' });
-  assert.equal(f.controllers.length, 4);
+  assert.equal(f.controllers.length, 8);
   manager.review(workers[0].id, true, '检查通过');
   await tick();
   assert.equal(first.closeCalls, 1);
-  assert.equal(f.controllers.length, 5);
-  assert.equal(manager.status().runningCount, 4);
+  assert.equal(f.controllers.length, 9);
+  assert.equal(manager.status().runningCount, 8);
   assert.equal(manager.status().queuedCount, 1);
   assert.equal(manager.get(workers[0].id).data.status, 'closed');
   assert.equal(manager.get(workers[0].id).data.sessionId, 'session-first');
@@ -955,16 +978,15 @@ test('同批前置任务验收后自动串行启动重叠范围，并交接完�
   assert.ok(f.controllers.slice(0, 2).every(controller => controller.closeCalls === 1));
 });
 
-test('依赖可前向引用且循环、缺失依赖和无序写冲突整批拒绝', async t => {
+test('依赖可前向引用，循环和缺失依赖整批拒绝', async t => {
   const f = await fixture(t);
   const manager = await f.create();
   for (const specs of [
     [f.spec('A', { dependsOn: ['A'] })],
     [f.spec('A', { dependsOn: ['B'] }), f.spec('B', { dependsOn: ['A'] })],
     [f.spec('A', { dependsOn: ['不存在'] })],
-    [f.spec('A', { access: 'write' }), f.spec('B', { access: 'write' })],
   ]) {
-    assert.throws(() => manager.dispatch(specs), /循环|未找到|冲突/);
+    assert.throws(() => manager.dispatch(specs), /循环|未找到/);
     assert.equal(manager.workers.size, 0);
     assert.equal(manager.store.listWorkers().length, 0);
     assert.equal(f.controllers.length, 0);
@@ -977,21 +999,22 @@ test('依赖可前向引用且循环、缺失依赖和无序写冲突整批拒�
   assert.equal(manager.get(first.id).data.status, 'running');
 });
 
-test('共同前置任务不允许两个同范围后继并发写，显式传递链可以串行', async t => {
+test('共同前置任务的两个同范围后继不并发写，按提交顺序串行', async t => {
   const f = await fixture(t);
   const manager = await f.create();
-  assert.throws(() => manager.dispatch([
+  const [a, b, c] = manager.dispatch([
     f.spec('A', { access: 'write', scope: ['front'] }),
     f.spec('B', { access: 'write', scope: ['front'], dependsOn: ['A'] }),
     f.spec('C', { access: 'write', scope: ['front'], dependsOn: ['A'] }),
-  ]), /冲突/);
-  const workers = manager.dispatch([
-    f.spec('A', { access: 'write', scope: ['front'] }),
-    f.spec('B', { scope: ['back'], dependsOn: ['A'] }),
-    f.spec('C', { access: 'write', scope: ['front/nested'], dependsOn: ['B'] }),
   ]);
-  assert.equal(workers.length, 3);
   assert.equal(f.controllers.length, 1);
+  f.controllers[0].emit('result', { success: true, text: 'A 完成' });
+  manager.review(a.id, true, '通过');
+  await tick();
+  assert.equal(manager.get(b.id).data.status, 'running');
+  assert.equal(manager.get(c.id).data.status, 'queued');
+  assert.equal(manager.get(c.id).data.queueReason, 'waiting_scope');
+  assert.equal(f.controllers.length, 2);
 });
 
 test('依赖失败与拒绝验收显示阻塞，修复通过后下游自动继续', async t => {
@@ -1146,7 +1169,8 @@ test('后台任务未确认停止时，进程退出不能放行关闭、恢复�
     await assert.rejects(manager.closeWorker(a.id), /unconfirmed-build/);
     assert.equal(manager.get(a.id).data.status, 'failed');
     assert.throws(() => manager.resume(a.id, '继续'), /unconfirmed-build/);
-    assert.throws(() => manager.dispatch([f.spec('C', { access: 'write', scope: ['front'] })]), /冲突/);
+    const [c] = manager.dispatch([f.spec('C', { access: 'write', scope: ['front'] })]);
+    assert.equal(manager.get(c.id).data.queueReason, 'waiting_scope');
     await assert.rejects(manager.close(), error => error instanceof AggregateError
       && error.errors.some(item => /unconfirmed-build/.test(item.message)));
     assert(existsSync(manager.store.lockPath));
@@ -1504,4 +1528,128 @@ test('前置版本变化使整条旧交付链失效，重新执行并验收后�
   assert.equal(manager.get(c.id).data.status, 'running');
   assert.equal(manager.get(d.id).data.status, 'queued');
   assert.equal(f.controllers.length, 5);
+});
+
+async function until(predicate, message) {
+  for (let i = 0; i < 500 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(predicate(), message);
+}
+
+test('自动验收：验证命令通过即验收并启动下游，无需主控 team_review', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([
+    f.spec('A', { review: 'auto', verify: `"${process.execPath}" -e "process.exit(0)"` }),
+    f.spec('B', { dependsOn: ['A'] }),
+  ]);
+  const waiting = manager.wait({ workerIds: [a.id], timeoutMs: 10000 });
+  f.controllers[0].emit('result', { success: true, text: 'A 完成' });
+  assert.equal(manager.get(a.id).verifying, true);
+  const result = await waiting;
+  assert.equal(result.done, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.workers[0].review.accepted, true);
+  assert.match(result.workers[0].review.note, /自动验收.*通过/);
+  assert.equal(manager.get(b.id).data.status, 'running');
+  assert.match(f.controllers[1].options.worker.instructions, /自动验收/);
+});
+
+test('自动验收：验证失败把输出发回工作者修复，超过轮数交主控，主控追加后重新计数', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const verify = `"${process.execPath}" -e "const ok = require('fs').existsSync('ok.txt'); console.log(ok ? 'PASS' : 'FAIL-MARKER'); process.exit(ok ? 0 : 1)"`;
+  const [a] = manager.dispatch([f.spec('A', { access: 'write', scope: ['.'], review: 'auto', verify, maxFixRounds: 1 })]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '第一轮' });
+  await until(() => controller.sent.length === 2, '验证失败后应自动发回修复要求');
+  assert.match(controller.sent[1].text, /FAIL-MARKER/);
+  assert.match(controller.sent[1].text, /自动修复 1\/1/);
+  assert.equal(manager.get(a.id).data.status, 'running');
+  controller.emit('result', { success: true, text: '第二轮', messageIds: [controller.sent[1].messageId] });
+  const rejected = await manager.wait({ timeoutMs: 10000 });
+  assert.equal(rejected.done, false);
+  assert.equal(rejected.workers[0].attention, true);
+  assert.equal(rejected.workers[0].review.accepted, false);
+  assert.match(rejected.workers[0].review.note, /FAIL-MARKER/);
+  assert.equal(controller.sent.length, 2);
+  writeFileSync(path.join(f.cwd, 'ok.txt'), '');
+  manager.send(a.id, '已补充文件，请重新报告');
+  assert.equal(manager.get(a.id).data.fixRounds, 0);
+  controller.emit('result', { success: true, text: '第三轮', messageIds: [controller.sent[2].messageId] });
+  const passed = await manager.wait({ timeoutMs: 10000 });
+  assert.equal(passed.done, true);
+  assert.equal(passed.workers[0].review.accepted, true);
+});
+
+test('关闭工作者会中止进行中的验证命令，不再自动验收', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A', { review: 'auto', verify: `"${process.execPath}" -e "setTimeout(() => {}, 60000)"` })]);
+  f.controllers[0].emit('result', { success: true, text: '完成' });
+  await tick();
+  assert.equal(manager.get(a.id).verifying, true);
+  const started = Date.now();
+  await manager.closeWorker(a.id);
+  await until(() => !manager.get(a.id).verifying, '中止后应清除验证标记');
+  assert.ok(Date.now() - started < 10000);
+  assert.equal(manager.get(a.id).data.status, 'closed');
+  assert.equal(manager.get(a.id).data.lastReview, undefined);
+});
+
+test('team_wait 在提问、失败或全部完成时返回，超时如实标记', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  const timed = await manager.wait({ timeoutMs: 20 });
+  assert.equal(timed.timedOut, true);
+  assert.equal(timed.done, false);
+  assert.deepEqual(timed.workers.map(worker => worker.attention), [false, false]);
+  const asking = manager.wait({ timeoutMs: 10000 });
+  const question = f.controllers[1].request('question', { questions: [{ question: '选哪个？' }] });
+  const asked = await asking;
+  const target = asked.workers.find(worker => worker.id === b.id);
+  assert.equal(asked.timedOut, false);
+  assert.equal(target.attention, true);
+  assert.equal(target.requests[0].kind, 'question');
+  manager.reply(target.requests[0].id, { text: '选 A' });
+  assert.deepEqual(await question, { text: '选 A' });
+  const failing = manager.wait({ timeoutMs: 10000 });
+  f.controllers[0].emit('result', { success: false, text: '编译失败' });
+  const failed = (await failing).workers.find(worker => worker.id === a.id);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.attention, true);
+  assert.match(failed.error, /编译失败/);
+  manager.send(a.id, '修复');
+  f.controllers[0].emit('result', { success: true, text: 'A 完成' });
+  f.controllers[1].emit('result', { success: true, text: 'B 完成' });
+  const review = await manager.wait({ timeoutMs: 10000 });
+  assert.ok(review.workers.every(worker => worker.status === 'awaiting_review' && worker.attention));
+  manager.review(a.id, true, '通过');
+  manager.review(b.id, true, '通过');
+  const done = await manager.wait({ workerIds: [a.id, b.id], timeoutMs: 10000 });
+  assert.equal(done.done, true);
+  assert.equal((await manager.wait({ timeoutMs: 10000 })).workers.length, 0);
+});
+
+test('verify 工作者可与只读任务共享范围，与写入任务重叠时排队', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader, verifier, writer] = manager.dispatch([
+    f.spec('读取', { scope: ['front'] }),
+    f.spec('验证', { access: 'verify' }),
+    f.spec('写入', { access: 'write', scope: ['front'] }),
+  ]);
+  assert.equal(manager.get(reader.id).data.status, 'running');
+  assert.equal(manager.get(verifier.id).data.status, 'running');
+  assert.match(manager.get(verifier.id).data.instructions, /验证任务/);
+  assert.equal(manager.get(writer.id).data.queueReason, 'waiting_scope');
+});
+
+test('工作者说明不附带 AGENTS.md，也不要求工作者自行读取或逐步汇报', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.cwd, 'AGENTS.md'), '# 规范\n使用 pnpm');
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('A')]);
+  const { instructions } = manager.get(worker.id).data;
+  assert.doesNotMatch(instructions, /AGENTS|使用 pnpm|先阅读|report_progress/);
 });
