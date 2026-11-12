@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Cross-platform MCP server for Codex to coordinate local Claude Code workers",
   "bin": { "cc-team-mcp": "src/cli.mjs" },
-  "files": ["src/", "README.md", "team.config.example.json"],
+  "files": ["src/", "README.md", "README.zh-CN.md", "team.config.example.json"],
   "repository": { "type": "git", "url": "git+https://github.com/lboverfys/mcp-cccx-together.git" },
   "bugs": { "url": "https://github.com/lboverfys/mcp-cccx-together/issues" },
   "engines": { "node": ">=22" },
