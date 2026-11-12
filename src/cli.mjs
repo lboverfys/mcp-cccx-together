@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
 import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { executableCommand, loadConfig, projectRoot } from './config.mjs';
+import { codexConfigPath, updateCodexServer } from './codex-config.mjs';
+import { providerSourceVariables } from './providers.mjs';
 
 const execute = promisify(execFile);
+const DEFAULT_WAIT_MS = 50000;
+// setup 默认让 team_wait 单次最多等 9.5 分钟，Codex 工具超时同步设为 10 分钟。
+const LONG_WAIT_MS = 570000;
 const cliPath = fileURLToPath(import.meta.url);
 const help = `CC Team MCP — Codex 协调本机 Claude Code
 
@@ -15,7 +21,7 @@ const help = `CC Team MCP — Codex 协调本机 Claude Code
   serve         启动标准输入/输出 MCP 服务（默认命令）
   doctor        检查客户端、运行时及目录权限；不调用模型、不创建目录
   print-config  输出通用 MCP JSON 配置
-  setup         使用 codex mcp add 注册服务；保留已有同名配置
+  setup         使用 codex mcp add 注册服务，并设置长等待和工具超时；保留已有同名配置
   prune         预览已关闭团队的历史结果清理，保护仍被引用的版本
   recover       预览异常退出团队的锁及日志尾行恢复，拒绝未完成收尾的任务
   --team ID     prune/recover 的团队 ID
@@ -28,7 +34,7 @@ const help = `CC Team MCP — Codex 协调本机 Claude Code
 
 环境变量：CC_TEAM_CONFIG、CC_TEAM_CLAUDE_EXECUTABLE、CC_TEAM_CODEX_EXECUTABLE、
 CC_TEAM_STATE_DIR、CC_TEAM_TEMP_DIR、CC_TEAM_NOTIFICATION_MODE、
-CC_TEAM_PERMISSION_MODE、CC_TEAM_WAIT_TIMEOUT_MS。
+CC_TEAM_PERMISSION_MODE、CC_TEAM_WAIT_TIMEOUT_MS、CC_TEAM_DEFAULT_PROVIDER。
 `;
 
 function parseArgs(args) {
@@ -94,7 +100,7 @@ function inspectDirectory(directory) {
 
 export async function runCli(args = process.argv.slice(2), {
   stdout = process.stdout, stderr = process.stderr, executeImpl = execute,
-  loadConfigImpl = loadConfig, runServerImpl, entryPath = cliPath,
+  loadConfigImpl = loadConfig, runServerImpl, entryPath = cliPath, env = process.env, home = homedir(),
 } = {}) {
   try {
     const options = parseArgs(args);
@@ -117,7 +123,7 @@ export async function runCli(args = process.argv.slice(2), {
       const invocation = executableCommand(executable);
       return executeImpl(invocation.command, [...invocation.args, ...commandArgs], {
         windowsHide: true, shell: false, timeout: 10000, maxBuffer: 64 * 1024, encoding: 'utf8',
-        env: { ...process.env, DISABLE_AUTOUPDATER: '1' },
+        env: { ...env, DISABLE_AUTOUPDATER: '1' },
       });
     };
     if (options.command === 'doctor') {
@@ -161,11 +167,36 @@ export async function runCli(args = process.argv.slice(2), {
         if (!/No MCP server named .+ found\./i.test(`${error.stderr ?? ''}\n${error.stdout ?? ''}`)) throw error;
       }
       if (existing) throw new Error(`MCP 配置 ${options.name} 已存在。请使用 --name 选择其他名称，或先用 codex mcp remove ${options.name} 移除旧配置。`);
-      const registration = mcpConfiguration(config, options.name, entryPath).mcpServers[options.name];
-      const envArgs = Object.entries(registration.env).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
-      await call(config.codexExecutable, ['mcp', 'add', options.name, ...envArgs, '--', registration.command, ...registration.args]);
+      const register = async waitMs => {
+        const registration = mcpConfiguration(config, options.name, entryPath).mcpServers[options.name];
+        const envArgs = Object.entries({ ...registration.env, CC_TEAM_WAIT_TIMEOUT_MS: String(waitMs) })
+          .flatMap(([key, value]) => ['--env', `${key}=${value}`]);
+        await call(config.codexExecutable, ['mcp', 'add', options.name, ...envArgs, '--', registration.command, ...registration.args]);
+      };
+      // 等待上限必须低于 Codex 的工具超时：两者一起写入，写不进工具超时就退回默认等待。
+      const waitMs = config.waitTimeoutExplicit ? config.waitTimeoutMs : LONG_WAIT_MS;
+      const toolTimeoutSec = Math.ceil(waitMs / 1000) + 30;
+      const forward = providerSourceVariables(config.providers);
+      const configFile = codexConfigPath(env, home);
+      await register(waitMs);
+      let tuned;
+      try { tuned = updateCodexServer(configFile, options.name, { toolTimeoutSec, envVars: forward }); }
+      catch (error) {
+        let effectiveWait = waitMs;
+        if (waitMs > DEFAULT_WAIT_MS) {
+          await call(config.codexExecutable, ['mcp', 'remove', options.name]);
+          await register(DEFAULT_WAIT_MS);
+          effectiveWait = DEFAULT_WAIT_MS;
+        }
+        stdout.write(`已注册 MCP：${options.name}，但未能写入 ${configFile}：${error.message}\n` +
+          `team_wait 单次最多等待 ${effectiveWait} 毫秒。需要更长等待时，在 [mcp_servers.${options.name}] 中手动设置 tool_timeout_sec = 600 并把 CC_TEAM_WAIT_TIMEOUT_MS 改为 570000` +
+          `${forward.length ? `；并添加 env_vars = [${forward.map(name => JSON.stringify(name)).join(', ')}] 转发 provider 凭据` : ''}。\n`);
+        return 0;
+      }
       stdout.write(`已注册 MCP：${options.name}。请重新打开 Codex 会话后使用；可用 codex mcp get ${options.name} 查看配置。\n` +
-        `team_wait 单次最多等待 CC_TEAM_WAIT_TIMEOUT_MS（当前 ${config.waitTimeoutMs} 毫秒）；需要更长时，在 Codex 配置的 [mcp_servers.${options.name}] 中设置 tool_timeout_sec = 600，并将该值改为 570000。\n`);
+        `已在 ${configFile} 设置 tool_timeout_sec = ${toolTimeoutSec}，team_wait 单次最多等待 ${waitMs} 毫秒。\n` +
+        (tuned.forwarded.length ? `已转发 provider 所需环境变量：${tuned.forwarded.join(', ')}。\n` : '') +
+        (tuned.unmanagedEnvVars ? `现有 env_vars 是多行数组，未自动修改；请手动加入：${forward.join(', ')}。\n` : ''));
       return 0;
     }
     const runServer = runServerImpl ?? (await import('./server.mjs')).runServer;

@@ -331,7 +331,7 @@ test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回�
   }
 });
 
-test('MCP 传递 mct/ctm 委派说明并暴露全部 15 个工具，未打开团队时返回工具错误', async t => {
+test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团队时返回工具错误', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   const { tools } = await endpoint.client.listTools();
@@ -350,9 +350,11 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 15 个工具，未打开团
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'team_open', 'team_dispatch', 'team_status', 'team_events', 'team_send', 'team_reply',
     'team_request', 'team_interrupt', 'team_resume', 'team_review', 'team_close', 'team_shutdown', 'team_list', 'team_result',
-    'team_wait',
+    'team_wait', 'team_diff',
   ].sort());
-  for (const name of ['team_status', 'team_events', 'team_request', 'team_wait']) {
+  assert.match(instructions, /team_diff/);
+  assert.match(instructions, /没有 verify 时默认由主控验收/);
+  for (const name of ['team_status', 'team_events', 'team_request', 'team_wait', 'team_diff']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
   }
   const result = await endpoint.raw('team_status');
@@ -597,11 +599,11 @@ test('错误 teamId 不切换已打开团队，独立团队锁互不干扰', asy
   assert.equal(restored.workers[0].status, 'closed');
 });
 
-test('含cc尾缀的完整名字限制十字符，规范化后的重名在启动前整批拒绝', async t => {
+test('含cc尾缀的完整名字限制 24 字符，规范化后的重名在启动前整批拒绝', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   await endpoint.call('team_open', { teamId: 'named-team', notifications: false });
-  for (const name of ['一二三四五六七八九', '  ', 'cc', 'CC', '接口\n开发']) {
+  for (const name of ['一二三四五六七八九十一二三四五六七八九十一二三', '  ', 'cc', 'CC', '接口\n开发']) {
     assert.equal((await endpoint.raw('team_dispatch', { workers: [f.spec(name)] })).isError, true);
   }
   const duplicated = await endpoint.raw('team_dispatch', { workers: [f.spec('接口开发cc'), f.spec(' 接口开发 ')] });
@@ -618,9 +620,10 @@ test('含cc尾缀的完整名字限制十字符，规范化后的重名在启动
   assert.equal(f.controllers.length, 1);
   assert.equal((await endpoint.call('team_status')).workers.length, 1);
 
-  const tenCharacters = '𠮷'.repeat(8) + 'cc';
-  assert.equal((await endpoint.call('team_dispatch', { workers: [f.spec(tenCharacters)] })).workers[0].name, tenCharacters);
-  assert.equal((await endpoint.raw('team_dispatch', { workers: [f.spec(`${tenCharacters}一`)] })).isError, true);
+  const longest = '𠮷'.repeat(22) + 'cc';
+  assert.equal((await endpoint.call('team_dispatch', { workers: [f.spec(longest)] })).workers[0].name, longest);
+  assert.equal((await endpoint.raw('team_dispatch', { workers: [f.spec(`${longest}一`)] })).isError, true);
+  assert.equal((await endpoint.call('team_dispatch', { workers: [f.spec('migration')] })).workers[0].name, 'migrationcc');
 });
 
 test('自动补小写cc尾缀，已有尾缀不重复追加并传给执行会话', async t => {
@@ -686,4 +689,26 @@ test('按名字完成查看、追加、事件筛选、验收、关闭及重开�
   assert.equal(interrupted.id, worker.id);
   assert.equal(resumedController.interruptCalls, 1);
   assert((await endpoint.call('team_events', { workerIds: ['接口开发cc'] })).events.every(event => event.workerId === worker.id));
+});
+
+test('未填 review 时按是否有 verify 决定验收方式，team_open 和说明列出可用 provider', async t => {
+  const f = await fixture(t);
+  f.config.providers = { deepseek: { env: {}, envFrom: {}, model: 'ds-model' } };
+  f.config.defaultProvider = 'deepseek';
+  const endpoint = await f.connect();
+  assert.match(endpoint.client.getInstructions(), /可用 provider：deepseek（默认 deepseek）/);
+  const opened = await endpoint.call('team_open', { teamId: 'review-defaults', notifications: false });
+  assert.deepEqual(opened.providers, [{ name: 'deepseek', model: 'ds-model' }]);
+  await endpoint.call('team_dispatch', { workers: [
+    { name: '甲', cwd: f.cwd, prompt: '只读分析' },
+    { name: '乙', cwd: f.cwd, prompt: '运行检查', access: 'verify', verify: `"${process.execPath}" -e "process.exit(0)"` },
+  ] });
+  const status = await endpoint.call('team_status');
+  assert.deepEqual(status.workers.map(worker => [worker.review, worker.provider, worker.model]),
+    [['codex', 'deepseek', 'ds-model'], ['auto', 'deepseek', 'ds-model']]);
+  const unknown = await endpoint.raw('team_dispatch', { workers: [{ name: '丙', cwd: f.cwd, prompt: 'x', provider: 'other' }] });
+  assert.equal(unknown.isError, true);
+  const diff = await endpoint.raw('team_diff', { workerId: '甲cc' });
+  assert.equal(diff.isError, true);
+  assert.match(diff.content[0].text, /只有 worktree 隔离/);
 });

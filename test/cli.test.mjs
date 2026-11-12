@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { mcpConfiguration, runCli } from '../src/cli.mjs';
@@ -178,23 +178,75 @@ test('setup 先检查同名配置，已有注册或查询错误时保持原配�
   }
 });
 
-test('setup 用实际子进程验证参数边界、Node 包装入口和注册调用，不修改真实 Codex', async t => {
+function fakeCodex(directory) {
+  const script = path.join(directory, 'fake codex.mjs');
+  const log = path.join(directory, 'calls.jsonl');
+  const codexHome = path.join(directory, 'codex home');
+  mkdirSync(codexHome);
+  // 模拟 codex mcp add 写出的表结构；FAKE_CODEX_SKIP_CONFIG 模拟无法定位配置表。
+  writeFileSync(script, `import {appendFileSync, writeFileSync} from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+if (args[0] === 'mcp' && args[1] === 'get') { process.stderr.write("Error: No MCP server named '" + args[2] + "' found.\\n"); process.exit(1); }
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
+if (args[0] === 'mcp' && args[1] === 'add' && !process.env.FAKE_CODEX_SKIP_CONFIG) {
+  writeFileSync(path.join(process.env.CODEX_HOME, 'config.toml'), 'model = "gpt"\\n\\n[mcp_servers.' + args[2] + ']\\ncommand = "node"\\nargs = ["cli.mjs"]\\n\\n[mcp_servers.' + args[2] + '.env]\\nA = "1"\\n');
+}
+`);
+  const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+  return { script, codexHome, calls, configFile: path.join(codexHome, 'config.toml') };
+}
+
+test('setup 用实际子进程注册并同步长等待与工具超时，不修改真实 Codex', async t => {
   const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-cli-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const fakeCodex = path.join(directory, 'fake codex.mjs');
-  const log = path.join(directory, 'arguments.json');
-  writeFileSync(fakeCodex, `import {writeFileSync} from 'node:fs';
-const args = process.argv.slice(2);
-if(args[0] === 'mcp' && args[1] === 'get') { process.stderr.write("Error: No MCP server named 'cc_custom' found.\\n"); process.exit(1); }
-writeFileSync(${JSON.stringify(log)}, JSON.stringify(args));
-`);
-  const h = harness({ codexExecutable: fakeCodex, configPath: path.join(directory, 'config with spaces.json') });
+  const codex = fakeCodex(directory);
+  const h = harness({ codexExecutable: codex.script, configPath: path.join(directory, 'config with spaces.json'), waitTimeoutMs: 50000 });
   const entryPath = path.join(directory, 'package ; literal', 'cli.mjs');
-  assert.equal(await runCli(['setup', '--name', 'cc_custom'], { ...h.options, entryPath }), 0, h.stderr);
-  assert(existsSync(log));
-  const args = JSON.parse(readFileSync(log, 'utf8'));
+  const env = { ...process.env, CODEX_HOME: codex.codexHome };
+  assert.equal(await runCli(['setup', '--name', 'cc_custom'], { ...h.options, entryPath, env, home: directory }), 0, h.stderr);
+  const [args] = codex.calls();
+  assert.equal(codex.calls().length, 1);
   assert.deepEqual(args.slice(0, 3), ['mcp', 'add', 'cc_custom']);
   assert.deepEqual(args.slice(args.indexOf('--') + 1), [process.execPath, entryPath, 'serve', '--config', h.config.configPath]);
-  assert.equal(args.includes('--env'), false);
+  assert.deepEqual(args.slice(3, args.indexOf('--')), ['--env', 'CC_TEAM_WAIT_TIMEOUT_MS=570000']);
+  const toml = readFileSync(codex.configFile, 'utf8');
+  assert.match(toml, /\[mcp_servers\.cc_custom\]\ntool_timeout_sec = 600\ncommand = "node"/);
+  assert.match(toml, /\[mcp_servers\.cc_custom\.env\]\nA = "1"/);
+  assert.doesNotMatch(toml, /env_vars/);
   assert.match(h.stdout, /已注册 MCP/);
+  assert.match(h.stdout, /tool_timeout_sec = 600/);
+});
+
+test('setup 保留显式等待并转发 provider 凭据变量', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-cli-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const codex = fakeCodex(directory);
+  const h = harness({ codexExecutable: codex.script, configPath: path.join(directory, 'config.json'),
+    waitTimeoutMs: 120000, waitTimeoutExplicit: true,
+    providers: { deepseek: { env: { ANTHROPIC_BASE_URL: 'https://example.invalid' }, envFrom: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' } } } });
+  const env = { ...process.env, CODEX_HOME: codex.codexHome };
+  assert.equal(await runCli(['setup'], { ...h.options, env, home: directory }), 0, h.stderr);
+  const [args] = codex.calls();
+  assert(args.includes('CC_TEAM_WAIT_TIMEOUT_MS=120000'));
+  const toml = readFileSync(codex.configFile, 'utf8');
+  assert.match(toml, /tool_timeout_sec = 150\n/);
+  assert.match(toml, /env_vars = \["DEEPSEEK_API_KEY"\]/);
+  assert.match(h.stdout, /DEEPSEEK_API_KEY/);
+});
+
+test('setup 无法写入工具超时时退回默认等待，避免 team_wait 超过 Codex 超时', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-cli-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const codex = fakeCodex(directory);
+  const h = harness({ codexExecutable: codex.script, configPath: path.join(directory, 'config.json'), waitTimeoutMs: 50000 });
+  const env = { ...process.env, CODEX_HOME: codex.codexHome, FAKE_CODEX_SKIP_CONFIG: '1' };
+  assert.equal(await runCli(['setup'], { ...h.options, env, home: directory }), 0, h.stderr);
+  const calls = codex.calls();
+  assert.deepEqual(calls.map(call => call.slice(0, 3)), [['mcp', 'add', 'cc_team'], ['mcp', 'remove', 'cc_team'], ['mcp', 'add', 'cc_team']]);
+  assert(calls[0].includes('CC_TEAM_WAIT_TIMEOUT_MS=570000'));
+  assert(calls[2].includes('CC_TEAM_WAIT_TIMEOUT_MS=50000'));
+  assert.equal(existsSync(codex.configFile), false);
+  assert.match(h.stdout, /未能写入/);
+  assert.match(h.stdout, /50000 毫秒/);
 });

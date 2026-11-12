@@ -27,7 +27,14 @@ $environmentNames = @(
 $providerEnvironmentNames = Get-ChildItem Env: | Where-Object {
     $_.Name -match '^(ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|CLOUD_ML_|VERTEX_|AZURE_)'
 } | Select-Object -ExpandProperty Name
-$environmentNames = @(@($environmentNames) + @($providerEnvironmentNames) | Sort-Object -Unique)
+# 团队配置里 provider 通过 envFrom 引用的凭据变量也需要转发给 MCP。
+$providerSourceNames = @()
+if ($teamConfig.providers) {
+    foreach ($provider in $teamConfig.providers.PSObject.Properties) {
+        if ($provider.Value.envFrom) { $providerSourceNames += @($provider.Value.envFrom.PSObject.Properties | ForEach-Object { $_.Value }) }
+    }
+}
+$environmentNames = @(@($environmentNames) + @($providerEnvironmentNames) + @($providerSourceNames) | Sort-Object -Unique)
 $values = [ordered]@{
     command = $nodeExecutable
     args = @($registration.args)

@@ -2,6 +2,7 @@ import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync
 import path from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { normalizeProviders } from './providers.mjs';
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageNames = { claude: '@anthropic-ai/claude-code', codex: '@openai/codex' };
@@ -96,7 +97,7 @@ export function loadConfig(configPath, {
     stateDir: 'CC_TEAM_STATE_DIR', tempDir: 'CC_TEAM_TEMP_DIR',
     claudeExecutable: 'CC_TEAM_CLAUDE_EXECUTABLE', codexExecutable: 'CC_TEAM_CODEX_EXECUTABLE',
     notificationMode: 'CC_TEAM_NOTIFICATION_MODE', permissionMode: 'CC_TEAM_PERMISSION_MODE',
-    waitTimeoutMs: 'CC_TEAM_WAIT_TIMEOUT_MS',
+    waitTimeoutMs: 'CC_TEAM_WAIT_TIMEOUT_MS', defaultProvider: 'CC_TEAM_DEFAULT_PROVIDER',
   })) {
     if (env[variable] !== undefined) {
       config[key] = env[variable];
@@ -111,9 +112,16 @@ export function loadConfig(configPath, {
   if (!['poll', 'codex-queue'].includes(config.notificationMode)) throw new Error('notificationMode 必须为 poll 或 codex-queue');
   config.permissionMode ??= 'bypassPermissions';
   if (!['default', 'acceptEdits', 'bypassPermissions'].includes(config.permissionMode)) throw new Error('permissionMode 必须为 default、acceptEdits 或 bypassPermissions');
+  // setup 只在用户未显式设置时改用长等待。
+  config.waitTimeoutExplicit = config.waitTimeoutMs !== undefined;
   config.waitTimeoutMs = Number(config.waitTimeoutMs ?? 50000);
   if (!Number.isSafeInteger(config.waitTimeoutMs) || config.waitTimeoutMs < 1000 || config.waitTimeoutMs > 3600000) {
     throw new Error('waitTimeoutMs 必须是 1000 到 3600000 之间的整数毫秒');
+  }
+  config.providers = normalizeProviders(config.providers);
+  if (config.defaultProvider === '' || config.defaultProvider === null) delete config.defaultProvider;
+  if (config.defaultProvider !== undefined && !Object.hasOwn(config.providers, config.defaultProvider)) {
+    throw new Error(`defaultProvider ${config.defaultProvider} 未在 providers 中定义`);
   }
   const executableErrors = {};
   let discoveredExecutable = false;

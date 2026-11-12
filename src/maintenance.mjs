@@ -4,6 +4,7 @@ import { copyFile, open } from 'node:fs/promises';
 import path from 'node:path';
 import { Store, processIsAlive, readWorkers, assertBackgroundTasksStopped, scanEventLog } from './store.mjs';
 import { ResultStore } from './results.mjs';
+import { removeWorktree, worktreeChanges } from './worktree.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -80,15 +81,30 @@ export async function pruneTeam(config, teamId, { keepResults, apply = false }) 
       return { file, bytes: statSync(file).size };
     });
     const removable = [...removableResults, ...orphanRecords];
+    // 隔离工作区：没有未合并改动的可删除；有改动的保留，由用户检查后处理。
+    const worktrees = [];
+    for (const worker of workers) {
+      if (!worker.worktree || !existsSync(worker.worktree.root)) continue;
+      const item = { name: worker.name, id: worker.id, root: worker.worktree.root };
+      try { item.pendingFiles = worktreeChanges(worker.worktree, { tempDir: path.join(config.tempDir, teamId, 'git') }).files.length; }
+      catch (error) { item.error = error.message; }
+      worktrees.push(item);
+    }
     let removed = 0;
+    let removedWorktrees = 0;
     if (apply) {
       try { for (const item of removable) { unlinkSync(item.file); removed++; } }
       catch (error) { throw new Error(`清理中止，已删除 ${removed}/${removable.length} 个文件：${error.message}`, { cause: error }); }
+      for (const item of worktrees.filter(entry => entry.pendingFiles === 0)) {
+        try { removeWorktree(workers.find(worker => worker.id === item.id).worktree); item.removed = true; removedWorktrees++; }
+        catch (error) { item.error = error.message; }
+      }
     }
     return { teamId, applied: apply, keepResults, retainedResults: keep.size,
       removableResults: removableResults.length, orphanRecords: orphanRecords.length,
       bytes: removable.reduce((sum, item) => sum + item.bytes, 0), removed,
-      files: removable.slice(0, 100).map(item => path.relative(directory, item.file)), omittedFiles: Math.max(0, removable.length - 100) };
+      files: removable.slice(0, 100).map(item => path.relative(directory, item.file)), omittedFiles: Math.max(0, removable.length - 100),
+      worktrees, removableWorktrees: worktrees.filter(item => item.pendingFiles === 0).length, removedWorktrees };
   } finally { store.close(); }
 }
 

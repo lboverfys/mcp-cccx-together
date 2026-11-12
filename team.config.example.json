@@ -1,3 +1,14 @@
 {
-  "notificationMode": "poll"
+  "notificationMode": "poll",
+  "providers": {
+    "deepseek": {
+      "description": "DeepSeek through its Anthropic-compatible API; check DeepSeek's docs for current model names",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-chat"
+      },
+      "envFrom": { "ANTHROPIC_AUTH_TOKEN": "DEEPSEEK_API_KEY" },
+      "model": "deepseek-chat"
+    }
+  }
 }

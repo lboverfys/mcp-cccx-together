@@ -1,0 +1,43 @@
+name: Bug report / 问题报告
+description: Something doesn't work as documented / 行为与文档不符
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never attach your state directory, API keys or unredacted logs. Security problems: use private vulnerability reporting (see SECURITY.md).
+        不要附带状态目录、API 密钥或未脱敏的日志。安全问题请按 SECURITY.md 私下报告。
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / 发生了什么
+      description: Include the tool call and the error text if there is one. / 附上相关工具调用和错误文本。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected / 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: Minimal plan (team_dispatch input) and project layout if relevant. / 最小的派发参数和项目结构。
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: cc-team-mcp doctor output (redacted) / doctor 输出（已脱敏）
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions / 版本
+      description: OS and arch, Node, git, Claude Code, Codex, cc-team-mcp, provider if any
+    validations:
+      required: true

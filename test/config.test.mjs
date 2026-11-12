@@ -144,3 +144,26 @@ test('权限模式默认免审批、等待上限默认 50 秒，均可由配置�
     assert.throws(() => loadConfig(f.write('bad-wait.json', `{"waitTimeoutMs":${value}}`), options), /waitTimeoutMs/);
   }
 });
+
+test('provider 配置校验字段和变量名，默认 provider 必须存在，等待是否显式设置可区分', t => {
+  const f = fixture(t);
+  const claude = f.write(process.platform === 'win32' ? 'bin/claude.exe' : 'bin/claude');
+  chmodSync(claude, 0o755);
+  const load = (stored, env = {}) => loadConfig(f.write('config.json', JSON.stringify({ claudeExecutable: claude, ...stored })),
+    { ...f.options, env });
+  const config = load({ providers: { deepseek: { env: { ANTHROPIC_BASE_URL: 'https://api.example/anthropic' },
+    envFrom: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, model: 'deepseek-model' } }, defaultProvider: 'deepseek' });
+  assert.deepEqual(config.providers.deepseek.envFrom, { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' });
+  assert.equal(config.defaultProvider, 'deepseek');
+  assert.equal(config.waitTimeoutExplicit, false);
+  assert.equal(load({ waitTimeoutMs: 120000 }).waitTimeoutExplicit, true);
+  assert.equal(load({}, { CC_TEAM_WAIT_TIMEOUT_MS: '120000' }).waitTimeoutExplicit, true);
+  assert.deepEqual(load({}).providers, {});
+  assert.throws(() => load({ defaultProvider: 'missing' }), /defaultProvider missing 未在 providers 中定义/);
+  assert.throws(() => load({}, { CC_TEAM_DEFAULT_PROVIDER: 'missing' }), /未在 providers 中定义/);
+  assert.throws(() => load({ providers: { 'bad name': {} } }), /provider 名称无效/);
+  assert.throws(() => load({ providers: { ds: { token: 'x' } } }), /未知字段：token/);
+  assert.throws(() => load({ providers: { ds: { env: { TMPDIR: '/x' } } } }), /保留的环境变量名/);
+  assert.throws(() => load({ providers: { ds: { envFrom: { ANTHROPIC_AUTH_TOKEN: 'not a name' } } } }), /来源环境变量名/);
+  assert.throws(() => load({ providers: { ds: { env: { A: '1' }, envFrom: { A: 'B' } } } }), /重复设置：A/);
+});
