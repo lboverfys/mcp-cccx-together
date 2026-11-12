@@ -8,6 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createTeamServer } from '../src/server.mjs';
 import { TeamManager } from '../src/manager.mjs';
+import { Store } from '../src/store.mjs';
 
 const tempRoot = tmpdir();
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -35,6 +36,52 @@ test('客户端在团队初始化期间关闭时等待初始化并释放锁', as
   await Promise.all([opening, closing]);
   assert.equal(existsSync(path.join(f.config.stateDir, 'close-during-open', 'store.lock')), false);
   assert.equal((await endpoint.raw('team_open', { teamId: 'late' })).isError, true);
+});
+
+test('派发和追加已接受后事件失败通过 MCP 返回警告及完整标识，状态仍可查询', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'committed-warnings', notifications: false });
+  const original = Store.prototype.append;
+  const fault = t.mock.method(Store.prototype, 'append', function (id, type, data) {
+    if (['created', 'message_queued'].includes(type)) throw new Error('模拟事件保存失败');
+    return original.call(this, id, type, data);
+  });
+  try {
+    const dispatched = await endpoint.call('team_dispatch', { workers: [f.spec('甲'), f.spec('乙')] });
+    assert.equal(dispatched.workers.length, 2);
+    assert(dispatched.warnings.some(warning => /任务.*已保存/.test(warning)));
+    assert(dispatched.warnings.some(warning => /消息.*已投递/.test(warning)));
+    assert.deepEqual((await endpoint.call('team_status')).workers.map(worker => worker.id), dispatched.workers.map(worker => worker.id));
+    assert.equal(f.controllers.length, 2);
+    assert(f.controllers.every(controller => controller.sent.length === 1));
+    const sent = await endpoint.call('team_send', { workerId: '甲cc', message: '只追加一次' });
+    assert.match(sent.warnings[0], /已投递.*事件记录失败/);
+    assert.equal(sent.processed, false);
+    assert.equal(f.controllers[0].sent.length, 2);
+    assert.equal(f.controllers[0].sent.at(-1).messageId, sent.messageId);
+    const status = await endpoint.call('team_status');
+    assert.equal(status.workers[0].pendingMessages, 2);
+    assert.equal(status.workers[1].pendingMessages, 1);
+  } finally { fault.mock.restore(); }
+});
+
+test('追加消息状态保存失败通过 MCP 返回错误且不投递，纠正后可安全重试', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'unsent-failure', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('甲')] });
+  const fault = t.mock.method(Store.prototype, 'saveWorker', () => { throw new Error('模拟状态保存失败'); });
+  try {
+    const result = await endpoint.raw('team_send', { workerId: '甲cc', message: '需保存后再发送' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /状态保存失败/);
+    assert.equal(f.controllers[0].sent.length, 1);
+  } finally { fault.mock.restore(); }
+  assert.equal((await endpoint.call('team_status')).workers[0].pendingMessages, 1);
+  const result = await endpoint.call('team_send', { workerId: '甲cc', message: '需保存后再发送' });
+  assert.equal(f.controllers[0].sent.length, 2);
+  assert.equal(f.controllers[0].sent.at(-1).messageId, result.messageId);
 });
 
 test('默认轮询不启用专属通知，历史团队列表分页且无需先打开团队', async t => {

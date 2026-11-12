@@ -134,9 +134,13 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
     } catch (error) { await notifier?.close(); throw error; }
     finally { opening = false; finishOpening(); }
   });
-  register('team_dispatch', '用户要求使用 mct / ctm（cc_team）时，在 team_open 后调用本工具，将任务委派给 Claude Code（CC）子 agent。批量提交任务，按maxConcurrent与dependsOn自动排队。名字以cc结尾且不超过十字符；依赖通过主控验收才启动下游。重名、环依赖或无依赖的写范围冲突整批拒绝。默认只读，write须明确scope。', {
+  register('team_dispatch', '用户要求使用 mct / ctm（cc_team）时，在 team_open 后调用本工具，将任务委派给 Claude Code（CC）子 agent。批量提交任务，按maxConcurrent与dependsOn自动排队。名字以cc结尾且不超过十字符；依赖通过主控验收才启动下游。重名、环依赖或无依赖的写范围冲突整批拒绝。默认只读，write须明确scope。返回warnings时任务已保存，请检查状态，不要重复派发。', {
     workers: z.array(workerSpec).min(1),
-  }, ({ workers }) => ({ workers: requireTeam().dispatch(workers) }));
+  }, ({ workers }) => {
+    const warnings = [];
+    const dispatched = requireTeam().dispatch(workers, warnings);
+    return { workers: dispatched, ...(warnings.length ? { warnings } : {}) };
+  });
   register('team_status', '查看并发数、依赖/排队原因、工作者状态、最近交付/验收和待答复请求。不传workerIds则列出全部；可按完整名字或UUID筛选。', {
     workerIds: z.array(workerReference).optional(),
   }, ({ workerIds }) => ({
@@ -146,7 +150,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
     after: z.number().int().min(0).default(0), workerIds: z.array(workerReference).optional(),
     limit: z.number().int().min(1).max(200).default(100), waitMs: z.number().int().min(0).max(25000).default(0),
   }, input => requireTeam().events(input), true);
-  register('team_send', '向运行中或待命的工作者追加指令。入队不等于已处理；不能代替team_reply回答阻塞问题。', {
+  register('team_send', '向运行中或待命的工作者追加指令。入队不等于已处理；不能代替team_reply回答阻塞问题。返回warnings时消息已接受，请按messageId检查状态，不要重复发送。', {
     workerId: workerReference, message: text,
   }, ({ workerId, message }) => requireTeam().send(workerId, message));
   register('team_reply', '回答指定请求。权限请求必须显式allow，问题使用text或以原问题文本为键的answers；多选答案使用字符串数组。不得扩大用户授权。', {
@@ -172,7 +176,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   register('team_interrupt', '中断一个工作者当前轮次，不关闭会话；已排队消息不保证被清空，需要完全停止时使用team_close。', {
     workerId: workerReference,
   }, ({ workerId }) => requireTeam().interrupt(workerId));
-  register('team_resume', '恢复已关闭/停止的原工作者并重新排队；已取消且从未启动的任务也可按原名恢复。不得同时恢复仍运行的会话。', {
+  register('team_resume', '恢复已关闭/停止的原工作者并重新排队；已取消且从未启动的任务也可按原名恢复。不得同时恢复仍运行的会话。返回warnings时恢复任务已保存，请检查状态，不要重复恢复。', {
     workerId: workerReference, message: text,
   }, ({ workerId, message }) => requireTeam().resume(workerId, message));
   register('team_review', '检查完整交付、实际diff和测试后验收，并传入读取到的resultId以防结果在审批期间变化。accepted才释放下游依赖；handoff交接接口/文件。排队任务需要时自动回收已验收进程。返回warnings时验收已持久保存，须按警告检查事件或调度状态，不要当作验收未生效而重试。', {

@@ -147,7 +147,7 @@ export class TeamManager {
     return { teamId: this.teamId, maxConcurrent: this.maxConcurrent, storage: this.store.storageInfo(),
       runningCount: [...this.workers.values()].filter(worker => worker.controller).length,
       queuedCount: [...this.workers.values()].filter(worker => ['queued', 'blocked'].includes(worker.data.status)).length,
-      workers: selected.map(({ data, controller }) => ({
+      workers: selected.map(({ data, controller, deliveryWarning }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
       model: data.model ?? '继承 CC 配置', status: data.status, sessionId: data.sessionId,
       pid: controller?.pid ?? null, lastPid: data.lastPid, processExited: data.processExited ?? false, updatedAt: data.updatedAt, error: data.error,
@@ -158,6 +158,7 @@ export class TeamManager {
       acceptedCurrent: acceptance.get(data.id).accepted,
       staleDependencies: acceptance.get(data.id).staleDependencies,
       backgroundTasks: data.backgroundTasks ?? [],
+      ...(deliveryWarning ? { deliveryWarning } : {}),
       requests: requests.get(data.id) ?? [],
     })) };
   }
@@ -248,7 +249,7 @@ export class TeamManager {
     }
   }
 
-  dispatch(specs) {
+  dispatch(specs, warnings = []) {
     if (this.closing) throw new Error('团队正在关闭');
     const prepared = specs.map(spec => ({ ...this.prepare(spec), id: randomUUID() }));
     const names = new Map([...this.workers.values()].map(worker => [worker.data.name, worker.data.id]));
@@ -272,14 +273,18 @@ export class TeamManager {
     });
     this.store.saveWorkers(created.map(worker => worker.data));
     for (const worker of created) {
-      const { id, name, cwd, scope, access, dependsOn } = worker.data;
-      this.workers.set(id, worker);
+      this.workers.set(worker.data.id, worker);
       this.indexName(worker);
-      this.event(id, 'created', { name, cwd, scope, access, dependsOn });
     }
     this.graphCache = undefined;
     this.acceptanceCache = undefined;
-    this.schedule();
+    for (const { data } of created) {
+      const { id, name, cwd, scope, access, dependsOn } = data;
+      try { this.event(id, 'created', { name, cwd, scope, access, dependsOn }); }
+      catch (error) { warnings.push(`任务 ${name} 已保存，但创建事件记录失败：${error.message}`); }
+    }
+    try { this.schedule(warnings); }
+    catch (error) { warnings.push(`任务已保存，但后续调度失败：${error.message}`); }
     return created.map(({ data }) => ({ id: data.id, name: data.name, status: data.status, error: data.error }));
   }
 
@@ -366,7 +371,7 @@ export class TeamManager {
     return firstPaths.some(a => secondPaths.some(b => inside(a, b) || inside(b, a)));
   }
 
-  schedule() {
+  schedule(warnings = []) {
     if (this.closing || this.scheduling) return;
     this.scheduling = true;
     this.queueUpdates = new Map();
@@ -434,7 +439,7 @@ export class TeamManager {
           activeWorkers.push(worker);
           while (worker.data.queuedMessages.length) {
             const message = worker.data.queuedMessages.shift();
-            try { this.deliver(worker, message.text, message.messageId); }
+            try { this.deliver(worker, message.text, message.messageId, warnings); }
             catch (error) {
               worker.data.queuedMessages.unshift(message);
               this.fail(worker, error);
@@ -551,6 +556,7 @@ export class TeamManager {
     if ((!worker.controller && !['queued', 'blocked'].includes(worker.data.status)) || ['closing', 'closed'].includes(worker.data.status)) throw new Error('工作进程未运行，请先 resume');
     if (worker.data.pendingMessages.length + worker.data.queuedMessages.length >= 32) throw new Error('该工作者已有32条未完成消息，请先等待处理');
     const messageId = randomUUID();
+    const warnings = [];
     if (!worker.controller) {
       const previousReview = worker.data.lastReview;
       worker.data.lastReview = undefined;
@@ -560,8 +566,8 @@ export class TeamManager {
         worker.data.lastReview = previousReview;
         throw error;
       }
-      this.event(id, 'message_queued', { messageId, summary: clip(text, 1000), waitingToStart: true });
-      this.schedule();
+      try { this.event(id, 'message_queued', { messageId, summary: clip(text, 1000), waitingToStart: true }); }
+      catch (error) { warnings.push(`消息已保存到队列，但事件记录失败：${error.message}`); }
     } else {
       if (!worker.data.pendingMessages.length && !worker.data.backgroundTasks?.length &&
         worker.data.dependsOn.some(dependencyId => !this.accepted(this.get(dependencyId)))) {
@@ -572,14 +578,17 @@ export class TeamManager {
         (other.controller || unconfirmedResources(other.data)) && this.scopesOverlap(prepared, other.data));
       if (conflict) throw new Error(`追加任务的工作范围与 ${conflict.data.name} 冲突，请先完成并关闭冲突工作者`);
       Object.assign(worker.data, prepared);
-      this.deliver(worker, text, messageId);
-      this.schedule();
+      this.deliver(worker, text, messageId, warnings);
     }
-    return { id, name: worker.data.name, messageId, status: 'queued', processed: false };
+    try { this.schedule(warnings); }
+    catch (error) { warnings.push(`消息已接受，但后续调度失败：${error.message}`); }
+    return { id, name: worker.data.name, messageId, status: 'queued', processed: false,
+      ...(warnings.length ? { warnings } : {}) };
   }
 
-  deliver(worker, text, messageId) {
-    const previousDependencies = worker.data.dependencyResults;
+  deliver(worker, text, messageId, warnings = []) {
+    const previous = { ...worker.data };
+    const previousDependencies = previous.dependencyResults;
     if (!worker.data.pendingMessages.length && !worker.data.backgroundTasks?.length && worker.data.dependsOn.length &&
       worker.data.dependsOn.every(id => this.accepted(this.get(id)))) {
       this.captureDependencies(worker);
@@ -590,14 +599,32 @@ export class TeamManager {
     if (worker.data.appliedConstraints !== this.constraints) {
       text += `\n\n主控更新的团队约束（优先遵守）：\n${this.constraints}`;
     }
-    try { worker.controller.send(text, messageId); }
-    catch (error) { worker.data.dependencyResults = previousDependencies; throw error; }
     worker.data.lastReview = undefined;
     worker.data.appliedConstraints = this.constraints;
-    worker.data.pendingMessages.push(messageId);
+    worker.data.pendingMessages = [...previous.pendingMessages, messageId];
     if (worker.data.status !== 'needs_input') worker.data.status = 'running';
-    this.save(worker);
-    this.event(worker.data.id, 'message_queued', { messageId, summary: clip(text, 1000) });
+    let saved = false;
+    try {
+      this.save(worker);
+      saved = true;
+      worker.controller.send(text, messageId);
+    } catch (error) {
+      for (const key of Object.keys(worker.data)) {
+        if (!Object.hasOwn(previous, key)) delete worker.data[key];
+      }
+      Object.assign(worker.data, previous);
+      this.acceptanceCache = undefined;
+      if (saved) {
+        try { this.store.saveWorker(previous); }
+        catch (rollbackError) { throw new AggregateError([error, rollbackError], '消息未投递，原状态未能写回；请检查工作者状态后再继续'); }
+      }
+      throw error;
+    }
+    try { this.event(worker.data.id, 'message_queued', { messageId, summary: clip(text, 1000) }); }
+    catch (error) {
+      worker.deliveryWarning = `消息 ${messageId} 已投递给 ${worker.data.name}，但事件记录失败：${error.message}`;
+      warnings.push(worker.deliveryWarning);
+    }
   }
 
   request(worker, kind, payload, signal) {
@@ -762,8 +789,11 @@ export class TeamManager {
       }
       throw error;
     }
-    this.schedule();
-    return { id, name: worker.data.name, messageId, status: 'queued', processed: false };
+    const warnings = [];
+    try { this.schedule(warnings); }
+    catch (error) { warnings.push(`恢复任务已保存，但后续调度失败：${error.message}`); }
+    return { id, name: worker.data.name, messageId, status: 'queued', processed: false,
+      ...(warnings.length ? { warnings } : {}) };
   }
 
   review(id, accepted, note, handoff, expectedResultId) {
@@ -789,7 +819,7 @@ export class TeamManager {
     const warnings = [];
     try { this.event(id, 'review', worker.data.lastReview); }
     catch (error) { warnings.push(`验收已保存，但事件记录失败：${error.message}`); }
-    try { this.schedule(); }
+    try { this.schedule(warnings); }
     catch (error) { warnings.push(`验收已保存，但后续调度失败：${error.message}`); }
     return { id, name: worker.data.name, accepted, resultId: worker.data.lastResult.resultId, status: worker.data.status,
       ...(warnings.length ? { warnings } : {}) };

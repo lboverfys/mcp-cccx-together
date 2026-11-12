@@ -78,6 +78,186 @@ test('批量派发先验证全部范围，冲突错误不产生部分工作者',
   assert.equal(result.length, 2);
 });
 
+test('批量保存失败不登记任务；提交后创建事件失败仍返回完整批次和警告', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  assert.deepEqual(manager.status().workers, []);
+  const originalSave = manager.store.saveWorkers;
+  manager.store.saveWorkers = () => { throw new Error('模拟批次保存失败'); };
+  try { assert.throws(() => manager.dispatch([f.spec('A'), f.spec('B')]), /批次保存失败/); }
+  finally { manager.store.saveWorkers = originalSave; }
+  assert.deepEqual(manager.status().workers, []);
+  assert.deepEqual(manager.store.listWorkers(), []);
+  assert.equal(f.controllers.length, 0);
+
+  const originalAppend = manager.store.append;
+  manager.store.append = function (id, type, data) {
+    if (type === 'created') throw new Error('模拟创建事件失败');
+    return originalAppend.call(this, id, type, data);
+  };
+  const warnings = [];
+  let workers;
+  try { workers = manager.dispatch([f.spec('A'), f.spec('B', { dependsOn: ['A'] })], warnings); }
+  finally { manager.store.append = originalAppend; }
+  assert.equal(workers.length, 2);
+  assert.equal(warnings.length, 2);
+  assert(warnings.every(warning => /已保存.*创建事件.*失败/.test(warning)));
+  assert.deepEqual(manager.status().workers.map(worker => worker.id), workers.map(worker => worker.id));
+  assert.deepEqual(manager.store.listWorkers().map(worker => worker.id), workers.map(worker => worker.id));
+  assert.equal(f.controllers.length, 1);
+  f.controllers[0].emit('result', { success: true, text: '上游交付' });
+  manager.review(workers[0].id, true, '通过');
+  assert.equal(f.controllers.length, 2);
+  assert(f.controllers.every(controller => controller.sent.length === 1));
+  assert.throws(() => manager.dispatch([f.spec('B')]), /已存在/);
+  await manager.close();
+  const reopened = await f.create();
+  assert.deepEqual(reopened.status().workers.map(worker => worker.id), workers.map(worker => worker.id));
+});
+
+test('批量提交后调度失败返回已保存警告，恢复调度只投递原批次一次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const originalSchedule = manager.schedule;
+  manager.schedule = () => { throw new Error('模拟调度失败'); };
+  const warnings = [];
+  let workers;
+  try { workers = manager.dispatch([f.spec('A'), f.spec('B')], warnings); }
+  finally { manager.schedule = originalSchedule; }
+  assert.equal(workers.length, 2);
+  assert.match(warnings[0], /任务已保存.*调度失败/);
+  assert.equal(manager.status().queuedCount, 2);
+  assert.equal(manager.store.listWorkers().length, 2);
+  assert.equal(f.controllers.length, 0);
+  manager.schedule();
+  manager.schedule();
+  assert.equal(f.controllers.length, 2);
+  assert(f.controllers.every(controller => controller.sent.length === 1));
+});
+
+test('追加指令保存失败不会投递或撤销已有验收，重试只发送一次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '已有交付' });
+  manager.review(a.id, true, '已检查');
+  const before = structuredClone(manager.get(a.id).data);
+  const savedBefore = manager.store.listWorkers();
+  assert.equal(manager.accepted(manager.get(a.id)), true);
+  const originalSave = manager.store.saveWorker;
+  manager.store.saveWorker = () => { throw new Error('模拟状态保存失败'); };
+  try { assert.throws(() => manager.send(a.id, '追加任务'), /状态保存失败/); }
+  finally { manager.store.saveWorker = originalSave; }
+  assert.equal(controller.sent.length, 1);
+  assert.deepEqual(manager.get(a.id).data, before);
+  assert.deepEqual(manager.store.listWorkers(), savedBefore);
+  assert.equal(manager.accepted(manager.get(a.id)), true);
+  const result = manager.send(a.id, '追加任务');
+  assert.equal(controller.sent.length, 2);
+  assert.equal(controller.sent.at(-1).messageId, result.messageId);
+  assert.deepEqual(manager.store.listWorkers()[0].pendingMessages, [result.messageId]);
+  assert.equal(manager.accepted(manager.get(a.id)), false);
+});
+
+test('已投递消息的事件失败只返回警告，不重新入队；追加后的调度失败也不误报投递失败', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const originalAppend = manager.store.append;
+  const originalSchedule = manager.schedule;
+  manager.store.append = function (id, type, data) {
+    if (type === 'message_queued') throw new Error('模拟消息事件失败');
+    return originalAppend.call(this, id, type, data);
+  };
+  try {
+    const warnings = [];
+    const [a] = manager.dispatch([f.spec('A')], warnings);
+    assert.match(warnings[0], /已投递.*事件记录失败/);
+    const controller = f.controllers[0];
+    assert.equal(controller.sent.length, 1);
+    assert.equal(manager.get(a.id).data.status, 'running');
+    assert.equal(manager.get(a.id).data.queuedMessages.length, 0);
+    manager.schedule = () => { throw new Error('模拟后续调度失败'); };
+    const result = manager.send(a.id, '追加一次');
+    assert.equal(result.warnings.length, 2);
+    assert.match(result.warnings[0], /已投递.*事件记录失败/);
+    assert.match(result.warnings[1], /消息已接受.*调度失败/);
+    assert.equal(controller.sent.length, 2);
+    assert.equal(controller.sent.at(-1).messageId, result.messageId);
+    assert.equal(manager.get(a.id).data.queuedMessages.length, 0);
+    assert.deepEqual(manager.store.listWorkers()[0].pendingMessages, controller.sent.map(message => message.messageId));
+  } finally {
+    manager.store.append = originalAppend;
+    manager.schedule = originalSchedule;
+  }
+});
+
+test('排队追加的事件失败保留消息并返回警告，重开和恢复不会重复或丢失已接受消息', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ maxConcurrent: 1 });
+  const [, b] = manager.dispatch([f.spec('A'), f.spec('B')]);
+  const originalAppend = manager.store.append;
+  manager.store.append = function (id, type, data) {
+    if (type === 'message_queued') throw new Error('模拟排队事件失败');
+    return originalAppend.call(this, id, type, data);
+  };
+  let queued;
+  try { queued = manager.send(b.id, '排队追加'); }
+  finally { manager.store.append = originalAppend; }
+  assert.match(queued.warnings[0], /消息已保存到队列.*事件记录失败/);
+  assert.equal(manager.get(b.id).data.queuedMessages.at(-1).messageId, queued.messageId);
+  assert.equal(manager.store.listWorkers().find(worker => worker.id === b.id).queuedMessages.length, 2);
+  await manager.close();
+  const reopened = await f.create();
+  const originalSchedule = reopened.schedule;
+  reopened.schedule = () => { throw new Error('模拟恢复后的调度失败'); };
+  let resumed;
+  try { resumed = reopened.resume(b.id, '继续'); }
+  finally { reopened.schedule = originalSchedule; }
+  assert.match(resumed.warnings[0], /恢复任务已保存.*调度失败/);
+  assert.equal(reopened.get(b.id).data.queuedMessages.length, 3);
+  const restoredAppend = reopened.store.append;
+  reopened.store.append = function (id, type, data) {
+    if (type === 'message_queued') throw new Error('模拟异步投递事件失败');
+    return restoredAppend.call(this, id, type, data);
+  };
+  try { reopened.schedule(); }
+  finally { reopened.store.append = restoredAppend; }
+  assert.deepEqual(f.controllers.at(-1).sent.map(message => message.text), ['执行 B', '排队追加', '继续']);
+  assert.equal(f.controllers.at(-1).sent[1].messageId, queued.messageId);
+  assert.equal(f.controllers.at(-1).sent[2].messageId, resumed.messageId);
+  assert.match(reopened.status([b.id]).workers[0].deliveryWarning, /已投递.*异步投递事件失败/);
+});
+
+test('执行器拒绝投递且回滚写盘失败时明确报错，不投递消息或隐瞒恢复失败', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  const controller = f.controllers[0];
+  const originalSend = controller.send;
+  const originalSave = manager.store.saveWorker;
+  let saves = 0;
+  manager.store.saveWorker = function (data) {
+    if (++saves === 2) throw new Error('模拟回滚写盘失败');
+    return originalSave.call(this, data);
+  };
+  controller.send = () => { throw new Error('模拟输入流关闭'); };
+  try {
+    assert.throws(() => manager.send(a.id, '不能投递'), error => {
+      assert(error instanceof AggregateError);
+      assert.match(error.message, /消息未投递.*原状态未能写回/);
+      assert.match(error.errors[0].message, /输入流关闭/);
+      assert.match(error.errors[1].message, /回滚写盘失败/);
+      return true;
+    });
+    assert.equal(controller.sent.length, 1);
+    assert.equal(manager.get(a.id).data.pendingMessages.length, 1);
+  } finally {
+    controller.send = originalSend;
+    manager.store.saveWorker = originalSave;
+  }
+});
+
 test('范围索引允许同一工作者的嵌套范围，仍阻止祖先写入及共享读目录写入', async t => {
   const f = await fixture(t);
   const manager = await f.create();
@@ -1125,11 +1305,13 @@ test('发送失败不撤销已有验收，旧结果 ID 不能验收新结果', a
   controller.emit('result', { success: true, text: '第一版' });
   const originalId = manager.get(a.id).data.lastResult.resultId;
   manager.review(a.id, true, '通过', undefined, originalId);
+  const savedBefore = manager.store.listWorkers();
   const originalSend = controller.send;
   controller.send = () => { throw new Error('输入流已经关闭'); };
   assert.throws(() => manager.send(a.id, '未成功发送'), /输入流/);
   assert.equal(manager.get(a.id).data.lastReview.accepted, true);
   assert.equal(manager.accepted(manager.get(a.id)), true);
+  assert.deepEqual(manager.store.listWorkers(), savedBefore);
   controller.send = originalSend;
   manager.send(a.id, '第二轮');
   controller.emit('result', { success: true, text: '第二版' });

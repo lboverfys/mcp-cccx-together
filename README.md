@@ -109,7 +109,9 @@ Codex 会按以下流程协作：
 
 `team_status` 显示依赖、排队原因、后台任务、最近交付和验收记录，`acceptedCurrent` 表示当前整条依赖链的验收是否有效。完整结果单独保存，事件窗口滚动后仍可通过 `team_result` 读取。
 
-`team_review` 返回 `warnings` 时，验收已保存，可通过 `team_status` 查看后续调度状态并处理提示的问题。
+`team_dispatch`、`team_send`、`team_resume` 或 `team_review` 返回 `warnings` 时，对应的提交已经生效，警告说明后续事件记录或调度的问题。请保留返回的工作者 ID、`messageId` 或 `resultId`，通过 `team_status` 检查实际状态后处理，不要直接重复提交。投递前的消息状态保存失败时不会投递给工作者。
+
+`team_status` 的 `deliveryWarning` 保留当前 MCP 进程中最近一次消息投递后的事件记录警告，包括异步调度时发生的警告；它不表示消息投递失败。
 
 ### 并行范围与权限
 
