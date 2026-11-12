@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -35,7 +35,7 @@ function outputQueue() {
   };
 }
 
-function harness({ workerOverrides = {}, configOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand, stderrError } = {}) {
+function harness({ workerOverrides = {}, configOverrides = {}, request, readDependency, autoExit = true, streamError, endError, stopTask, spawnCommand, stderrError, env } = {}) {
   const events = [];
   const messages = [];
   const waiters = [];
@@ -67,6 +67,7 @@ function harness({ workerOverrides = {}, configOverrides = {}, request, readDepe
     config: { claudeExecutable: 'D:/tools/claude.exe', tempDir: 'D:/task/temp', permissionMode: 'default', ...configOverrides },
     request: request ?? (async () => ({ allow: false, reason: '未授权' })),
     readDependency,
+    ...(env ? { env } : {}),
     emit(type, data) {
       if (type === 'stderr' && stderrError) throw stderrError;
       events.push({ type, data });
@@ -744,4 +745,57 @@ lines.on('close', () => process.exit(0));
   assert.equal(bypassOptions.promptTool, undefined);
   await bypass.worker.close();
   assert.equal(children[3].exitCode, 0);
+});
+
+test('write 工作者的文件编辑工具只能写分配范围，免权限模式下由钩子拒绝越界路径', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cc-team-scope-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'src'));
+  const requests = [];
+  const h = harness({
+    configOverrides: { permissionMode: undefined },
+    workerOverrides: { access: 'write', cwd: root, writeRoots: [join(root, 'src')] },
+  });
+  const [matcher] = h.options.hooks.PreToolUse;
+  assert.equal(matcher.matcher, 'Edit|Write|MultiEdit|NotebookEdit');
+  const hook = matcher.hooks[0];
+  assert.deepEqual(await hook({ tool_name: 'Edit', tool_input: { file_path: join(root, 'src', 'a.js') }, cwd: root }), {});
+  assert.deepEqual(await hook({ tool_name: 'Write', tool_input: { file_path: 'src/new.js' }, cwd: root }), {});
+  assert.deepEqual(await hook({ tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: root }), {});
+  const denied = await hook({ tool_name: 'Write', tool_input: { file_path: join(root, 'README.md') }, cwd: root, tool_use_id: 'tool-9' });
+  assert.equal(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /不在分配范围内/);
+  const escaped = await hook({ tool_name: 'Edit', tool_input: { file_path: join(root, 'src', '..', 'README.md') }, cwd: root });
+  assert.equal(escaped.hookSpecificOutput.permissionDecision, 'deny');
+  assert(h.events.some(event => event.type === 'scope_denied' && event.data.toolUseId === 'tool-9'));
+  await h.instance.close();
+
+  // 需审批模式下越界编辑直接拒绝，不打扰主控。
+  const approval = harness({
+    request: async (...args) => { requests.push(args); return { allow: true }; },
+    workerOverrides: { access: 'write', cwd: root, writeRoots: [join(root, 'src')] },
+  });
+  const result = await approval.options.canUseTool('Edit', { file_path: join(root, 'README.md') }, { signal: new AbortController().signal });
+  assert.equal(result.behavior, 'deny');
+  assert.equal(requests.length, 0);
+  await approval.instance.close();
+
+  const reader = harness({ workerOverrides: { access: 'read' } });
+  assert.equal(reader.options.hooks, undefined);
+  await reader.instance.close();
+});
+
+test('provider 注入环境变量和默认模型，缺少来源变量时拒绝启动', async () => {
+  const providers = { deepseek: { env: { ANTHROPIC_BASE_URL: 'https://example.invalid/anthropic' },
+    envFrom: { ANTHROPIC_AUTH_TOKEN: 'DS_KEY' }, model: 'ds-model' } };
+  const h = harness({ configOverrides: { providers }, workerOverrides: { provider: 'deepseek' }, env: { DS_KEY: 'secret', PATH: '/bin' } });
+  assert.equal(h.options.env.ANTHROPIC_BASE_URL, 'https://example.invalid/anthropic');
+  assert.equal(h.options.env.ANTHROPIC_AUTH_TOKEN, 'secret');
+  assert.equal(h.options.env.PATH, '/bin');
+  assert.equal(h.options.model, 'ds-model');
+  await h.instance.close();
+  const overridden = harness({ configOverrides: { providers }, workerOverrides: { provider: 'deepseek', model: 'other' }, env: { DS_KEY: 'x' } });
+  assert.equal(overridden.options.model, 'other');
+  await overridden.instance.close();
+  assert.throws(() => harness({ configOverrides: { providers }, workerOverrides: { provider: 'deepseek' }, env: {} }), /需要环境变量 DS_KEY/);
 });

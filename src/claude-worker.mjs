@@ -1,9 +1,13 @@
 import { spawn } from 'node:child_process';
+import { resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { inside, pathKey, physicalPath } from './paths.mjs';
+import { providerEnvironment } from './providers.mjs';
 
 const limit = (text, length = 2000) => String(text).slice(0, length);
+const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 function inputQueue() {
   const messages = [];
@@ -52,7 +56,13 @@ async function withShutdownTimeout(promise, message) {
   }
 }
 
-export function createClaudeWorker({ worker, config, emit, request, readDependency, queryImpl = query, spawnImpl = spawn }) {
+export function createClaudeWorker({ worker, config, emit, request, readDependency, queryImpl = query, spawnImpl = spawn, env: sourceEnv = process.env }) {
+  // provider 缺少来源变量时在启动前失败，不用错误的端点或账号运行。
+  const providerEnv = providerEnvironment(config.providers, worker.provider, sourceEnv);
+  const model = worker.model ?? config.providers?.[worker.provider]?.model;
+  const cwd = worker.worktree?.cwd ?? worker.cwd;
+  const writeRoots = worker.access === 'write' && worker.writeRoots?.length
+    ? worker.writeRoots.map(root => pathKey(physicalPath(root))) : undefined;
   const input = inputQueue();
   const abortController = new AbortController();
   const pendingRequests = new Set();
@@ -130,11 +140,37 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     ],
   });
 
+  /** 写入任务的文件编辑工具只能改分配范围（隔离时为 worktree 内的对应路径）和自身临时目录。 */
+  function scopeViolation(toolName, toolInput, baseCwd = cwd) {
+    if (!writeRoots || !FILE_TOOLS.has(toolName)) return undefined;
+    const target = toolInput?.file_path ?? toolInput?.notebook_path;
+    if (typeof target !== 'string' || !target) return undefined;
+    let allowed = false;
+    try {
+      const full = pathKey(physicalPath(resolve(baseCwd, target)));
+      allowed = writeRoots.some(root => inside(root, full));
+    } catch { /* 无法核实的路径按越界处理 */ }
+    if (allowed) return undefined;
+    return `${target} 不在分配范围内，已拒绝修改。允许修改：${worker.writeRoots.join(', ')}` +
+      (worker.worktree ? `。你在隔离工作区中工作，主工作区 ${worker.cwd} 下的路径请改用 ${worker.worktree.cwd} 下的同名路径。` : '。需要扩大范围时用 ask_parent 询问主控。');
+  }
+
+  const scopeHook = async (hookInput) => {
+    const reason = scopeViolation(hookInput.tool_name, hookInput.tool_input, hookInput.cwd || cwd);
+    if (!reason) return {};
+    // 回调抛错时 SDK 会放行工具调用，因此记录失败不得影响拒绝结果。
+    try { emit('scope_denied', { tool: hookInput.tool_name, toolUseId: hookInput.tool_use_id, summary: limit(reason, 1000) }); }
+    catch { /* 状态写入失败不改变拒绝决定 */ }
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  };
+
   async function canUseTool(toolName, toolInput, context) {
     if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
       && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
       return { behavior: 'allow', updatedInput: toolInput };
     }
+    const violation = scopeViolation(toolName, toolInput);
+    if (violation) return { behavior: 'deny', message: violation };
     const decision = await ask('permission', {
       toolName,
       input: toolInput,
@@ -158,19 +194,20 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     prompt: input,
     options: {
       abortController,
-      cwd: worker.cwd,
+      cwd,
       pathToClaudeCodeExecutable: config.claudeExecutable,
       extraArgs: { name: worker.name },
       settingSources: ['user', 'project', 'local'],
       settings: { disableAllHooks: true, disableSkillShellExecution: true },
       env: {
-        ...process.env,
+        ...sourceEnv,
+        ...providerEnv,
         DISABLE_AUTOUPDATER: '1',
         TEMP: config.tempDir,
         TMP: config.tempDir,
         TMPDIR: config.tempDir,
       },
-      ...(worker.model ? { model: worker.model } : {}),
+      ...(model ? { model } : {}),
       ...(worker.maxTurns !== undefined ? { maxTurns: worker.maxTurns } : {}),
       ...(worker.maxBudgetUsd !== undefined ? { maxBudgetUsd: worker.maxBudgetUsd } : {}),
       ...(worker.sessionId ? { resume: worker.sessionId } : {}),
@@ -179,6 +216,8 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
         : worker.tools ? { tools: worker.tools } : {}),
       // 提问统一走 ask_parent，免权限模式下也不会卡在无人应答的 AskUserQuestion。
       disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion'],
+      // 代码注册的钩子不受 disableAllHooks 影响，免权限模式下也会执行。
+      ...(writeRoots ? { hooks: { PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [scopeHook] }] } } : {}),
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',

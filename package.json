@@ -1,11 +1,12 @@
 {
   "name": "cc-team-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "type": "module",
-  "description": "Cross-platform MCP server for Codex to coordinate local Claude Code workers",
+  "description": "MCP server that lets Codex plan and review while Claude Code workers — on Claude or any Anthropic-compatible model — execute in parallel",
+  "keywords": ["mcp", "codex", "claude-code", "multi-agent", "deepseek", "git-worktree"],
   "bin": { "cc-team-mcp": "src/cli.mjs" },
-  "files": ["src/", "README.md", "README.zh-CN.md", "team.config.example.json"],
+  "files": ["src/", "README.md", "README.zh-CN.md", "CHANGELOG.md", "SECURITY.md", "team.config.example.json"],
   "repository": { "type": "git", "url": "git+https://github.com/lboverfys/mcp-cccx-together.git" },
   "bugs": { "url": "https://github.com/lboverfys/mcp-cccx-together/issues" },
   "engines": { "node": ">=22" },
@@ -14,7 +15,8 @@
     "doctor": "node src/cli.mjs doctor",
     "setup": "node src/cli.mjs setup",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "check": "node scripts/check.mjs"
+    "check": "node scripts/check.mjs",
+    "prepublishOnly": "npm run check && npm test"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.318",

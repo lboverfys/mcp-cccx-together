@@ -5,11 +5,16 @@
 
 [English](README.md) | 简体中文
 
-**Codex 负责规划，Claude Code 并行干活。**
+**Codex 负责规划，快速的工作者并行干活。**
 
-CC Team MCP 是一个本地 [MCP](https://modelcontextprotocol.io) 服务，让 [Codex](https://github.com/openai/codex) 成为一组 [Claude Code](https://code.claude.com) 工作者的规划者和协调者。Codex 拆分任务、一次提交完整计划，然后等待；服务负责并行运行工作者、遵守依赖和文件范围、用你自己的测试命令验证每份结果，只在真正需要决策时才唤醒 Codex。
+CC Team MCP 是一个本地 [MCP](https://modelcontextprotocol.io) 服务，让 [Codex](https://github.com/openai/codex) 成为一组 [Claude Code](https://code.claude.com) 工作者的规划者和审核者。工作者可以使用 Claude，也可以使用任何提供 Anthropic 兼容接口的模型，例如 DeepSeek。Codex 拆分任务、一次提交完整计划，然后等待。服务负责并行运行工作者，每个写入任务使用独立的 git worktree。服务用你的测试命令检查每份结果，只把分配范围内的改动合并回来，只在需要决策时才唤醒 Codex。
 
-支持 Windows、macOS 和 Linux，使用标准 MCP stdio 接入。不开放网络端口，不需要额外的 API 密钥——工作者直接复用你已有的 Claude Code 安装、登录和模型配置。
+支持 Windows、macOS 和 Linux，使用标准 MCP stdio 接入。不开放网络端口；除非配置了 provider，否则不需要额外的 API 密钥，工作者直接复用你已有的 Claude Code 安装和登录。
+
+> [!NOTE]
+> **本项目以中文为主。** 工作者说明、工具描述和错误信息都使用中文，工作者也用中文汇报。Codex 能理解任何语言的请求；中英文 README 同步维护。
+
+**名称说明：** npm 包和命令行工具叫 `cc-team-mcp`；`setup` 在 Codex 中把服务注册为 `cc_team`；在请求中提到 `mct` 或 `ctm` 即可使用。代码仓库名为 `mcp-cccx-together`。
 
 ## 目录
 
@@ -19,6 +24,8 @@ CC Team MCP 是一个本地 [MCP](https://modelcontextprotocol.io) 服务，让 
 - [使用](#使用)
 - [任务参数](#任务参数)
 - [工具](#工具)
+- [隔离与合并](#隔离与合并)
+- [模型与 provider](#模型与-provider)
 - [配置](#配置)
 - [恢复工作](#恢复工作)
 - [维护](#维护)
@@ -36,18 +43,20 @@ sequenceDiagram
     participant CC as Claude Code 工作者
     You->>Codex: "使用 mct 给接口加上限流"
     Codex->>MCP: team_dispatch（任务、依赖、验证命令）
-    MCP->>CC: 按依赖顺序并行启动工作者
+    MCP->>CC: 并行启动工作者，写入任务各用独立 worktree
     CC-->>MCP: 交付结果
-    MCP->>MCP: 运行验证命令 → 通过即验收，失败则发回工作者修复
+    MCP->>MCP: 在 worktree 中运行验证 → 合并范围内改动，失败则发回修复
     Codex->>MCP: team_wait
     MCP-->>Codex: 全部完成，或某个工作者需要决策
+    Codex->>MCP: 需要主控验收时 team_diff / team_review
     Codex-->>You: 最终检查与总结
 ```
 
-- **一次派发，一次等待。** Codex 一次提交全部任务，用 `team_wait` 阻塞等待而不是轮询，多数任务只需要几轮 Codex 调用。
+- **一次派发，一次等待。** Codex 一次提交全部任务，用 `team_wait` 阻塞等待而不是轮询。
+- **以验证为准，不以自述为准。** 提供 `verify` 命令（例如 `npm test`）时，由服务自己检查结果，失败就发回同一工作者修复，最多 `maxFixRounds` 轮。没有 `verify` 时，由 Codex 验收后才放行下游。
+- **写入隔离。** 在 git 仓库中，每个写入任务在独立的 git worktree 中工作，并行的写入者和各自的测试互不看到对方未完成的修改。验收时只合并任务 `scope` 内的改动，范围外的改动会被拒绝。
 - **依赖调度。** `dependsOn` 串联任务；前置结果验收后，下游立即启动，并收到上游交付作为交接。
-- **自动验证。** 为任务提供 `verify` 命令（例如 `npm test`）。工作者完成后由服务执行：退出码为 0 即验收；否则把输出发回同一工作者修复，最多 `maxFixRounds` 轮。
-- **按范围并行。** 写入范围重叠的任务按提交顺序排队；互不相关的任务并行运行（默认同时 8 个）。
+- **任意 Anthropic 兼容模型。** 配置一次 provider（例如 DeepSeek），然后按任务选择。
 - **状态持久化。** 团队、结果和验收记录保存在磁盘上。关掉 Codex，第二天回来按名字恢复工作者，Claude Code 会话完整保留。
 
 ## 开始之前：权限说明
@@ -55,8 +64,9 @@ sequenceDiagram
 > [!WARNING]
 > 默认情况下，工作者以 Claude Code 的 `bypassPermissions` 模式运行：可以**不经确认**地修改文件和执行命令，权限与你的系统用户相同。这正是团队速度快的原因，但只适合你信任的代码和机器。
 >
-> - `scope` 只控制调度（哪些任务可以同时运行），**不是**沙箱。
-> - 写入任务建议在独立的 git worktree、容器或虚拟机中运行。
+> - 写入任务使用独立的 git worktree（见[隔离与合并](#隔离与合并)）。文件编辑工具（`Edit`、`Write`、`MultiEdit`、`NotebookEdit`）会拒绝任务 `scope` 以外的路径。
+> - 这**不是**沙箱：shell 命令仍可读写你的用户能访问的任何位置，`node_modules` 等链接进来的依赖目录与主工作区共享。
+> - 不信任的代码请放在容器或虚拟机中运行。
 > - 如需由 Codex 审批工具调用，把 `permissionMode` 设为 `default` 或 `acceptEdits`（见[配置](#配置)）。
 
 工作者不能再创建子 agent，不会运行你的 Claude Code hooks，并且只能看到本服务提供的协作工具（不加载其他 MCP 服务）。
@@ -68,7 +78,7 @@ sequenceDiagram
 - **Node.js 22+**（包含 npm）
 - **Claude Code**：已安装，并能在终端中独立完成一次对话（[安装指南](https://code.claude.com/docs/en/setup)）
 - **Codex CLI**，或任何支持本地 stdio 服务的 MCP 客户端
-- **Git**（从 GitHub 安装时需要）
+- **Git 2.38+**：用于 worktree 隔离（从 GitHub 安装时也需要）
 
 ### 从 GitHub 安装（推荐）
 
@@ -79,7 +89,7 @@ cc-team-mcp setup
 ```
 
 - `doctor` 检查 Node、Claude Code、Codex 以及状态/临时目录，不调用模型，也不创建任何文件。
-- `setup` 通过 `codex mcp add` 把服务注册为 `cc_team`。已存在同名配置时不会覆盖，可用 `--name` 指定其他名称。
+- `setup` 通过 `codex mcp add` 把服务注册为 `cc_team`。它同时设置 Codex 的工具超时，让 `team_wait` 单次最多可等待 9.5 分钟，并转发 provider 需要的凭据变量（见[延长单次等待](#延长单次等待)）。已存在同名配置时不会覆盖，可用 `--name` 指定其他名称。
 - `--omit=optional` 跳过 Agent SDK 自带的 Claude 程序，直接使用你已安装的 Claude Code。
 
 重新打开 Codex 会话，运行 `/mcp` 确认服务已连接。
@@ -133,8 +143,9 @@ npm uninstall -g cc-team-mcp
    | --- | --- |
    | `needs_input` | 用 `team_reply` 回答工作者的问题 |
    | `failed` 或自动验收未通过 | 用 `team_send` 指示修复，或 `team_close` 后重新派发 |
+   | `stopped` | 工作进程已退出；用 `team_resume` 恢复，或关闭 |
    | `blocked` | 先处理 `blockedBy` 中的上游任务 |
-   | `awaiting_review`（`review: "codex"`） | 用 `team_result` 读取结果，再 `team_review` |
+   | `awaiting_review` | 用 `team_result` 读取报告、`team_diff` 查看实际改动，再 `team_review` |
 
 4. 重复 `team_wait` 直到 `done: true`，最后做一次整体检查。
 
@@ -143,17 +154,16 @@ npm uninstall -g cc-team-mcp
 ```json
 {
   "workers": [
-    { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"] },
-    { "name": "实现cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现功能", "access": "write", "scope": ["src"], "dependsOn": ["设计cc"], "verify": "npm test" },
+    { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"], "review": "auto" },
+    { "name": "实现cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现功能", "access": "write", "scope": ["src"], "dependsOn": ["设计cc"], "verify": "npm test", "provider": "deepseek" },
     { "name": "验证cc", "cwd": "/项目/绝对路径", "prompt": "对照契约检查实现并运行测试", "access": "verify", "dependsOn": ["实现cc"] }
   ]
 }
 ```
 
-`设计cc` 完成后自动验收；`实现cc` 带着设计交接启动，持续修复直到 `npm test` 通过；随后 `验证cc` 检查结果。只有出现卡点时才需要 Codex 介入。
-
-> [!NOTE]
-> 工作者说明和工具描述目前使用中文，工作者也用中文汇报。Codex 能理解任何语言的请求。
+1. `设计cc` 是只读任务，`"review": "auto"` 让它完成即通过验收。
+2. `实现cc` 使用 DeepSeek，在独立 worktree 中从设计交接开始工作。它持续修复直到 `npm test` 在该 worktree 中通过，然后把 `src` 内的改动合并回主工作区。
+3. `验证cc` 没有 `verify`，由 Codex 验收它的报告。
 
 ## 任务参数
 
@@ -161,18 +171,21 @@ npm uninstall -g cc-team-mcp
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `name` | — | 简短的职责名。缺少 `cc` 时自动补上；包含 `cc` 最多 10 个字符；同一团队内唯一。 |
+| `name` | — | 简短的职责名。缺少 `cc` 时自动补上；包含 `cc` 最多 24 个字符；同一团队内唯一。 |
 | `cwd` | — | 项目目录的绝对路径。 |
 | `prompt` | — | 任务内容。写清目标、涉及的文件和验收方式。 |
 | `access` | `read` | `read`：仅 Read/Glob/Grep。`verify`：额外提供 Bash，用于运行测试和构建（不应修改文件）。`write`：完整工具集。 |
-| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**。写入范围重叠的任务依次执行。 |
+| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**。写入范围重叠的任务依次执行；文件编辑工具和合并都限制在该范围内。 |
 | `dependsOn` | `[]` | 需先通过验收的任务名字或 ID，可引用同一批次中的任务。 |
-| `verify` | — | 工作者成功后在 `cwd` 中执行的 shell 命令，退出码 0 表示通过，超时 10 分钟。 |
-| `review` | `auto` | `auto`：工作者成功且 `verify` 通过即验收。`codex`：等待 Codex 调用 `team_review`。 |
-| `maxFixRounds` | `2` | `verify` 失败时自动发回工作者修复的轮数，超过后交给 Codex（0–5）。 |
+| `verify` | — | 工作者成功后执行的 shell 命令；隔离任务在其 worktree 中执行。退出码 0 表示通过，超时 10 分钟。 |
+| `review` | 有 `verify` 时为 `auto`，否则为 `codex` | `auto`：工作者成功且 `verify` 通过即验收。`codex`：等待 Codex 调用 `team_review`。写入任务使用 `auto` 必须提供 `verify`。 |
+| `maxFixRounds` | `2` | `verify` 失败或改动越界时自动发回工作者修复的轮数，超过后交给 Codex（0–5）。 |
+| `isolation` | git 仓库中的写入任务为 `worktree` | `worktree` 或 `shared`，见[隔离与合并](#隔离与合并)。 |
+| `links` | `node_modules`、`.venv`、`venv` | 从主工作区链接进 worktree 的被忽略路径（相对 `cwd`），例如 `.env`。仅在 `worktree` 下生效。 |
+| `provider` | `defaultProvider`（如已设置） | 运行该工作者的 provider，见[模型与 provider](#模型与-provider)。 |
 | `instructions` | — | 该工作者的额外约束。 |
-| `model` | Claude Code 默认模型 | 为该工作者覆盖模型。 |
-| `maxTurns`、`maxBudgetUsd` | — | 由 Claude Agent SDK 执行的单次运行轮次与预算上限。 |
+| `model` | provider 的模型，或 Claude Code 默认模型 | 为该工作者覆盖模型。 |
+| `maxTurns`、`maxBudgetUsd` | — | 由 Claude Agent SDK 执行的单次运行轮次与预算上限。`maxBudgetUsd` 按 Anthropic 价格估算，对其他 provider 不构成真实上限。 |
 | `allowedTools` | `[]` | 预先允许的 Claude Code 权限规则（仅在 `permissionMode` 不是 `bypassPermissions` 时有意义）。 |
 
 团队级设置通过 `team_open` 传入：`constraints`（附加到每个工作者说明中的约束）、`maxConcurrent`（同时存活的 Claude Code 进程数，默认 8）和 `teamId`。
@@ -183,14 +196,15 @@ npm uninstall -g cc-team-mcp
 | --- | --- |
 | `team_dispatch` | 批量提交任务；未打开团队时自动打开 |
 | `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回精简结果 |
-| `team_open` | 创建或重新打开团队，设置约束和并发 |
+| `team_open` | 创建或重新打开团队，设置约束和并发；列出已配置的 provider |
 | `team_list` | 列出已保存的团队 |
-| `team_status` | 完整状态：依赖、排队原因、进程、待答复请求、最近结果和验收 |
+| `team_status` | 完整状态：依赖、排队原因、进程、worktree、待答复请求、最近结果和验收 |
 | `team_events` | 按游标读取原始事件流（用于排查；等待请用 `team_wait`） |
 | `team_request` | 读取待答复问题或权限请求的全文 |
 | `team_reply` | 回答问题，或允许/拒绝工具调用 |
 | `team_result` | 分页读取完整结果（每页最多 100 KB） |
-| `team_review` | 验收或拒绝指定版本的结果（必须传 `resultId`） |
+| `team_diff` | 查看隔离任务尚未合并的改动：文件、越界文件、统计和分页补丁 |
+| `team_review` | 验收或拒绝指定版本的结果（必须传 `resultId`）；验收隔离任务时合并其改动 |
 | `team_send` | 向工作者追加指令 |
 | `team_interrupt` | 中断工作者的当前轮次 |
 | `team_resume` | 在原 Claude Code 会话中恢复已关闭的工作者 |
@@ -199,6 +213,59 @@ npm uninstall -g cc-team-mcp
 
 限制：每个工作者最多 32 条待处理消息，保留最近 2000 条事件，每份结果最大 8 MiB。大型产物请保存为项目文件并汇报路径。
 
+## 隔离与合并
+
+`cwd` 位于 git 仓库内的写入任务默认在独立的 [git worktree](https://git-scm.com/docs/git-worktree) 中运行。不在 git 仓库中时直接修改你的文件（`shared`），`team_dispatch` 会返回警告。
+
+- **起点。** worktree 以任务启动时主工作区的快照为起点，包括未提交的修改和未被忽略的未跟踪文件。你的分支、索引和 `HEAD` 都不会改动；快照提交不挂在任何分支上。
+- **位置。** `<stateDir>/<teamId>/worktrees/<workerId>`。状态目录必须位于仓库之外。
+- **依赖。** 测试需要的被忽略目录会从主工作区链接进来：默认 `node_modules`、`.venv` 和 `venv`，可用 `links` 添加更多。链接目录是共享的，工作者重装依赖会改动主工作区的 `node_modules`。
+- **路径。** 发给工作者的消息中指向项目的绝对路径会改写为 worktree 路径；文件编辑工具拒绝 worktree 中范围以外的路径。
+- **验收即合并。** 结果被验收时（自动验收或 `team_review`），服务取出工作者自起点以来的改动：
+  - 每个改动的路径都必须在 `scope` 内，否则验收失败。自动验收会在 `maxFixRounds` 内把越界清单发回工作者；`team_review` 返回错误。
+  - 期间你或其他任务改过相同文件时做三方合并；冲突会让验收失败，且不改动任何文件。
+  - 合并结果只写入你的工作区文件，不会暂存或提交。
+- **合并前检查。** `team_diff` 显示尚未合并的改动、越界文件和分页补丁。
+- **清理。** 关闭工作者时，已全部合并的 worktree 会被删除；仍有未合并改动的会保留（路径见 `team_status`）。`team_resume` 会在原路径重建已删除的 worktree，Claude Code 会话因此可以继续。`prune` 会清理遗留的无改动 worktree。
+
+下游任务的快照在上游改动合并之后才创建，因此能看到这些改动。
+
+## 模型与 provider
+
+默认情况下，工作者使用你已安装的 Claude Code，并加载用户、项目和本地设置，即沿用 Claude Code 当前的模型、服务商和登录方式。本服务不保存任何凭据。
+
+要把工作者接到其他 Anthropic 兼容接口，在[配置文件](#配置)中定义 **provider**。`env` 写非机密的值；`envFrom` 从 MCP 服务已有的环境变量复制机密，密钥不必写进文件：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "description": "通过 Anthropic 兼容接口使用 DeepSeek",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-chat"
+      },
+      "envFrom": { "ANTHROPIC_AUTH_TOKEN": "DEEPSEEK_API_KEY" },
+      "model": "deepseek-chat"
+    }
+  },
+  "defaultProvider": "deepseek"
+}
+```
+
+- 用任务的 `provider` 字段按任务选择，或用 `defaultProvider`（或 `CC_TEAM_DEFAULT_PROVIDER`）设为所有任务的默认值。Codex 能在服务说明和 `team_open` 的返回中看到 provider 列表。
+- `setup` 会把 `envFrom` 的来源变量（此例中为 `DEEPSEEK_API_KEY`）加入 Codex 的 `env_vars`，由 Codex 转发给服务；Windows 启动脚本也会这样做。需要的变量未设置时，派发会给出明确的错误。
+- **DeepSeek：** 上面的接口地址来自 DeepSeek 的 [Anthropic API 指南](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)。模型名称会随版本变化，请以该指南为准。把 `ANTHROPIC_DEFAULT_HAIKU_MODEL`（以及 Claude Code 用到的 Sonnet/Opus 对应变量）指向 DeepSeek 的模型，Claude Code 的后台调用也会走 DeepSeek。
+- 如果 `~/.claude/settings.json` 的 `env` 中设置了 `ANTHROPIC_*` 变量，Claude Code 可能优先使用它们；请改为写进 provider。
+- **费用：** `costUsd` 和 `maxBudgetUsd` 是 SDK 按 Anthropic 价格的估算。使用其他 provider 的工作者，其结果带有 `costReliable: false`，设置 `maxBudgetUsd` 会收到警告；请用 `maxTurns` 控制工作量。
+
+如果 Claude Code 本身通过环境变量配置服务商（不使用 provider），需要让 Codex 转发这些变量：
+
+```toml
+[mcp_servers.cc_team]
+env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+```
+
 ## 配置
 
 常规安装无需配置文件。需要自定义时，复制 [`team.config.example.json`](team.config.example.json)，然后通过 `--config /绝对路径/team.config.json`（用于 `doctor`、`setup` 和 `print-config`）或环境变量 `CC_TEAM_CONFIG` 指定。
@@ -206,10 +273,12 @@ npm uninstall -g cc-team-mcp
 | 字段 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `permissionMode` | `CC_TEAM_PERMISSION_MODE` | `bypassPermissions` | `bypassPermissions`、`acceptEdits` 或 `default`（工具调用经 Codex 用 `team_reply` 审批） |
-| `waitTimeoutMs` | `CC_TEAM_WAIT_TIMEOUT_MS` | `50000` | 单次 `team_wait` 的最长等待毫秒数，须小于客户端的工具超时 |
+| `waitTimeoutMs` | `CC_TEAM_WAIT_TIMEOUT_MS` | `50000`（`setup` 注册为 `570000`） | 单次 `team_wait` 的最长等待毫秒数，须小于客户端的工具超时 |
+| `providers` | — | 无 | 命名的 Anthropic 兼容 provider（见[模型与 provider](#模型与-provider)） |
+| `defaultProvider` | `CC_TEAM_DEFAULT_PROVIDER` | 无 | 任务未指定 provider 时使用的 provider |
 | `claudeExecutable` | `CC_TEAM_CLAUDE_EXECUTABLE` | 自动查找 | Claude Code 的绝对路径 |
 | `codexExecutable` | `CC_TEAM_CODEX_EXECUTABLE` | 自动查找 | Codex 的绝对路径（用于 `setup` 和通知） |
-| `stateDir` | `CC_TEAM_STATE_DIR` | 见下文 | 团队、工作者、事件和结果 |
+| `stateDir` | `CC_TEAM_STATE_DIR` | 见下文 | 团队、工作者、事件、结果和 worktree；请放在仓库之外 |
 | `tempDir` | `CC_TEAM_TEMP_DIR` | `<系统临时目录>/cc-team-mcp` | 工作者临时文件 |
 | `notificationMode` | `CC_TEAM_NOTIFICATION_MODE` | `poll` | `poll` 或 `codex-queue` |
 
@@ -217,7 +286,11 @@ npm uninstall -g cc-team-mcp
 
 ### 延长单次等待
 
-Codex 会在工具超时后终止调用，因此 `team_wait` 默认最多等待 50 秒。长任务想减少 Codex 轮次，可在 `~/.codex/config.toml` 中同时调高两个上限：
+Codex 会在工具超时后终止调用。每次 `team_wait` 超时都要多花一轮 Codex，因此等待越长，慢速的 Codex 轮次越少。
+
+`setup` 会自动处理：注册 `CC_TEAM_WAIT_TIMEOUT_MS = 570000`，并在 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）的 `[mcp_servers.cc_team]` 表中写入 `tool_timeout_sec = 600`。如果你自己设置了 `waitTimeoutMs`，`setup` 会保留该值，并把工具超时设为比它多 30 秒。无法修改该文件时，`setup` 改为注册安全的 50 秒默认值，并输出手动步骤。
+
+手动配置时请同时调高两个上限：
 
 ```toml
 [mcp_servers.cc_team]
@@ -227,18 +300,9 @@ tool_timeout_sec = 600
 CC_TEAM_WAIT_TIMEOUT_MS = "570000"
 ```
 
-### 模型与服务商
-
-工作者使用你已安装的 Claude Code，并加载用户、项目和本地设置，因此沿用 Claude Code 当前的模型、服务商和登录方式。本服务不保存任何凭据。如果服务商通过环境变量配置，需要让 Codex 转发这些变量：
-
-```toml
-[mcp_servers.cc_team]
-env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
-```
-
 ### Windows 启动脚本
 
-在源码目录中，`Start-TeamCodex.ps1` 会在指定项目中启动 Codex，并仅为本次会话挂载本服务——包含上面的延长等待设置和服务商环境变量转发，不修改全局 Codex 配置。
+在源码目录中，`Start-TeamCodex.ps1` 会在指定项目中启动 Codex，并仅为本次会话挂载本服务。挂载内容包括延长等待设置，以及服务商环境变量（含 `envFrom` 引用的变量）的转发。全局 Codex 配置不会被修改。
 
 ```powershell
 .\Start-TeamCodex.ps1 -ProjectPath C:\work\my-app
@@ -254,14 +318,15 @@ env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "
 
 > 打开之前的团队，让实现cc 继续完善错误处理。
 
-Codex 会调用 `team_list`，用原 `teamId` 通过 `team_open` 重新打开团队，再按名字调用 `team_resume`。约束、并发、依赖和验收记录都会恢复；尚未投递的消息会保留，并在 `team_resume` 后按顺序发送。
+Codex 会调用 `team_list`，用原 `teamId` 通过 `team_open` 重新打开团队，再按名字调用 `team_resume`。约束、并发、依赖、验收记录和 worktree 都会恢复；尚未投递的消息会保留，并在 `team_resume` 后按顺序发送。
 
 ## 维护
 
 运行维护命令前请先关闭团队。两条命令默认只预览，加 `--apply` 才实际执行。
 
 ```sh
-# 清理历史结果：每个工作者至少保留最近 3 份，以及仍被引用的版本
+# 清理历史结果（每个工作者至少保留最近 3 份，以及仍被引用的版本），
+# 以及已关闭工作者中没有未合并改动的 worktree
 cc-team-mcp prune --team <团队ID> --keep-results 3
 cc-team-mcp prune --team <团队ID> --keep-results 3 --apply
 
@@ -270,7 +335,7 @@ cc-team-mcp recover --team <团队ID>
 cc-team-mcp recover --team <团队ID> --apply
 ```
 
-升级前请备份状态目录。旧格式会在下次写入时自动迁移；回退版本时恢复备份即可。
+升级前请备份状态目录。旧格式会在下次写入时自动迁移；回退版本时恢复备份即可。各版本的行为变化见[更新日志](CHANGELOG.md)。
 
 ## 排查问题
 
@@ -279,21 +344,26 @@ cc-team-mcp recover --team <团队ID> --apply
 | 找不到 Claude Code | 确认同一环境下 `claude --version` 可运行，再执行 `cc-team-mcp doctor`，或设置 `claudeExecutable` |
 | Codex 中看不到工具 | 检查 `codex mcp list` 和 `/mcp`，确认注册的路径仍然存在，重新打开会话 |
 | 工作者鉴权或网络错误 | 在同一环境中单独运行 Claude Code；检查 `env_vars` 转发 |
+| 提示 provider“需要环境变量” | `envFrom` 的来源变量没有传到服务。重新运行 `setup`，或把它加入 `env_vars` |
 | `team_wait` 因工具超时失败 | 调低 `CC_TEAM_WAIT_TIMEOUT_MS` 或调高 `tool_timeout_sec`（见[延长单次等待](#延长单次等待)） |
+| 验收失败，提示“超出分配范围” | `team_diff` 会列出 `outsideScope`。让工作者撤销这些文件，或扩大 `scope` 后重新派发 |
+| 验收失败，提示“冲突” | 主工作区改动了相同的行。先在主工作区解决，或拒绝该结果后基于当前状态重新派发 |
+| worktree 中 `verify` 报缺少模块 | 把测试需要的被忽略目录或文件加入 `links` |
+| 提示“stateDir 位于该 git 仓库内” | 把 `stateDir` 移到仓库之外，或使用 `isolation: "shared"` |
 | 任务一直处于 `waiting_scope` | 查看 `blockedBy`，该工作者完成并验收后会自动启动；拆分范围即可并行 |
 | 工作者停在 `needs_input` | 用 `team_request` 读取请求，再用 `team_reply` 回答 |
 | 提示团队被其他进程占用 | 关闭另一个会话；如为异常退出，运行 `recover` |
 | 关闭失败 | Claude Code 后台任务未能确认停止。先自行核实再重试，不要直接删除锁文件 |
 | 提示事件日志尾行不完整 | 运行 `recover`（先预览），不要直接删除事件日志 |
 
-状态文件以明文保存任务内容、进度和工具输入。请确保状态目录仅自己可访问，也不要在 issue 中附带。
+状态文件以明文保存任务内容、进度和工具输入。请确保状态目录仅自己可访问，也不要在 issue 中附带。报告安全问题请参阅 [SECURITY.md](SECURITY.md)。
 
 ## 开发
 
 ```sh
 npm ci --omit=optional
 npm run check   # 语法检查
-npm test        # 使用模拟的 Claude Code 进程运行全部测试，不调用模型
+npm test        # 使用模拟的 Claude Code 进程和临时 git 仓库运行全部测试，不调用模型
 npm pack --dry-run
 ```
 
@@ -301,13 +371,15 @@ CI 在 Windows、macOS 和 Linux 上分别使用 Node.js 22 和 24 运行。
 
 `node scripts/smoke-live.mjs` 使用真实的 Claude Code 运行端到端流程（两个只读工作者、提问、多轮和恢复）。**会产生费用**：每个工作进程限制 8 轮和 SDK 估算的 1 美元。加 `--notify` 可同时验证 Codex 通知。
 
+代码结构：`src/server.mjs`（MCP 工具）、`src/manager.mjs`（团队状态机与调度）、`src/claude-worker.mjs`（单个 Claude Code 进程）、`src/isolation.mjs` 与 `src/worktree.mjs`（worktree 与合并）、`src/store.mjs` 与 `src/results.mjs`（持久化状态）、`src/providers.mjs`、`src/config.mjs`、`src/cli.mjs`。
+
 ## 参与贡献
 
 欢迎提交 issue 和 pull request。
 
-- **报告问题**：请提供系统和架构、Node 与 Claude Code 版本、脱敏后的 `cc-team-mcp doctor` 输出、最小复现步骤和预期结果。不要附带状态目录或 API 密钥。
-- **提交 PR**：附上能复现问题的测试。修改工具协议时，同步更新工具描述、两份 README 和 `scripts/smoke-live.mjs`。CI 必须在三个平台上全部通过。
+- **报告问题**：请提供系统和架构、Node、git 与 Claude Code 版本、脱敏后的 `cc-team-mcp doctor` 输出、最小复现步骤和预期结果。不要附带状态目录或 API 密钥。
+- **提交 PR**：附上能复现问题的测试。修改工具协议时，同步更新工具描述、两份 README、`CHANGELOG.md` 和 `scripts/smoke-live.mjs`。面向工作者的文字保持中文。CI 必须在三个平台上全部通过。
 
 ## 许可证
 
-[MIT](LICENSE)。第三方依赖遵循各自的许可证。
+[MIT](LICENSE)。第三方依赖遵循各自的许可证。`@anthropic-ai/claude-agent-sdk` 不是开源软件，按 Anthropic 的[法律条款](https://code.claude.com/docs/en/legal-and-compliance)提供；安装和运行本项目时适用这些条款。

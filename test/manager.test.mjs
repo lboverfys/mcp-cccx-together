@@ -1653,3 +1653,83 @@ test('工作者说明不附带 AGENTS.md，也不要求工作者自行读取或�
   const { instructions } = manager.get(worker.id).data;
   assert.doesNotMatch(instructions, /AGENTS|使用 pnpm|先阅读|report_progress/);
 });
+
+test('team_wait 报告两次等待之间进程已退出的工作者，不把它当作全部完成', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a] = manager.dispatch([f.spec('A')]);
+  f.controllers[0].finished.reject(new Error('模拟进程崩溃'));
+  await tick();
+  await tick();
+  assert.equal(manager.get(a.id).controller, null);
+  assert.equal(manager.get(a.id).data.status, 'failed');
+  const result = await manager.wait({ timeoutMs: 1000 });
+  assert.equal(result.done, false);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.workers.length, 1);
+  assert.equal(result.workers[0].attention, true);
+  assert.match(result.workers[0].error, /模拟进程崩溃/);
+  await manager.closeWorker(a.id);
+  assert.deepEqual((await manager.wait({ timeoutMs: 1000 })).workers, []);
+  // 重新打开团队后，上次会话遗留的失败不再阻塞等待。
+  manager.get(a.id).data.status = 'failed';
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal((await reopened.wait({ timeoutMs: 1000 })).workers.length, 0);
+});
+
+test('没有 verify 时默认交主控验收，write 任务不能无验证自动验收；非 git 目录写入退回共享工作区', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const verify = `"${process.execPath}" -e "process.exit(0)"`;
+  const warnings = [];
+  const [plain, verified, writer] = manager.dispatch([
+    f.spec('A'), f.spec('B', { verify }), f.spec('C', { access: 'write', scope: ['front'], verify }),
+  ], warnings);
+  assert.equal(manager.get(plain.id).data.review, 'codex');
+  assert.equal(manager.get(verified.id).data.review, 'auto');
+  assert.equal(manager.get(writer.id).data.isolation, 'shared');
+  assert.equal(manager.get(plain.id).data.isolation, 'shared');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /不是 git 仓库/);
+  assert.throws(() => manager.dispatch([f.spec('D', { access: 'write', scope: ['back'], review: 'auto' })]), /必须提供 verify/);
+  assert.throws(() => manager.dispatch([f.spec('E', { access: 'write', scope: ['back'], isolation: 'worktree' })]), /不在 git 仓库中/);
+  assert.throws(() => manager.dispatch([f.spec('F', { isolation: 'worktree' })]), /只有 write 任务/);
+  assert.throws(() => manager.dispatch([f.spec('G', { access: 'write', scope: ['back'], links: ['../x'] })]), /links 必须是 cwd 内/);
+  // 只读任务可以显式选择 auto，成功即放行。
+  const [explicit] = manager.dispatch([f.spec('H', { review: 'auto' })]);
+  assert.equal(manager.get(explicit.id).data.review, 'auto');
+});
+
+test('provider 校验来源变量，默认 provider 生效，预算估算给出警告', async t => {
+  const f = await fixture(t);
+  f.config.providers = { deepseek: { env: { ANTHROPIC_BASE_URL: 'https://example.invalid' }, envFrom: { ANTHROPIC_AUTH_TOKEN: 'DS_KEY' }, model: 'ds-model' } };
+  f.config.defaultProvider = 'deepseek';
+  const missing = await f.create({ env: {} });
+  assert.throws(() => missing.dispatch([f.spec('A')]), /需要环境变量 DS_KEY/);
+  assert.throws(() => missing.dispatch([f.spec('B', { provider: 'other' })]), /未配置 provider：other/);
+  await missing.close();
+  const manager = await f.create({ env: { DS_KEY: 'secret' } });
+  const warnings = [];
+  const [a] = manager.dispatch([f.spec('A', { maxBudgetUsd: 1 })], warnings);
+  assert.equal(manager.get(a.id).data.provider, 'deepseek');
+  assert.deepEqual(f.controllers[0].options.env, { DS_KEY: 'secret' });
+  assert.match(warnings[0], /maxBudgetUsd.*不代表 provider deepseek 的实际费用/);
+  const status = manager.status().workers[0];
+  assert.equal(status.provider, 'deepseek');
+  assert.equal(status.model, 'ds-model');
+  assert.doesNotMatch(JSON.stringify(manager.status()), /secret/);
+  f.controllers[0].emit('result', { success: true, text: '完成', costUsd: 0.5 });
+  assert.equal(manager.get(a.id).data.lastResult.costReliable, false);
+});
+
+test('前置交付摘要被截断时，下游指令明确要求读取完整交付', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [up] = manager.dispatch([f.spec('上游'), f.spec('下游', { dependsOn: ['上游'] })]);
+  f.controllers[0].emit('result', { success: true, text: '长'.repeat(2500) });
+  assert.equal(manager.get(up.id).data.lastResult.textTruncated, true);
+  assert.equal(manager.get(up.id).data.lastResult.text.length, 2000);
+  manager.review(up.id, true, '通过');
+  assert.match(f.controllers[1].options.worker.instructions, /摘要已截断为前 2000 字符，开始前必须用 mcp__team__read_dependency 读取完整交付/);
+});
