@@ -1554,6 +1554,27 @@ test('自动验收：验证命令通过即验收并启动下游，无需主控 t
   assert.match(f.controllers[1].options.worker.instructions, /自动验收/);
 });
 
+test('自动验收命令使用该工作者的临时目录，覆盖父进程的临时路径', async t => {
+  const f = await fixture(t);
+  const script = path.join(f.dir, 'verify-temp.cjs');
+  writeFileSync(script, `const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const temporary = require('node:os').tmpdir();
+assert.equal(path.dirname(temporary), process.argv[2]);
+for (const key of ['TEMP', 'TMP', 'TMPDIR']) assert.equal(process.env[key], temporary);
+fs.writeFileSync(path.join(temporary, 'verification.txt'), 'ok');
+`);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('验证', {
+    verify: `"${process.execPath}" "${script}" "${path.join(f.config.tempDir, 'test-team')}"`,
+  })]);
+  f.controllers[0].emit('result', { success: true, text: '完成' });
+  const result = await manager.wait({ workerIds: [worker.id], timeoutMs: 10000 });
+  assert.equal(result.done, true, JSON.stringify(result));
+  assert.equal(existsSync(path.join(f.config.tempDir, 'test-team', worker.id, 'verification.txt')), true);
+});
+
 test('自动验收：验证失败把输出发回工作者修复，超过轮数交主控，主控追加后重新计数', async t => {
   const f = await fixture(t);
   const manager = await f.create();

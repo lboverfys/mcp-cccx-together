@@ -80,10 +80,10 @@ export class WorktreeIsolation {
   merge(worker) {
     const { data } = worker;
     try {
-      if (!existsSync(data.worktree.root)) return { ok: true, files: [], worktree: data.worktree };
+      if (!existsSync(data.worktree.root)) throw new Error(`隔离工作区不存在：${data.worktree.root}；无法确认交付内容，未执行合并`);
       const merged = integrateWorktree(data.worktree, { allowed: this.scopeFilter(data), tempDir: this.tempDir });
       return { ok: true, files: merged.files,
-        worktree: merged.files.length ? { ...data.worktree, baseTree: merged.tree, integratedAt: new Date().toISOString() } : data.worktree };
+        worktree: merged.tree !== data.worktree.baseTree ? { ...data.worktree, baseTree: merged.tree, integratedAt: new Date().toISOString() } : data.worktree };
     } catch (error) {
       return { ok: false, kind: error.code === 'SCOPE' ? 'scope' : error.code === 'CONFLICT' ? 'conflict' : 'error',
         files: error.files ?? [], error: clip(error.message, 4000) };

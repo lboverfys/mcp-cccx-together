@@ -57,7 +57,15 @@ export function snapshotTree(root, { tempDir, excludes = [] }) {
     const current = path.resolve(root, git(root, ['rev-parse', '--git-path', 'index']).trim());
     if (existsSync(current)) copyFileSync(current, index);
     const env = { GIT_INDEX_FILE: index };
-    git(root, ['add', '-A', '--', '.', ...excludes.map(item => `:(exclude,literal)${item}`)], { env });
+    let ignored = new Set();
+    if (excludes.length) {
+      try {
+        ignored = new Set(git(root, ['check-ignore', '-z', '--stdin'], { env, input: `${excludes.join('\0')}\0` }).split('\0'));
+      } catch (error) { if (error.status !== 1) throw error; } // 退出码 1 表示没有匹配的忽略项。
+    }
+    // Git 会对显式列出的已忽略路径报错，即使该路径是排除项；保留其原有忽略规则即可。
+    const pathspecs = excludes.filter(item => !ignored.has(item)).map(item => `:(exclude,literal)${item}`);
+    git(root, ['add', '-A', '--', '.', ...pathspecs], { env });
     return git(root, ['write-tree'], { env }).trim();
   } finally { removeIndex(index); }
 }
@@ -190,11 +198,12 @@ export function integrateWorktree(worktree, { allowed, tempDir }) {
   if (outside.length) throw failure('SCOPE', `修改超出分配范围：${list(outside)}`, outside);
   const changed = new Set(files.map(file => file.path));
   const ours = snapshotTree(worktree.repoRoot, { tempDir });
-  let target = theirs;
-  if (ours !== worktree.baseTree && nameStatus(worktree.repoRoot, worktree.baseTree, ours).some(file => changed.has(file.path))) {
-    target = mergeTrees(worktree.repoRoot, worktree.baseTree, ours, theirs);
-  }
-  const entries = nameStatus(worktree.repoRoot, ours, target).filter(file => changed.has(file.path));
+  const merging = ours !== worktree.baseTree && nameStatus(worktree.repoRoot, worktree.baseTree, ours).some(file => changed.has(file.path));
+  const target = merging ? mergeTrees(worktree.repoRoot, worktree.baseTree, ours, theirs) : theirs;
+  // 三方合并已保留主工作区改动，实际差异可能位于重命名后的路径。
+  const entries = nameStatus(worktree.repoRoot, ours, target).filter(file => merging || changed.has(file.path));
+  const outsideTargets = entries.map(file => file.path).filter(file => !allowed(file));
+  if (outsideTargets.length) throw failure('SCOPE', `合并目标超出分配范围：${list(outsideTargets)}`, outsideTargets);
   writeEntries(worktree.repoRoot, target, entries, tempDir);
   return { tree: theirs, files: entries };
 }

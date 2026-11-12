@@ -588,7 +588,8 @@ export class TeamManager {
     let check = { ok: true, output: '' };
     try {
       if (worker.data.verify && !this.closing && worker.data.status === 'awaiting_review') {
-        check = await runVerify(worker.data.verify, worker.data.worktree?.cwd ?? worker.data.cwd, abort.signal);
+        check = await runVerify(worker.data.verify, worker.data.worktree?.cwd ?? worker.data.cwd, abort.signal,
+          resolve(this.config.tempDir, this.teamId, worker.data.id));
       }
     } finally {
       if (worker.verifyAbort === abort) {

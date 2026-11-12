@@ -4,12 +4,12 @@ export const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
 export const VERIFY_OUTPUT_CHARS = 6000;
 
 /** 在 cwd 用系统 shell 执行验证命令；中止或超时会结束整个进程树。 */
-export function runVerify(command, cwd, signal) {
+export function runVerify(command, cwd, signal, tempDir) {
   return new Promise(resolveRun => {
     let output = '';
     let timedOut = false;
     const child = spawn(command, { cwd, shell: true, windowsHide: true, detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'] });
+      stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, TEMP: tempDir, TMP: tempDir, TMPDIR: tempDir } });
     const collect = data => { output = (output + data).slice(-VERIFY_OUTPUT_CHARS); };
     child.stdout.setEncoding('utf8').on('data', collect);
     child.stderr.setEncoding('utf8').on('data', collect);

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DEFAULT_LINKS, createWorktree, integrateWorktree, removeWorktree, repoRoot, worktreeChanges, worktreeDiff } from '../src/worktree.mjs';
@@ -14,21 +14,31 @@ const inWorktree = (worktree, file, content) => {
 };
 
 test('worktree 以主工作区当前内容为基线，含未提交和未跟踪文件，并链接被忽略的依赖目录', async t => {
-  const r = gitRepository(t, { 'a.txt': 'committed\n', '.gitignore': 'node_modules/\n' });
+  const r = gitRepository(t, { 'a.txt': 'committed\n', '.gitignore': 'node_modules/\n.env\n' });
   r.write('a.txt', 'uncommitted\n');
   r.write('new.txt', 'untracked\n');
   r.write('node_modules/pkg/index.js', 'module.exports = 1;\n');
+  r.write('.env', 'LOCAL_ONLY=1\n');
   const before = r.git('status', '--porcelain');
-  const worktree = createWorktree({ cwd: r.root, root: r.worktreeRoot, tempDir: r.tempDir, links: DEFAULT_LINKS });
+  const worktree = createWorktree({ cwd: r.root, root: r.worktreeRoot, tempDir: r.tempDir, links: [...DEFAULT_LINKS, '.env'] });
   assert.equal(repoRoot(r.root), r.root);
   assert.equal(worktree.cwd, worktree.root);
   assert.equal(readFileSync(path.join(worktree.root, 'a.txt'), 'utf8'), 'uncommitted\n');
   assert.equal(readFileSync(path.join(worktree.root, 'new.txt'), 'utf8'), 'untracked\n');
   assert.equal(readFileSync(path.join(worktree.root, 'node_modules/pkg/index.js'), 'utf8'), 'module.exports = 1;\n');
-  assert.deepEqual(worktree.links, ['node_modules']);
+  assert.equal(readFileSync(path.join(worktree.root, '.env'), 'utf8'), 'LOCAL_ONLY=1\n');
+  assert.deepEqual(worktree.links, ['node_modules', '.env']);
   // 主仓库的 HEAD、索引和工作区状态都不变。
   assert.equal(r.git('status', '--porcelain'), before);
   assert.deepEqual(worktreeChanges(worktree, { tempDir: r.tempDir }).files, []);
+  inWorktree(worktree, 'a.txt', 'worker change\n');
+  assert.deepEqual(worktreeDiff(worktree, { tempDir: r.tempDir }).files, [{ status: 'M', path: 'a.txt' }]);
+  const merged = integrateWorktree(worktree, { allowed: file => file === 'a.txt', tempDir: r.tempDir });
+  assert.equal(r.read('a.txt'), 'worker change\n');
+  assert.deepEqual(worktreeChanges({ ...worktree, baseTree: merged.tree }, { tempDir: r.tempDir }).files, []);
+  removeWorktree(worktree);
+  assert.equal(r.read('node_modules/pkg/index.js'), 'module.exports = 1;\n');
+  assert.equal(r.read('.env'), 'LOCAL_ONLY=1\n');
 });
 
 test('子目录 cwd 映射到 worktree 内的同一子目录', async t => {
@@ -90,6 +100,21 @@ test('diff 返回相对基线的文件、统计和补丁', async t => {
   assert.deepEqual(diff.files, [{ status: 'M', path: 'src/a.txt' }]);
   assert.match(diff.stat, /src\/a\.txt/);
   assert.match(diff.patch, /\+more/);
+});
+
+test('主工作区把文件移出 scope 后拒绝整批合并，不漏掉重命名目标的范围检查', async t => {
+  const r = gitRepository(t, { 'src/a.txt': lines(20), 'src/b.txt': 'b\n' });
+  const worktree = createWorktree({ cwd: r.root, root: r.worktreeRoot, tempDir: r.tempDir });
+  inWorktree(worktree, 'src/a.txt', lines(20).replace('line 1\n', 'worker 1\n'));
+  inWorktree(worktree, 'src/b.txt', 'worker b\n');
+  mkdirSync(path.join(r.root, 'docs'));
+  renameSync(path.join(r.root, 'src/a.txt'), path.join(r.root, 'docs/renamed.txt'));
+  const before = r.git('status', '--porcelain');
+  assert.throws(() => integrateWorktree(worktree, { allowed: file => file.startsWith('src/'), tempDir: r.tempDir }),
+    error => error.code === 'SCOPE' && error.files.join() === 'docs/renamed.txt');
+  assert.equal(r.read('docs/renamed.txt'), lines(20));
+  assert.equal(r.read('src/b.txt'), 'b\n');
+  assert.equal(r.git('status', '--porcelain'), before);
 });
 
 test('删除 worktree 先拆除链接，不删除主工作区的依赖目录', async t => {

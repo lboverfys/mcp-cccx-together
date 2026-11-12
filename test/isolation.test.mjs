@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { TeamManager } from '../src/manager.mjs';
 import { gitRepository } from './fixtures/git.mjs';
+import { removeWorktree } from '../src/worktree.mjs';
 
 const readWorktree = (controller, file) => readFileSync(path.join(controller.options.worker.worktree.root, file), 'utf8');
 
@@ -112,6 +113,58 @@ test('主控验收时越界改动不合并且验收不生效，关闭保留有�
   const closed = await manager.closeWorker(worker.id);
   assert.deepEqual(closed.worktree, { root: controller.options.worker.worktree.root, removed: false, pendingFiles: 2 });
   assert.equal(existsSync(controller.options.worker.worktree.root), true);
+});
+
+test('主工作区重命名后验收把改动合并到新路径，保留并行修改并可清理 worktree', async t => {
+  const original = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
+  const changed = original.replace('line 1\n', 'worker 1\n');
+  const f = fixture(t, { 'src/a.txt': original, 'docs/x.txt': 'original\n' });
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('实现')]);
+  const controller = f.controllers[0];
+  f.edit(controller, 'src/a.txt', changed);
+  controller.emit('result', { success: true, text: '完成' });
+  renameSync(path.join(f.repo.root, 'src/a.txt'), path.join(f.repo.root, 'src/renamed.txt'));
+  f.repo.write('docs/x.txt', 'main change\n');
+  manager.review(worker.id, true, '核对改名后的内容');
+  assert.equal(f.repo.read('src/renamed.txt'), changed);
+  assert.equal(existsSync(path.join(f.repo.root, 'src/a.txt')), false);
+  assert.equal(f.repo.read('docs/x.txt'), 'main change\n');
+  assert.equal(manager.get(worker.id).data.lastReview.mergedFiles, 1);
+  assert.deepEqual(manager.diff(worker.id).files, []);
+  const closed = await manager.closeWorker(worker.id);
+  assert.equal(closed.worktree.removed, true);
+});
+
+test('主工作区已包含同样改动时推进验收基线，不保留虚假的未合并改动', async t => {
+  const f = fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('实现')]);
+  f.edit(f.controllers[0], 'src/a.txt', 'same change\n');
+  f.repo.write('src/a.txt', 'same change\n');
+  f.controllers[0].emit('result', { success: true, text: '完成' });
+  manager.review(worker.id, true, '主工作区已包含该改动');
+  assert.equal(manager.get(worker.id).data.lastReview.mergedFiles, 0);
+  assert.deepEqual(manager.diff(worker.id).files, []);
+  assert.equal((await manager.closeWorker(worker.id)).worktree.removed, true);
+});
+
+test('隔离目录丢失时拒绝验收且不启动下游，主工作区保持原样', async t => {
+  const f = fixture(t);
+  const manager = await f.create();
+  const [worker, downstream] = manager.dispatch([f.spec('实现'), f.spec('下游', { dependsOn: ['实现'] })]);
+  const controller = f.controllers[0];
+  f.edit(controller, 'src/a.txt', 'pending change\n');
+  controller.emit('result', { success: true, text: '完成' });
+  const worktree = controller.options.worker.worktree;
+  assert.equal(path.dirname(worktree.root), path.join(f.config.stateDir, 'iso-team', 'worktrees'));
+  removeWorktree(worktree);
+  assert.throws(() => manager.review(worker.id, true, '验收'), /隔离工作区.*不存在/);
+  assert.equal(manager.get(worker.id).data.lastReview, undefined);
+  assert.equal(manager.get(worker.id).data.status, 'awaiting_review');
+  assert.equal(manager.get(downstream.id).data.status, 'queued');
+  assert.equal(f.controllers.length, 1);
+  assert.equal(f.repo.read('src/a.txt'), 'a\n');
 });
 
 test('自动验收在 worktree 中运行 verify，越界改动发回修复，超过轮次后拒绝且不合并', async t => {
