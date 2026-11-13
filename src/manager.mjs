@@ -13,6 +13,8 @@ import { runVerify } from './verify.mjs';
 const active = new Set(['starting', 'running', 'needs_input', 'awaiting_review', 'interrupting', 'idle']);
 const clip = (text, max = 12000) => String(text ?? '').slice(0, max);
 const SUMMARY_CHARS = 2000;
+// team_wait 直接带回的报告上限；工作者按要求控制篇幅，超出时才需要 team_result 续读。
+const REPORT_CHARS = 6000;
 // team_wait 判定：working 仍会自行推进；needsParent 必须由主控处理；settled 表示本轮已停下。
 const working = worker => Boolean(worker.verifying || worker.closingPromise)
   || ['starting', 'running', 'interrupting', 'closing'].includes(worker.data.status);
@@ -144,6 +146,7 @@ export class TeamManager {
       workers: selected.map(({ data, controller, deliveryWarning, lifecycleError, verifying }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
       review: data.review ?? 'codex', ...(data.verify ? { verify: data.verify } : {}), ...(verifying ? { verifying } : {}),
+      ...(data.explore ? { explore: true } : {}),
       model: data.model ?? this.config.providers?.[data.provider]?.model ?? '继承 CC 配置',
       ...(data.provider ? { provider: data.provider } : {}), isolation: data.isolation ?? 'shared',
       ...(data.worktree ? { worktree: { root: data.worktree.root, cwd: data.worktree.cwd, exists: existsSync(data.worktree.root) } } : {}),
@@ -180,11 +183,13 @@ export class TeamManager {
   /** 派发时补全默认值：验收方式、隔离方式、provider，并拒绝不安全的组合。 */
   normalizeSpec(spec, warnings) {
     const label = spec.name;
-    // 没有 verify 时默认交主控验收，工作者的完成声明不会自动放行下游。
-    const review = spec.review ?? (spec.verify ? 'auto' : 'codex');
+    // read/verify 任务不改文件，验收只决定是否放行下游，默认自动验收，免得主控为放行而重做调查；
+    // write 任务没有 verify 时交主控验收，工作者的完成声明不会自动合并或放行下游。
+    const review = spec.review ?? (spec.verify || spec.access !== 'write' ? 'auto' : 'codex');
     if (review === 'auto' && !spec.verify && spec.access === 'write') {
       throw new Error(`${label}：write 任务使用 review "auto" 时必须提供 verify 命令，否则改用 review "codex"`);
     }
+    if (spec.explore && spec.access !== 'read') throw new Error(`${label}：explore 只适用于 read 任务`);
     const isolation = this.isolation.resolve(spec, warnings);
     const provider = spec.provider ?? this.config.defaultProvider;
     if (provider && !this.config.providers?.[provider]) throw new Error(`${label}：未配置 provider ${provider}`);
@@ -278,6 +283,7 @@ export class TeamManager {
   }
 
   instructions(spec) {
+    const explore = spec.access === 'read' && spec.explore;
     return `你是由 Codex 主控派发的 Claude Code 工作者，使用中文汇报。\n` +
       `你的名字是“${spec.name}”，主控和用户会用这个名字指代你。\n` +
       `工作目录：${spec.worktree?.cwd ?? spec.cwd}\n分配范围：${spec.scope.join(', ')}\n访问模式：${spec.access}\n` +
@@ -285,8 +291,14 @@ export class TeamManager {
         `任务里出现 ${spec.cwd} 下的路径时，改用隔离工作区下的同名路径。不要 git commit、checkout、reset 或 stash；` +
         `验收通过后由 MCP 把分配范围内的改动合并回主工作区，范围外的改动会导致验收失败。\n` : '') +
       `只执行主控任务，遵循项目约定，不扩大修改范围。上下文不自动共享；需要主控决定时通过 ask_parent 提问。\n` +
-      `不要自行再创建 agent。没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
-      `工具报错必须明确报告，不得虚报验证通过。结束时说明修改文件、验证结果、未完成项；你报告完成后由主控验收。清理本任务启动的服务，不得停止原有服务。\n` +
+      (explore ? '可以用 Agent 工具（subagent_type 只能是 Explore）把互不重叠的目录或子问题分给子 agent 并行检索；一两次搜索能解决的部分自己查。'
+        : '不要自行再创建 agent。') +
+      `没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
+      `工具报错必须明确报告，不得虚报验证通过。清理本任务启动的服务，不得停止原有服务。\n` +
+      `最终报告是主控唯一会读的内容，控制在 1500 字以内，不复述过程：先用一两句话直接回答任务；再列出不超过 5 条关键证据，用 文件:行号 或命令输出标注；` +
+      `已证实（有代码或命令输出支撑）与推测分开写，说明无法判断的部分及验证方法；不要给没有证据的可能性排序。` +
+      (spec.access === 'write' ? '另外列出修改的文件、验证命令及结果和未完成项。\n'
+        : spec.access === 'verify' ? '另外列出运行的命令及结果。\n' : '\n') +
       (spec.access === 'read' ? '当前为只读任务，不允许修改项目或运行命令。\n'
         : spec.access === 'verify' ? '当前为验证任务：可以运行测试、构建和检查命令，不要修改项目文件。\n' : '') +
       `工作者补充约束：\n${spec.taskInstructions ?? spec.instructions ?? ''}\n` +
@@ -411,13 +423,7 @@ export class TeamManager {
           this.setQueueState(worker, 'queued', conflicts.length || earlier.length ? 'waiting_scope' : 'waiting_capacity',
             conflicts.length ? conflicts : earlier);
           waitingAhead.push(worker);
-          for (const item of retiring) {
-            this.closeWorker(item.data.id).catch(error => {
-              item.data.error = clip(error.message, 2000);
-              this.save(item);
-              this.event(item.data.id, 'close_failed', { summary: item.data.error });
-            }).catch(error => this.lifecycleFailed(item, error));
-          }
+          for (const item of retiring) this.retire(item);
           continue;
         }
         if (worker.data.isolation === 'worktree') {
@@ -461,6 +467,15 @@ export class TeamManager {
       this.scheduling = false;
       if (updates.length) this.store.saveWorkers(updates);
     }
+  }
+
+  /** 后台回收已验收的空闲进程；关闭失败记入状态，不影响验收结论。 */
+  retire(worker) {
+    this.closeWorker(worker.data.id).catch(error => {
+      worker.data.error = clip(error.message, 2000);
+      this.save(worker);
+      this.event(worker.data.id, 'close_failed', { summary: worker.data.error });
+    }).catch(error => this.lifecycleFailed(worker, error));
   }
 
   diff(reference, options) {
@@ -625,6 +640,8 @@ export class TeamManager {
       note += merge.files.length ? `；已把 ${merge.files.length} 个文件合并回主工作区` : '；隔离工作区没有文件改动';
     }
     this.review(worker.data.id, true, note, undefined, resultId, { merge });
+    // read/verify 任务验收后没有改动要合并，直接回收进程，主控不必再 team_close；追问时 team_resume 恢复原会话。
+    if (worker.data.access !== 'write' && worker.controller) this.retire(worker);
   }
 
   autoReviewFailed(worker, error) {
@@ -635,11 +652,14 @@ export class TeamManager {
 
   /** 阻塞到目标全部停下或任一需要主控处理，返回精简结果；替代逐条轮询事件。 */
   async wait({ workerIds, timeoutMs = 50000 } = {}) {
-    // 本次服务中派发、恢复或追加过的工作者即使进程已退出，也要报告其失败或待处理状态。
+    // 本次服务中派发、恢复或追加过的工作者即使进程已退出，也要报告其失败或待处理状态；
+    // 在两次等待之间已完成（含自动验收后关闭）但结果还没返回给主控的，也要带回结果。
+    const unreported = worker => worker.touched && worker.data.lastResult
+      && worker.reportedResultId !== worker.data.lastResult.resultId;
     const targets = workerIds ? [...new Set(workerIds.map(ref => this.get(ref)))]
-      : [...this.workers.values()].filter(worker => !['idle', 'closed'].includes(worker.data.status)
+      : [...this.workers.values()].filter(worker => unreported(worker) || (!['idle', 'closed'].includes(worker.data.status)
         && (worker.controller || worker.verifying || ['queued', 'blocked'].includes(worker.data.status)
-          || (worker.touched && needsParent(worker))));
+          || (worker.touched && needsParent(worker)))));
     // 全队没有仍在推进的工作者时，继续等待也不会有变化。
     const ready = () => this.closing || targets.some(needsParent) || targets.every(settled)
       || ![...this.workers.values()].some(working);
@@ -671,11 +691,13 @@ export class TeamManager {
       ...(this.closing ? { closing: true } : {}),
       workers: targets.map(worker => {
         const { data } = worker;
+        const report = settled(worker) && data.lastResult ? this.report(worker) : undefined;
+        if (report) worker.reportedResultId = data.lastResult.resultId;
         return {
           id: data.id, name: data.name, status: data.status, attention: needsParent(worker),
           ...(data.queueReason ? { queueReason: data.queueReason } : {}),
           ...(data.blockedBy?.length ? { blockedBy: data.blockedBy.map(item => item.name) } : {}),
-          ...(settled(worker) && data.lastResult ? { resultId: data.lastResult.resultId, summary: data.lastResult.text } : {}),
+          ...(report ? { resultId: data.lastResult.resultId, ...report } : {}),
           ...(data.error ? { error: data.error } : {}),
           ...(data.lastReview ? { review: { accepted: data.lastReview.accepted, note: clip(data.lastReview.note, 6500) } } : {}),
           ...(requests.has(data.id) ? { requests: requests.get(data.id) } : {}),
@@ -683,6 +705,17 @@ export class TeamManager {
         };
       }),
     };
+  }
+
+  /** team_wait 返回的报告：摘要被截断时从完整交付补足，主控通常无需再调 team_result。 */
+  report(worker) {
+    const { resultId, text, textTruncated } = worker.data.lastResult;
+    if (!textTruncated) return { summary: text };
+    let full;
+    // 完整交付读取失败时退回摘要并标记截断，由 team_result 报告具体错误。
+    try { full = String(this.results.get(worker.data.id, resultId).text ?? ''); }
+    catch { return { summary: text, summaryTruncated: true }; }
+    return { summary: clip(full, REPORT_CHARS), ...(full.length > REPORT_CHARS ? { summaryTruncated: true } : {}) };
   }
 
   send(id, text, { automatic = false } = {}) {

@@ -785,6 +785,36 @@ test('write 工作者的文件编辑工具只能写分配范围，免权限模�
   await reader.instance.close();
 });
 
+test('explore 只读工作者可用 Explore 子 agent，钩子拒绝其他子 agent、嵌套和非检索工具', async () => {
+  const h = harness({ workerOverrides: { access: 'read', explore: true } });
+  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'Agent']);
+  assert.ok(!h.options.disallowedTools.includes('Agent'));
+  assert.ok(!h.options.disallowedTools.includes('Task'));
+  assert.ok(h.options.disallowedTools.includes('AskUserQuestion'));
+  const [matcher] = h.options.hooks.PreToolUse;
+  assert.equal(matcher.matcher, undefined);
+  const hook = matcher.hooks[0];
+  const denied = result => result.hookSpecificOutput?.permissionDecision === 'deny';
+  assert.deepEqual(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: '查找' } }), {});
+  assert.deepEqual(await hook({ tool_name: 'Grep', tool_input: { pattern: 'x' }, agent_id: 'sub-1' }), {});
+  assert.deepEqual(await hook({ tool_name: 'mcp__team__report_progress', tool_input: {} }), {});
+  assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { prompt: '默认类型' } })));
+  assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose' } })));
+  assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore' }, agent_id: 'sub-1' })));
+  const bash = await hook({ tool_name: 'Bash', tool_input: { command: 'rm -rf x' }, agent_id: 'sub-1', tool_use_id: 'tool-7' });
+  assert.ok(denied(bash));
+  assert.match(bash.hookSpecificOutput.permissionDecisionReason, /只读任务不能使用 Bash/);
+  assert.ok(denied(await hook({ tool_name: 'Edit', tool_input: { file_path: 'a.js' } })));
+  assert(h.events.some(event => event.type === 'scope_denied' && event.data.toolUseId === 'tool-7'));
+  await h.instance.close();
+  // explore 只对 read 生效，verify 工作者仍不能委派。
+  const verifier = harness({ workerOverrides: { access: 'verify', explore: true } });
+  assert.deepEqual(verifier.options.tools, ['Read', 'Glob', 'Grep', 'Bash']);
+  assert.ok(verifier.options.disallowedTools.includes('Agent'));
+  assert.equal(verifier.options.hooks, undefined);
+  await verifier.instance.close();
+});
+
 test('provider 注入环境变量和默认模型，缺少来源变量时拒绝启动', async () => {
   const providers = { deepseek: { env: { ANTHROPIC_BASE_URL: 'https://example.invalid/anthropic' },
     envFrom: { ANTHROPIC_AUTH_TOKEN: 'DS_KEY' }, model: 'ds-model' } };

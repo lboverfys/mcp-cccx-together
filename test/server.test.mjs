@@ -301,7 +301,9 @@ test('team_dispatch 未打开团队时自动打开，team_wait 等到自动验�
   const result = await waiting;
   assert.equal(result.done, true);
   assert.deepEqual(Object.keys(result.workers[0]).sort(), ['attention', 'id', 'name', 'resultId', 'review', 'status', 'summary']);
-  assert.equal(result.workers[0].status, 'idle');
+  // verify 任务自动验收后直接回收进程，主控不必再 team_close。
+  assert.equal(result.workers[0].status, 'closed');
+  assert.equal(f.controllers[0].closeCalls, 1);
   assert.equal(result.workers[0].review.accepted, true);
   assert.equal((await endpoint.call('team_result', { workerId: '实现cc' })).hasMore, false);
 });
@@ -353,7 +355,9 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
     'team_wait', 'team_diff',
   ].sort());
   assert.match(instructions, /team_diff/);
-  assert.match(instructions, /没有 verify 时默认由主控验收/);
+  assert.match(instructions, /没有 verify 的 write 任务默认由主控验收/);
+  assert.match(instructions, /已派出的问题主控不要再自己调查/);
+  assert.match(instructions, /summary 即工作者报告全文/);
   for (const name of ['team_status', 'team_events', 'team_request', 'team_wait', 'team_diff']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
   }
@@ -691,7 +695,7 @@ test('按名字完成查看、追加、事件筛选、验收、关闭及重开�
   assert((await endpoint.call('team_events', { workerIds: ['接口开发cc'] })).events.every(event => event.workerId === worker.id));
 });
 
-test('未填 review 时按是否有 verify 决定验收方式，team_open 和说明列出可用 provider', async t => {
+test('未填 review 时 read/verify 任务自动验收，team_open 和说明列出可用 provider', async t => {
   const f = await fixture(t);
   f.config.providers = { deepseek: { env: {}, envFrom: {}, model: 'ds-model' } };
   f.config.defaultProvider = 'deepseek';
@@ -705,7 +709,7 @@ test('未填 review 时按是否有 verify 决定验收方式，team_open 和说
   ] });
   const status = await endpoint.call('team_status');
   assert.deepEqual(status.workers.map(worker => [worker.review, worker.provider, worker.model]),
-    [['codex', 'deepseek', 'ds-model'], ['auto', 'deepseek', 'ds-model']]);
+    [['auto', 'deepseek', 'ds-model'], ['auto', 'deepseek', 'ds-model']]);
   const unknown = await endpoint.raw('team_dispatch', { workers: [{ name: '丙', cwd: f.cwd, prompt: 'x', provider: 'other' }] });
   assert.equal(unknown.isError, true);
   const diff = await endpoint.raw('team_diff', { workerId: '甲cc' });

@@ -57,7 +57,8 @@ async function fixture(t) {
     assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
     rmSync(dir, { recursive: true, force: true });
   });
-  const spec = (name, extra = {}) => ({ name, cwd, access: 'read', scope: ['.'], prompt: `执行 ${name}`, allowedTools: [], ...extra });
+  // 多数用例覆盖主控验收流程，默认显式交主控验收；需要默认值的用例传 review: undefined。
+  const spec = (name, extra = {}) => ({ name, cwd, access: 'read', scope: ['.'], prompt: `执行 ${name}`, allowedTools: [], review: 'codex', ...extra });
   return { dir, cwd, config, controllers, create, spec };
 }
 
@@ -1567,7 +1568,7 @@ fs.writeFileSync(path.join(temporary, 'verification.txt'), 'ok');
 `);
   const manager = await f.create();
   const [worker] = manager.dispatch([f.spec('验证', {
-    verify: `"${process.execPath}" "${script}" "${path.join(f.config.tempDir, 'test-team')}"`,
+    review: undefined, verify: `"${process.execPath}" "${script}" "${path.join(f.config.tempDir, 'test-team')}"`,
   })]);
   f.controllers[0].emit('result', { success: true, text: '完成' });
   const result = await manager.wait({ workerIds: [worker.id], timeoutMs: 10000 });
@@ -1699,27 +1700,89 @@ test('team_wait 报告两次等待之间进程已退出的工作者，不把它�
   assert.equal((await reopened.wait({ timeoutMs: 1000 })).workers.length, 0);
 });
 
-test('没有 verify 时默认交主控验收，write 任务不能无验证自动验收；非 git 目录写入退回共享工作区', async t => {
+test('read/verify 任务默认自动验收，没有 verify 的 write 任务交主控验收且不能自动验收；非 git 目录写入退回共享工作区', async t => {
   const f = await fixture(t);
   const manager = await f.create();
   const verify = `"${process.execPath}" -e "process.exit(0)"`;
   const warnings = [];
-  const [plain, verified, writer] = manager.dispatch([
-    f.spec('A'), f.spec('B', { verify }), f.spec('C', { access: 'write', scope: ['front'], verify }),
+  const [plain, checker, verified, writer, manual] = manager.dispatch([
+    f.spec('A', { review: undefined }), f.spec('V', { access: 'verify', review: undefined }), f.spec('B', { verify, review: undefined }),
+    f.spec('C', { access: 'write', scope: ['front'], verify, review: undefined }),
+    f.spec('W', { access: 'write', scope: ['back'], review: undefined }),
   ], warnings);
-  assert.equal(manager.get(plain.id).data.review, 'codex');
-  assert.equal(manager.get(verified.id).data.review, 'auto');
+  assert.deepEqual([plain, checker, verified, writer, manual].map(item => manager.get(item.id).data.review),
+    ['auto', 'auto', 'auto', 'auto', 'codex']);
   assert.equal(manager.get(writer.id).data.isolation, 'shared');
   assert.equal(manager.get(plain.id).data.isolation, 'shared');
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /不是 git 仓库/);
+  assert.equal(warnings.length, 2);
+  assert.ok(warnings.every(warning => /不是 git 仓库/.test(warning)));
   assert.throws(() => manager.dispatch([f.spec('D', { access: 'write', scope: ['back'], review: 'auto' })]), /必须提供 verify/);
+  assert.throws(() => manager.dispatch([f.spec('X', { access: 'verify', explore: true })]), /explore 只适用于 read 任务/);
   assert.throws(() => manager.dispatch([f.spec('E', { access: 'write', scope: ['back'], isolation: 'worktree' })]), /不在 git 仓库中/);
   assert.throws(() => manager.dispatch([f.spec('F', { isolation: 'worktree' })]), /只有 write 任务/);
   assert.throws(() => manager.dispatch([f.spec('G', { access: 'write', scope: ['back'], links: ['../x'] })]), /links 必须是 cwd 内/);
-  // 只读任务可以显式选择 auto，成功即放行。
-  const [explicit] = manager.dispatch([f.spec('H', { review: 'auto' })]);
-  assert.equal(manager.get(explicit.id).data.review, 'auto');
+  // 只读任务可以显式选择交主控验收。
+  const [explicit] = manager.dispatch([f.spec('H', { review: 'codex' })]);
+  assert.equal(manager.get(explicit.id).data.review, 'codex');
+});
+
+test('只读任务默认完成即验收并回收进程，team_wait 补报两次等待之间完成的结果且只报一次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A', { review: undefined }), f.spec('B', { review: undefined, dependsOn: ['A'] })]);
+  // A 在主控调用 team_wait 之前就已完成并被回收。
+  f.controllers[0].emit('result', { success: true, text: 'A 结论', sessionId: 'session-a' });
+  await until(() => manager.get(a.id).data.status === 'closed', '自动验收后应关闭只读工作者');
+  assert.equal(f.controllers[0].closeCalls, 1);
+  assert.equal(manager.get(a.id).data.lastReview.accepted, true);
+  assert.equal(manager.get(b.id).data.status, 'running');
+  const first = await manager.wait({ timeoutMs: 20 });
+  assert.equal(first.timedOut, true);
+  const reported = first.workers.find(worker => worker.id === a.id);
+  assert.equal(reported.summary, 'A 结论');
+  assert.equal(reported.attention, false);
+  assert.equal(first.workers.find(worker => worker.id === b.id).summary, undefined);
+  f.controllers[1].emit('result', { success: true, text: 'B 结论' });
+  const second = await manager.wait({ timeoutMs: 10000 });
+  assert.equal(second.done, true);
+  assert.deepEqual(second.workers.map(worker => [worker.name, worker.status, worker.summary]), [['B', 'closed', 'B 结论']]);
+  assert.deepEqual((await manager.wait({ timeoutMs: 1000 })).workers, []);
+  // 追问已关闭的只读工作者时恢复原会话，新结果再报告一次。
+  manager.resume(a.id, '补充检查');
+  f.controllers[2].emit('result', { success: true, text: 'A 补充结论' });
+  const third = await manager.wait({ timeoutMs: 10000 });
+  assert.deepEqual(third.workers.map(worker => worker.summary), ['A 补充结论']);
+});
+
+test('team_wait 从完整交付补足被截断的报告，过长时标记 summaryTruncated', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [medium, long] = manager.dispatch([f.spec('中', { review: undefined }), f.spec('长', { review: undefined })]);
+  f.controllers[0].emit('result', { success: true, text: '中'.repeat(4000) });
+  f.controllers[1].emit('result', { success: true, text: '长'.repeat(7000) });
+  const result = await manager.wait({ workerIds: [medium.id, long.id], timeoutMs: 10000 });
+  const [first, second] = result.workers;
+  assert.equal(first.summary.length, 4000);
+  assert.equal(first.summaryTruncated, undefined);
+  assert.equal(second.summary.length, 6000);
+  assert.equal(second.summaryTruncated, true);
+});
+
+test('工作者说明要求结论先行的简短报告，explore 只读任务允许 Explore 子 agent', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader, explorer, writer] = manager.dispatch([
+    f.spec('读取'), f.spec('检索', { explore: true }), f.spec('写入', { access: 'write', scope: ['front'] }),
+  ]);
+  const text = id => manager.get(id).data.instructions;
+  assert.match(text(reader.id), /1500 字以内.*直接回答任务.*文件:行号/);
+  assert.match(text(reader.id), /已证实.*与推测分开写/);
+  assert.match(text(reader.id), /不要自行再创建 agent/);
+  assert.doesNotMatch(text(reader.id), /修改的文件/);
+  assert.match(text(explorer.id), /subagent_type 只能是 Explore/);
+  assert.doesNotMatch(text(explorer.id), /不要自行再创建 agent/);
+  assert.equal(manager.status([explorer.id]).workers[0].explore, true);
+  assert.match(text(writer.id), /列出修改的文件、验证命令及结果和未完成项/);
 });
 
 test('provider 校验来源变量，默认 provider 生效，预算估算给出警告', async t => {

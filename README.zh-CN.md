@@ -53,7 +53,8 @@ sequenceDiagram
 ```
 
 - **一次派发，一次等待。** Codex 一次提交全部任务，用 `team_wait` 阻塞等待而不是轮询。
-- **以验证为准，不以自述为准。** 提供 `verify` 命令（例如 `npm test`）时，由服务自己检查结果，失败就发回同一工作者修复，最多 `maxFixRounds` 轮。没有 `verify` 时，由 Codex 验收后才放行下游。
+- **以验证为准，不以自述为准。** 提供 `verify` 命令（例如 `npm test`）时，由服务自己检查结果，失败就发回同一工作者修复，最多 `maxFixRounds` 轮。没有 `verify` 的写入任务由 Codex 验收后才放行下游。
+- **同一件事只做一次。** 只读和验证任务完成即自动验收并回收进程，报告全文随 `team_wait` 返回；工作者按固定格式（结论先行、带 `文件:行号` 证据、已证实与推测分开）简短汇报，Codex 直接采用，不重做已派出的调查。
 - **写入隔离。** 在 git 仓库中，每个写入任务在独立的 git worktree 中工作，并行的写入者和各自的测试互不看到对方未完成的修改。验收时只合并任务 `scope` 内的改动，范围外的改动会被拒绝。
 - **依赖调度。** `dependsOn` 串联任务；前置结果验收后，下游立即启动，并收到上游交付作为交接。
 - **任意 Anthropic 兼容模型。** 配置一次 provider（例如 DeepSeek），然后按任务选择。
@@ -69,7 +70,7 @@ sequenceDiagram
 > - 不信任的代码请放在容器或虚拟机中运行。
 > - 如需由 Codex 审批工具调用，把 `permissionMode` 设为 `default` 或 `acceptEdits`（见[配置](#配置)）。
 
-工作者不能再创建子 agent，不会运行你的 Claude Code hooks，并且只能看到本服务提供的协作工具（不加载其他 MCP 服务）。
+工作者不能再创建子 agent（`explore: true` 的只读任务例外，只能使用只读的 Explore 子 agent），不会运行你的 Claude Code hooks，并且只能看到本服务提供的协作工具（不加载其他 MCP 服务）。
 
 ## 安装
 
@@ -136,7 +137,7 @@ npm uninstall -g cc-team-mcp
 随后 Codex 会：
 
 1. 拆分工作，用一次 `team_dispatch` 提交全部任务。团队会自动打开（只有需要设置约束、调整并发或重新打开旧团队时，才先调用 `team_open`）。
-2. 调用 `team_wait`，阻塞到所有任务停下或有任务需要处理。
+2. 调用 `team_wait`，阻塞到所有任务停下或有任务需要处理。已停下的工作者带回报告全文（过长时 `summaryTruncated: true`，再用 `team_result` 续读）；在两次等待之间完成的结果也会补报一次。派出去的问题 Codex 不再自己调查。
 3. 只处理 `attention: true` 的工作者：
 
    | 状态 | Codex 的处理 |
@@ -145,25 +146,25 @@ npm uninstall -g cc-team-mcp
    | `failed` 或自动验收未通过 | 用 `team_send` 指示修复，或 `team_close` 后重新派发 |
    | `stopped` | 工作进程已退出；用 `team_resume` 恢复，或关闭 |
    | `blocked` | 先处理 `blockedBy` 中的上游任务 |
-   | `awaiting_review` | 用 `team_result` 读取报告、`team_diff` 查看实际改动，再 `team_review` |
+   | `awaiting_review` | 用 `team_diff` 查看实际改动，再 `team_review` |
 
-4. 重复 `team_wait` 直到 `done: true`，最后做一次整体检查。
+4. 重复 `team_wait` 直到 `done: true`；有写入时按需做一次整体验证，再汇总。自动验收的只读和验证工作者已自动关闭，无需 `team_close`，追问用 `team_resume`。
 
 ### 计划示例
 
 ```json
 {
   "workers": [
-    { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"], "review": "auto" },
+    { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"] },
     { "name": "实现cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现功能", "access": "write", "scope": ["src"], "dependsOn": ["设计cc"], "verify": "npm test", "provider": "deepseek" },
     { "name": "验证cc", "cwd": "/项目/绝对路径", "prompt": "对照契约检查实现并运行测试", "access": "verify", "dependsOn": ["实现cc"] }
   ]
 }
 ```
 
-1. `设计cc` 是只读任务，`"review": "auto"` 让它完成即通过验收。
+1. `设计cc` 是只读任务，默认完成即通过验收，随后进程自动关闭。
 2. `实现cc` 使用 DeepSeek，在独立 worktree 中从设计交接开始工作。它持续修复直到 `npm test` 在该 worktree 中通过，然后把 `src` 内的改动合并回主工作区。
-3. `验证cc` 没有 `verify`，由 Codex 验收它的报告。
+3. `验证cc` 是验证任务，同样完成即通过验收；它的报告随 `team_wait` 返回给 Codex。
 
 ## 任务参数
 
@@ -178,7 +179,8 @@ npm uninstall -g cc-team-mcp
 | `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**。写入范围重叠的任务依次执行；文件编辑工具和合并都限制在该范围内。 |
 | `dependsOn` | `[]` | 需先通过验收的任务名字或 ID，可引用同一批次中的任务。 |
 | `verify` | — | 工作者成功后执行的 shell 命令；隔离任务在其 worktree 中执行。退出码 0 表示通过，超时 10 分钟。 |
-| `review` | 有 `verify` 时为 `auto`，否则为 `codex` | `auto`：工作者成功且 `verify` 通过即验收。`codex`：等待 Codex 调用 `team_review`。写入任务使用 `auto` 必须提供 `verify`。 |
+| `review` | `read`/`verify` 任务和带 `verify` 的写入任务为 `auto`，其余为 `codex` | `auto`：工作者成功且 `verify`（如有）通过即验收；`read`/`verify` 任务随后自动关闭进程。`codex`：等待 Codex 调用 `team_review`。写入任务使用 `auto` 必须提供 `verify`。 |
+| `explore` | `false` | 仅 `read` 任务：允许工作者用 Claude Code 的 Explore 子 agent 并行检索互不重叠的部分，适合跨多个模块的大范围搜索。子 agent 同样只能 Read/Glob/Grep，且不能再嵌套。 |
 | `maxFixRounds` | `2` | `verify` 失败或改动越界时自动发回工作者修复的轮数，超过后交给 Codex（0–5）。 |
 | `isolation` | git 仓库中的写入任务为 `worktree` | `worktree` 或 `shared`，见[隔离与合并](#隔离与合并)。 |
 | `links` | `node_modules`、`.venv`、`venv` | 从主工作区链接进 worktree 的被忽略路径（相对 `cwd`），例如 `.env`。仅在 `worktree` 下生效。 |
@@ -195,7 +197,7 @@ npm uninstall -g cc-team-mcp
 | 工具 | 用途 |
 | --- | --- |
 | `team_dispatch` | 批量提交任务；未打开团队时自动打开 |
-| `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回精简结果 |
+| `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回精简结果和已停下工作者的报告全文 |
 | `team_open` | 创建或重新打开团队，设置约束和并发；列出已配置的 provider |
 | `team_list` | 列出已保存的团队 |
 | `team_status` | 完整状态：依赖、排队原因、进程、worktree、待答复请求、最近结果和验收 |

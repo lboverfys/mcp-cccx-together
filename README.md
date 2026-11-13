@@ -53,7 +53,8 @@ sequenceDiagram
 ```
 
 - **One dispatch, one wait.** Codex submits every task at once and blocks on `team_wait` instead of polling.
-- **Verified, not self-reported.** With a `verify` command (for example `npm test`) the server checks the result itself and sends failures back to the same worker, up to `maxFixRounds` times. Without `verify`, Codex reviews the result before anything downstream starts.
+- **Verified, not self-reported.** With a `verify` command (for example `npm test`) the server checks the result itself and sends failures back to the same worker, up to `maxFixRounds` times. For write tasks without `verify`, Codex reviews the result before anything downstream starts.
+- **Each job is done once.** Read and verify tasks are accepted as soon as they finish, their processes are closed, and the full report comes back with `team_wait`. Workers report in a fixed short format (conclusion first, `file:line` evidence, verified facts kept apart from guesses), so Codex can use the report as-is instead of repeating the investigation.
 - **Isolated writes.** In a git repository, each write task works in its own git worktree. Parallel writers and their test runs don't see each other's half-finished edits. On acceptance, only changes inside the task's `scope` are merged back; anything outside is rejected.
 - **Dependency scheduling.** `dependsOn` chains tasks. The next task starts as soon as its inputs are accepted and receives the upstream result as a handoff.
 - **Any Anthropic-compatible model.** Define providers (for example DeepSeek) once, then pick one per task.
@@ -69,7 +70,7 @@ sequenceDiagram
 > - Use a container or VM for code you don't trust.
 > - To approve tool calls through Codex instead, set `permissionMode` to `default` or `acceptEdits` (see [Configuration](#configuration)).
 
-Workers cannot start sub-agents. They don't run your Claude Code hooks, and they only see the coordination tools provided by this server (no other MCP servers).
+Workers cannot start sub-agents (except read tasks with `explore: true`, which may use the read-only Explore sub-agent). They don't run your Claude Code hooks, and they only see the coordination tools provided by this server (no other MCP servers).
 
 ## Installation
 
@@ -136,7 +137,7 @@ Mention **`mct`** (or **`ctm`**) in your request to Codex:
 Codex then:
 
 1. Splits the work and calls `team_dispatch` once with all tasks. A team is opened automatically (call `team_open` first only to set constraints, change concurrency or reopen an old team).
-2. Calls `team_wait`, which blocks until every task has stopped or one needs attention.
+2. Calls `team_wait`, which blocks until every task has stopped or one needs attention. Stopped workers come back with their full report (`summaryTruncated: true` if it is too long; read the rest with `team_result`), including results that finished between two waits. Codex does not investigate what it has delegated.
 3. Handles only workers marked `attention: true`:
 
    | Status | What Codex does |
@@ -145,25 +146,25 @@ Codex then:
    | `failed`, or auto-review rejected | Sends a fix with `team_send`, or `team_close` and re-dispatch |
    | `stopped` | The worker's process exited; `team_resume` it or close it |
    | `blocked` | Fixes the upstream task listed in `blockedBy` |
-   | `awaiting_review` | Reads the report with `team_result` and the actual changes with `team_diff`, then `team_review` |
+   | `awaiting_review` | Checks the actual changes with `team_diff`, then `team_review` |
 
-4. Repeats `team_wait` until `done: true`, then does a final check.
+4. Repeats `team_wait` until `done: true`, runs an overall check if anything was written, and sums up. Auto-accepted read and verify workers are already closed, so no `team_close` is needed; use `team_resume` for follow-ups.
 
 ### Example plan
 
 ```json
 {
   "workers": [
-    { "name": "designcc", "cwd": "/abs/path/to/project", "prompt": "Write the API contract and acceptance criteria", "scope": ["src"], "review": "auto" },
+    { "name": "designcc", "cwd": "/abs/path/to/project", "prompt": "Write the API contract and acceptance criteria", "scope": ["src"] },
     { "name": "implcc", "cwd": "/abs/path/to/project", "prompt": "Implement the contract", "access": "write", "scope": ["src"], "dependsOn": ["designcc"], "verify": "npm test", "provider": "deepseek" },
     { "name": "checkcc", "cwd": "/abs/path/to/project", "prompt": "Review the implementation against the contract and run the test suite", "access": "verify", "dependsOn": ["implcc"] }
   ]
 }
 ```
 
-1. `designcc` is read-only, and `"review": "auto"` accepts it when it finishes.
+1. `designcc` is read-only, so it is accepted when it finishes and its process is closed.
 2. `implcc` runs on DeepSeek in its own worktree, starting from the design handoff. It keeps fixing until `npm test` passes there, and then its changes under `src` are merged back.
-3. `checkcc` has no `verify`, so Codex reviews its report.
+3. `checkcc` is a verify task, also accepted when it finishes; its report reaches Codex through `team_wait`.
 
 ## Task options
 
@@ -178,7 +179,8 @@ Each entry in `team_dispatch.workers` accepts:
 | `scope` | whole `cwd` | Paths relative to `cwd` (not globs). **Required** for `write`. Overlapping write scopes run one after another; file-editing tools and merging are limited to it. |
 | `dependsOn` | `[]` | Names or IDs of tasks that must be accepted first; may reference tasks in the same batch. |
 | `verify` | — | Shell command run after the worker succeeds, in the worker's worktree for isolated tasks. Exit code 0 means pass. Times out after 10 minutes. |
-| `review` | `auto` with `verify`, otherwise `codex` | `auto`: accept when the worker succeeds and `verify` passes. `codex`: wait for Codex to call `team_review`. Write tasks need a `verify` command to use `auto`. |
+| `review` | `auto` for read and verify tasks and for write tasks with `verify`, otherwise `codex` | `auto`: accept when the worker succeeds and `verify` (if any) passes; read and verify workers are then closed. `codex`: wait for Codex to call `team_review`. Write tasks need a `verify` command to use `auto`. |
+| `explore` | `false` | Read tasks only: let the worker fan out non-overlapping searches to Claude Code's Explore sub-agent, for broad searches across many modules. The sub-agent is also limited to Read/Glob/Grep and cannot nest. |
 | `maxFixRounds` | `2` | How many times a failing `verify` or an out-of-scope change is sent back to the worker before Codex is asked (0–5). |
 | `isolation` | `worktree` for write tasks in a git repository | `worktree` or `shared`. See [Isolation and merging](#isolation-and-merging). |
 | `links` | `node_modules`, `.venv`, `venv` | Ignored paths (relative to `cwd`) linked from the main checkout into the worktree, for example `.env`. Only used with `worktree`. |
@@ -195,7 +197,7 @@ Team-wide options are set with `team_open`: `constraints` (text added to every w
 | Tool | Purpose |
 | --- | --- |
 | `team_dispatch` | Submit a batch of tasks; opens a team if none is open |
-| `team_wait` | Block until all tasks stop or one needs attention; returns a compact summary |
+| `team_wait` | Block until all tasks stop or one needs attention; returns a compact summary with the full report of each stopped worker |
 | `team_open` | Create or reopen a team; set constraints and concurrency; lists configured providers |
 | `team_list` | List saved teams |
 | `team_status` | Full state: dependencies, queue reasons, processes, worktrees, requests, latest results and reviews |

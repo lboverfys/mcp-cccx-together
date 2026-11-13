@@ -8,6 +8,8 @@ import { providerEnvironment } from './providers.mjs';
 
 const limit = (text, length = 2000) => String(text).slice(0, length);
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const READ_TOOLS = ['Read', 'Glob', 'Grep'];
+const AGENT_TOOLS = new Set(['Agent', 'Task']);
 
 function inputQueue() {
   const messages = [];
@@ -63,6 +65,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
   const cwd = worker.worktree?.cwd ?? worker.cwd;
   const writeRoots = worker.access === 'write' && worker.writeRoots?.length
     ? worker.writeRoots.map(root => pathKey(physicalPath(root))) : undefined;
+  const explore = worker.access === 'read' && Boolean(worker.explore);
   const input = inputQueue();
   const abortController = new AbortController();
   const pendingRequests = new Set();
@@ -164,6 +167,19 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
   };
 
+  /** explore 只读任务：主线程和 Explore 子 agent 都只能检索，子 agent 只能是 Explore 且不能再嵌套。 */
+  const exploreHook = async (hookInput) => {
+    const name = hookInput.tool_name;
+    if (READ_TOOLS.includes(name) || name?.startsWith('mcp__team__')) return {};
+    if (AGENT_TOOLS.has(name) && hookInput.tool_input?.subagent_type === 'Explore' && !hookInput.agent_id) return {};
+    const reason = AGENT_TOOLS.has(name)
+      ? '只读任务只能由主线程使用 Explore 子 agent（subagent_type: "Explore"）。'
+      : `只读任务不能使用 ${name}，只能用 ${READ_TOOLS.join('、')} 检索。`;
+    try { emit('scope_denied', { tool: name, toolUseId: hookInput.tool_use_id, summary: reason }); }
+    catch { /* 状态写入失败不改变拒绝决定 */ }
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  };
+
   async function canUseTool(toolName, toolInput, context) {
     if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
       && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
@@ -211,13 +227,14 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
       ...(worker.maxTurns !== undefined ? { maxTurns: worker.maxTurns } : {}),
       ...(worker.maxBudgetUsd !== undefined ? { maxBudgetUsd: worker.maxBudgetUsd } : {}),
       ...(worker.sessionId ? { resume: worker.sessionId } : {}),
-      ...(worker.access === 'read' ? { tools: ['Read', 'Glob', 'Grep'] }
-        : worker.access === 'verify' ? { tools: ['Read', 'Glob', 'Grep', 'Bash'] }
+      ...(worker.access === 'read' ? { tools: explore ? [...READ_TOOLS, 'Agent'] : READ_TOOLS }
+        : worker.access === 'verify' ? { tools: [...READ_TOOLS, 'Bash'] }
         : worker.tools ? { tools: worker.tools } : {}),
       // 提问统一走 ask_parent，免权限模式下也不会卡在无人应答的 AskUserQuestion。
-      disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion'],
-      // 代码注册的钩子不受 disableAllHooks 影响，免权限模式下也会执行。
-      ...(writeRoots ? { hooks: { PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [scopeHook] }] } } : {}),
+      disallowedTools: [...(explore ? [] : AGENT_TOOLS), 'Workflow', 'AskUserQuestion'],
+      // 代码注册的钩子不受 disableAllHooks 影响，免权限模式下也会执行，且对子 agent 的工具调用同样生效。
+      ...(writeRoots ? { hooks: { PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [scopeHook] }] } }
+        : explore ? { hooks: { PreToolUse: [{ hooks: [exploreHook] }] } } : {}),
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
