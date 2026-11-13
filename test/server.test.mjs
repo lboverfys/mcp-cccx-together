@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -11,6 +11,7 @@ import { TeamManager } from '../src/manager.mjs';
 import { Store } from '../src/store.mjs';
 
 const tempRoot = tmpdir();
+const WAITING_TOOLS = new Set(['team_dispatch', 'team_send', 'team_reply', 'team_review', 'team_resume']);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('客户端在团队初始化期间关闭时等待初始化并释放锁', async t => {
@@ -252,8 +253,10 @@ async function fixture(t) {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const endpoint = {
       app, client,
+      // 多数用例逐步驱动模拟工作者，派发和处理类调用须立即返回；默认阻塞的行为单独测试，显式传 wait 时保留原值。
       raw(name, args = {}) {
-        return client.callTool({ name, arguments: args }, undefined, { timeout: 2500 });
+        const input = WAITING_TOOLS.has(name) && args.wait === undefined ? { ...args, wait: false } : args;
+        return client.callTool({ name, arguments: input }, undefined, { timeout: 2500 });
       },
       async call(name, args = {}) {
         const result = await this.raw(name, args);
@@ -301,9 +304,68 @@ test('team_dispatch 未打开团队时自动打开，team_wait 等到自动验�
   const result = await waiting;
   assert.equal(result.done, true);
   assert.deepEqual(Object.keys(result.workers[0]).sort(), ['attention', 'id', 'name', 'resultId', 'review', 'status', 'summary']);
-  assert.equal(result.workers[0].status, 'idle');
+  // verify 任务自动验收后直接回收进程，主控不必再 team_close。
+  assert.equal(result.workers[0].status, 'closed');
+  assert.equal(f.controllers[0].closeCalls, 1);
   assert.equal(result.workers[0].review.accepted, true);
   assert.equal((await endpoint.call('team_result', { workerId: '实现cc' })).hasMore, false);
+});
+
+test('team_dispatch 默认等到结果再返回，报告附带证据原文、耗时和轮数，一次调用完成委派', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 5000;
+  mkdirSync(path.join(f.cwd, 'src'));
+  writeFileSync(path.join(f.cwd, 'src', 'limit.go'), 'package gateway\n\nfunc limit() int {\n\treturn 429\n}\n');
+  const endpoint = await f.connect();
+  const call = endpoint.client.callTool({ name: 'team_dispatch', arguments: { workers: [
+    { name: '限流', cwd: f.cwd, prompt: '429 从哪里来' },
+  ] } }, undefined, { timeout: 5000 });
+  while (!f.controllers.length) await tick();
+  f.controllers[0].emit('result', { success: true, durationMs: 4200, numTurns: 6,
+    text: '429 由本地限流返回。证据：src/limit.go:4；src/missing.go:1 已不存在。' });
+  const response = await call;
+  assert.notEqual(response.isError, true, response.content?.[0]?.text);
+  const result = JSON.parse(response.content[0].text);
+  assert.equal(result.opened, true);
+  assert.equal(result.done, true);
+  assert.equal(typeof result.waitedMs, 'number');
+  const [worker] = result.workers;
+  assert.equal(worker.name, '限流cc');
+  assert.equal(worker.status, 'closed');
+  assert.equal(worker.review.accepted, true);
+  assert.match(worker.summary, /^429 由本地限流返回/);
+  assert.equal(worker.durationMs, 4200);
+  assert.equal(worker.turns, 6);
+  assert.deepEqual(worker.evidence, [
+    { ref: 'src/limit.go:4', file: 'src/limit.go', ok: true, lines: '2-5', text: '2| \n3| func limit() int {\n4| \treturn 429\n5| }' },
+    { ref: 'src/missing.go:1', ok: false, reason: '工作目录内找不到该文件' },
+  ]);
+  assert.match(result.next, /全部完成.*转述.*不必再打开文件/);
+  // 没有可等的工作者时补发一次最近一批结果（上次返回可能没送达），之后不再重复。
+  const repeated = await endpoint.call('team_wait');
+  assert.equal(repeated.repeated, true);
+  assert.deepEqual(repeated.workers.map(item => item.summary), [worker.summary]);
+  assert.deepEqual((await endpoint.call('team_wait')).workers, []);
+});
+
+test('阻塞派发等待超时如实返回并提示延长等待，结果随后由 team_wait 带回；wait: false 立即返回', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 1000;
+  const endpoint = await f.connect();
+  const timed = await endpoint.call('team_dispatch', { wait: true, workers: [{ name: '慢', cwd: f.cwd, prompt: '检查' }] });
+  assert.equal(timed.timedOut, true);
+  assert.equal(timed.done, false);
+  assert.equal(timed.workers[0].attention, false);
+  assert.match(timed.hint, /单次最多等待 1 秒.*tool_timeout_sec 设为 600/);
+  const quick = await endpoint.call('team_dispatch', { wait: false, workers: [{ name: '快', cwd: f.cwd, prompt: '检查' }] });
+  assert.deepEqual(quick.workers.map(worker => [worker.name, worker.status]), [['快cc', 'running']]);
+  assert.equal(quick.done, undefined);
+  f.controllers[0].emit('result', { success: true, text: '慢的结论' });
+  f.controllers[1].emit('result', { success: true, text: '快的结论' });
+  const waited = await endpoint.call('team_wait');
+  assert.equal(waited.done, true);
+  assert.equal(waited.hint, undefined);
+  assert.deepEqual(waited.workers.map(worker => worker.summary).sort(), ['快的结论', '慢的结论']);
 });
 
 test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回明确失败', async t => {
@@ -337,15 +399,20 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
   const { tools } = await endpoint.client.listTools();
   const instructions = endpoint.client.getInstructions();
   for (const alias of ['mct', 'ctm']) {
-    assert.ok(instructions.includes(`使用 ${alias}`));
+    assert.ok(instructions.includes(alias));
     for (const name of ['team_open', 'team_dispatch']) {
       assert.ok(tools.find(tool => tool.name === name).description.includes(alias));
     }
   }
-  assert.match(instructions, /不区分大小写/);
-  assert.match(instructions, /通过本 MCP 委派 Claude Code（CC）子 agent/);
-  assert.match(instructions, /team_dispatch.*team_wait/);
-  assert.match(instructions, /无需再次确认/);
+  // Codex 决定怎么用本服务时看前 512 个字符：触发方式和完整流程都要在里面。
+  const head = [...instructions].slice(0, 512).join('');
+  for (const rule of [/不区分大小写/, /通过本 MCP 委派 Claude Code（CC）子 agent/, /team_dispatch.*team_wait/, /主控不要先自己调查/,
+    /已派出的问题也不要再自己查/, /summary 开头直接转述给用户/, /不要再打开文件或重做调查/, /attention/, /next/, /无需再次确认/]) {
+    assert.match(head, rule);
+  }
+  for (const name of ['team_dispatch', 'team_wait']) {
+    assert.match(tools.find(tool => tool.name === name).description, /不要再打开文件或重做调查/);
+  }
   assert.doesNotMatch(instructions, /不要使用绕过权限模式/);
   assert.deepEqual(tools.map(tool => tool.name).sort(), [
     'team_open', 'team_dispatch', 'team_status', 'team_events', 'team_send', 'team_reply',
@@ -353,7 +420,22 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
     'team_wait', 'team_diff',
   ].sort());
   assert.match(instructions, /team_diff/);
-  assert.match(instructions, /没有 verify 时默认由主控验收/);
+  assert.match(instructions, /没有 verify 的 write 任务由主控验收/);
+  assert.match(instructions, /不知道时填 "auto"/);
+  assert.match(instructions, /范围重叠也并行，合并冲突由 MCP 发回原工作者解决/);
+  assert.match(instructions, /需要运行命令、查 git 历史或本地日志的调查用 access:"verify"/);
+  assert.match(instructions, /不要另派汇总工作者/);
+  assert.doesNotMatch(instructions, /只读汇总工作者/);
+  assert.match(instructions, /summary 即工作者报告全文/);
+  assert.match(instructions, /wait: false/);
+  assert.match(instructions, /team_send、team_reply、team_resume、team_review 处理后默认继续等待/);
+  assert.match(instructions, /scope 省略即整个 cwd/);
+  assert.match(instructions, /evidence/);
+  assert.match(instructions, /不写 prompt、只填 access: "verify"、verify 命令和 dependsOn 全部写任务的命令任务/);
+  assert.doesNotMatch(instructions, /几次搜索就能回答的窄问题，主控先自行定位/);
+  for (const name of ['team_dispatch', 'team_send', 'team_reply', 'team_resume', 'team_review']) {
+    assert.equal(tools.find(tool => tool.name === name).inputSchema.properties.wait.default, true);
+  }
   for (const name of ['team_status', 'team_events', 'team_request', 'team_wait', 'team_diff']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
   }
@@ -599,30 +681,34 @@ test('错误 teamId 不切换已打开团队，独立团队锁互不干扰', asy
   assert.equal(restored.workers[0].status, 'closed');
 });
 
-test('含cc尾缀的完整名字限制 24 字符，规范化后的重名在启动前整批拒绝', async t => {
+test('含cc尾缀的完整名字超过 24 字符时截短，同批重名整批拒绝，与已有工作者重名时自动改名', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
   await endpoint.call('team_open', { teamId: 'named-team', notifications: false });
-  for (const name of ['一二三四五六七八九十一二三四五六七八九十一二三', '  ', 'cc', 'CC', '接口\n开发']) {
+  for (const name of ['  ', 'cc', 'CC', '接口\n开发']) {
     assert.equal((await endpoint.raw('team_dispatch', { workers: [f.spec(name)] })).isError, true);
   }
   const duplicated = await endpoint.raw('team_dispatch', { workers: [f.spec('接口开发cc'), f.spec(' 接口开发 ')] });
   assert.equal(duplicated.isError, true);
-  assert.match(duplicated.content[0].text, /名字.*已存在/);
+  assert.match(duplicated.content[0].text, /同一批次中名字.*已存在/);
   assert.equal(f.controllers.length, 0);
   assert.deepEqual((await endpoint.call('team_status')).workers, []);
 
   const { workers: [worker] } = await endpoint.call('team_dispatch', { workers: [f.spec(' 接口开发 ')] });
   assert.equal(worker.name, '接口开发cc');
   await endpoint.call('team_close', { workerIds: ['接口开发cc'] });
-  const reused = await endpoint.raw('team_dispatch', { workers: [f.spec('页面布局'), f.spec('接口开发cc')] });
-  assert.equal(reused.isError, true);
-  assert.equal(f.controllers.length, 1);
-  assert.equal((await endpoint.call('team_status')).workers.length, 1);
+  // 重名不再整批打回：页面布局照常启动，同名的新任务改名后启动，并告知实际名字。
+  const reused = await endpoint.call('team_dispatch', { workers: [f.spec('页面布局'), f.spec('接口开发cc')] });
+  assert.deepEqual(reused.workers.map(item => item.name), ['页面布局cc', '接口开发2cc']);
+  assert.ok(reused.warnings.some(warning => /接口开发cc.*已被占用.*接口开发2cc/.test(warning)));
+  assert.equal(f.controllers.length, 3);
 
   const longest = '𠮷'.repeat(22) + 'cc';
   assert.equal((await endpoint.call('team_dispatch', { workers: [f.spec(longest)] })).workers[0].name, longest);
-  assert.equal((await endpoint.raw('team_dispatch', { workers: [f.spec(`${longest}一`)] })).isError, true);
+  const truncated = await endpoint.call('team_dispatch', { workers: [f.spec('一二三四五六七八九十一二三四五六七八九十一二三')] });
+  assert.equal(truncated.workers[0].name, '一二三四五六七八九十一二三四五六七八九十一二cc');
+  const renamed = await endpoint.call('team_dispatch', { workers: [f.spec(`${longest}一`)] });
+  assert.equal(renamed.workers[0].name, `${'𠮷'.repeat(21)}2cc`);
   assert.equal((await endpoint.call('team_dispatch', { workers: [f.spec('migration')] })).workers[0].name, 'migrationcc');
 });
 
@@ -691,7 +777,7 @@ test('按名字完成查看、追加、事件筛选、验收、关闭及重开�
   assert((await endpoint.call('team_events', { workerIds: ['接口开发cc'] })).events.every(event => event.workerId === worker.id));
 });
 
-test('未填 review 时按是否有 verify 决定验收方式，team_open 和说明列出可用 provider', async t => {
+test('未填 review 时 read/verify 任务自动验收，team_open 和说明列出可用 provider', async t => {
   const f = await fixture(t);
   f.config.providers = { deepseek: { env: {}, envFrom: {}, model: 'ds-model' } };
   f.config.defaultProvider = 'deepseek';
@@ -705,10 +791,100 @@ test('未填 review 时按是否有 verify 决定验收方式，team_open 和说
   ] });
   const status = await endpoint.call('team_status');
   assert.deepEqual(status.workers.map(worker => [worker.review, worker.provider, worker.model]),
-    [['codex', 'deepseek', 'ds-model'], ['auto', 'deepseek', 'ds-model']]);
+    [['auto', 'deepseek', 'ds-model'], ['auto', 'deepseek', 'ds-model']]);
   const unknown = await endpoint.raw('team_dispatch', { workers: [{ name: '丙', cwd: f.cwd, prompt: 'x', provider: 'other' }] });
   assert.equal(unknown.isError, true);
   const diff = await endpoint.raw('team_diff', { workerId: '甲cc' });
   assert.equal(diff.isError, true);
   assert.match(diff.content[0].text, /只有 worktree 隔离/);
+});
+
+test('命令任务可省略 prompt，其他任务缺少 prompt 时拒绝；team_status 汇总主控调用节奏', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  const missing = await endpoint.raw('team_dispatch', { workers: [{ name: '查', cwd: f.cwd }] });
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0].text, /缺少 prompt/);
+  const dispatched = await endpoint.call('team_dispatch', { workers: [
+    { name: '测试', cwd: f.cwd, access: 'verify', verify: `"${process.execPath}" -e "0"` },
+  ], wait: true });
+  assert.equal(dispatched.done, true);
+  assert.match(dispatched.workers[0].summary, /^命令通过/);
+  assert.equal(f.controllers.length, 0);
+  await endpoint.call('team_status');
+  // 每次调用在返回后才记入，第二次查询能看到派发和第一次查询。
+  const status = await endpoint.call('team_status');
+  assert.equal(status.timing.mcpCalls.count, 2);
+  assert.equal(status.timing.codex.turns, status.timing.mcpCalls.count - 1, '除首个调用外，每次调用前的空档都计入主控');
+  assert.equal(status.workers[0].command, `"${process.execPath}" -e "0"`);
+});
+
+test('客户端超时放弃的 team_wait 不吞掉报告，下一次 team_wait 照常带回', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 5000;
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'abandoned-wait', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [{ name: '诊断', cwd: f.cwd, prompt: '查 429' }] });
+  // 模拟 Codex 的工具超时短于服务端等待：客户端先放弃这次调用。
+  await assert.rejects(endpoint.client.callTool({ name: 'team_wait', arguments: {} }, undefined, { timeout: 200 }));
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '结论：上游 429 透传', messageId: controller.sent[0].messageId });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  const again = await endpoint.call('team_wait');
+  assert.equal(again.done, true);
+  assert.deepEqual(again.workers.map(worker => worker.summary), ['结论：上游 429 透传']);
+});
+
+test('team_send、team_reply、team_review、team_resume 默认处理后继续等待，省去单独的 team_wait', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 5000;
+  const endpoint = await f.connect();
+  await endpoint.call('team_open', { teamId: 'act-then-wait', notifications: false });
+  await endpoint.call('team_dispatch', { workers: [f.spec('实现'), f.spec('验证', { dependsOn: ['实现cc'] })] });
+  const [implement] = f.controllers;
+  const finish = (controller, text) => setTimeout(() => controller.emit('result', { success: true, text,
+    messageIds: controller.sent.map(message => message.messageId) }), 50);
+
+  finish(implement, '实现完成');
+  const sent = await endpoint.client.callTool({ name: 'team_send', arguments: { workerId: '实现cc', message: '补上边界检查' } }, undefined, { timeout: 4000 });
+  const afterSend = JSON.parse(sent.content[0].text);
+  assert.equal(afterSend.name, '实现cc');
+  assert.equal(afterSend.status, undefined, '回执不带随等待过期的状态');
+  assert.match(afterSend.next, /实现cc 待验收/);
+  const reviewed = afterSend.workers.find(worker => worker.name === '实现cc');
+
+  const question = new Promise(resolve => setTimeout(() => resolve(f.controllers[1].request('question', { questions: [{ question: '要覆盖哪些场景？' }] })), 50));
+  const review = JSON.parse((await endpoint.client.callTool({ name: 'team_review', arguments: {
+    workerId: '实现cc', resultId: reviewed.resultId, accepted: true, note: '已核对' } }, undefined, { timeout: 4000 })).content[0].text);
+  assert.equal(review.accepted, true);
+  const asking = review.workers.find(worker => worker.name === '验证cc');
+  assert.equal(asking.status, 'needs_input');
+  assert.match(review.next, /验证cc 在等回答/);
+
+  setTimeout(() => question.then(() => finish(f.controllers[1], '验证完成')), 20);
+  const replied = JSON.parse((await endpoint.client.callTool({ name: 'team_reply', arguments: {
+    requestId: asking.requests[0].id, text: '全部场景' } }, undefined, { timeout: 4000 })).content[0].text);
+  assert.equal(replied.answered, true);
+  assert.equal(replied.workers.find(worker => worker.name === '验证cc').status, 'awaiting_review');
+
+  f.controllers[1].emit('session', { sessionId: randomUUID() });
+  await endpoint.call('team_close', { workerIds: ['验证cc'] });
+  const resumedController = () => f.controllers.at(-1);
+  setTimeout(() => finish(resumedController(), '补充完成'), 100);
+  const resumed = JSON.parse((await endpoint.client.callTool({ name: 'team_resume', arguments: {
+    workerId: '验证cc', message: '再看一遍' } }, undefined, { timeout: 4000 })).content[0].text);
+  assert.ok(resumed.messageId);
+  assert.equal(resumed.workers.find(worker => worker.name === '验证cc').summary, '补充完成');
+});
+
+test('读取过完整结果即视为已送达，没有可等的工作者时不再补发', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 5000;
+  const endpoint = await f.connect();
+  const call = endpoint.client.callTool({ name: 'team_dispatch', arguments: { workers: [{ name: '查', cwd: f.cwd, prompt: '查' }] } }, undefined, { timeout: 4000 });
+  while (!f.controllers.length) await tick();
+  f.controllers[0].emit('result', { success: true, text: '结论' });
+  assert.equal(JSON.parse((await call).content[0].text).done, true);
+  await endpoint.call('team_result', { workerId: '查cc' });
+  assert.deepEqual((await endpoint.call('team_wait')).workers, []);
 });

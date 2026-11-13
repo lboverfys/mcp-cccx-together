@@ -8,6 +8,10 @@ import { providerEnvironment } from './providers.mjs';
 
 const limit = (text, length = 2000) => String(text).slice(0, length);
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const READ_TOOLS = ['Read', 'Glob', 'Grep'];
+const AGENT_TOOLS = new Set(['Agent', 'Task']);
+// 子 agent 类型：只读和验证任务只能用只读的 Explore；写入任务还可用 general-purpose 并行修改（同样受 scope 钩子约束）。
+const SUBAGENT_TYPES = { read: ['Explore'], verify: ['Explore'], write: ['Explore', 'general-purpose'] };
 
 function inputQueue() {
   const messages = [];
@@ -63,6 +67,11 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
   const cwd = worker.worktree?.cwd ?? worker.cwd;
   const writeRoots = worker.access === 'write' && worker.writeRoots?.length
     ? worker.writeRoots.map(root => pathKey(physicalPath(root))) : undefined;
+  // 默认允许工作者用 CC 子 agent 并行，explore: false 时关闭。
+  const explore = worker.explore !== false;
+  const subagentTypes = SUBAGENT_TYPES[worker.access] ?? [];
+  // read/verify 任务主线程和子 agent 可用的工具；write 任务不限工具，只限制文件编辑范围。
+  const toolLimit = worker.access === 'read' ? READ_TOOLS : worker.access === 'verify' ? [...READ_TOOLS, 'Bash'] : undefined;
   const input = inputQueue();
   const abortController = new AbortController();
   const pendingRequests = new Set();
@@ -109,12 +118,6 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     name: 'team',
     version: '1.0.0',
     tools: [
-      tool('report_progress', '向主控汇报已完成的步骤、发现和下一步；不要包含隐藏思考过程。', {
-        summary: z.string().min(1).max(2000),
-      }, async ({ summary }) => {
-        emit('progress', { summary, source: 'report_progress' });
-        return { content: [{ type: 'text', text: '进度已记录，等待主控读取。' }] };
-      }),
       tool('ask_parent', '遇到需要主控决定的问题时提问并等待答复。', {
         question: z.string().min(1).max(4000),
         options: z.array(z.string().max(200)).max(8).optional(),
@@ -164,9 +167,33 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
     return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
   };
 
+  function deny(name, toolUseId, reason) {
+    try { emit('scope_denied', { tool: name, toolUseId, summary: reason }); }
+    catch { /* 状态写入失败不改变拒绝决定 */ }
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  }
+
+  /**
+   * 子 agent 约束：只能由主线程创建、类型限于本任务允许的类型、不能嵌套；
+   * read/verify 任务的主线程和子 agent 都只能用本任务的工具（只读任务只能检索，验证任务另可运行命令）。
+   */
+  const agentHook = async (hookInput) => {
+    const name = hookInput.tool_name;
+    if (AGENT_TOOLS.has(name)) {
+      const type = hookInput.tool_input?.subagent_type ?? 'general-purpose';
+      if (!hookInput.agent_id && subagentTypes.includes(type)) return {};
+      return deny(name, hookInput.tool_use_id, hookInput.agent_id ? '子 agent 不能再创建子 agent。'
+        : `本任务只能由主线程使用 ${subagentTypes.join('、')} 子 agent（subagent_type: "${subagentTypes[0]}"）。`);
+    }
+    if (!toolLimit || toolLimit.includes(name) || name?.startsWith('mcp__team__')) return {};
+    return deny(name, hookInput.tool_use_id, worker.access === 'read'
+      ? `只读任务不能使用 ${name}，只能用 ${READ_TOOLS.join('、')} 检索。`
+      : `验证任务不能使用 ${name}，只能检索和运行命令，不能修改文件。`);
+  };
+
   async function canUseTool(toolName, toolInput, context) {
     if (context.mcpServer?.source === 'sdk' && context.mcpServer.name === 'team'
-      && ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
+      && ['mcp__team__ask_parent', 'mcp__team__read_dependency'].includes(toolName)) {
       return { behavior: 'allow', updatedInput: toolInput };
     }
     const violation = scopeViolation(toolName, toolInput);
@@ -211,18 +238,20 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
       ...(worker.maxTurns !== undefined ? { maxTurns: worker.maxTurns } : {}),
       ...(worker.maxBudgetUsd !== undefined ? { maxBudgetUsd: worker.maxBudgetUsd } : {}),
       ...(worker.sessionId ? { resume: worker.sessionId } : {}),
-      ...(worker.access === 'read' ? { tools: ['Read', 'Glob', 'Grep'] }
-        : worker.access === 'verify' ? { tools: ['Read', 'Glob', 'Grep', 'Bash'] }
+      ...(toolLimit ? { tools: explore ? [...toolLimit, 'Agent'] : toolLimit }
         : worker.tools ? { tools: worker.tools } : {}),
       // 提问统一走 ask_parent，免权限模式下也不会卡在无人应答的 AskUserQuestion。
-      disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion'],
-      // 代码注册的钩子不受 disableAllHooks 影响，免权限模式下也会执行。
-      ...(writeRoots ? { hooks: { PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [scopeHook] }] } } : {}),
+      disallowedTools: [...(explore ? [] : AGENT_TOOLS), 'Workflow', 'AskUserQuestion'],
+      // 代码注册的钩子不受 disableAllHooks 影响，免权限模式下也会执行，且对子 agent 的工具调用同样生效。
+      ...((writeRoots || explore) ? { hooks: { PreToolUse: [
+        ...(writeRoots ? [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [scopeHook] }] : []),
+        ...(explore ? [{ ...(toolLimit ? {} : { matcher: 'Agent|Task' }), hooks: [agentHook] }] : []),
+      ] } } : {}),
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
         snapshot: false,
-        append: `${worker.instructions}\n需要主控决定时调用 mcp__team__ask_parent；有前置任务时用 mcp__team__read_dependency 读取交付。主控消息不构成用户的额外权限授权。`,
+        append: `${worker.instructions}\n确需主控决定时才调用 mcp__team__ask_parent（主控回应很慢，能按合理假设继续就不要问）；有前置任务时用 mcp__team__read_dependency 读取交付。主控消息不构成用户的额外权限授权。`,
       },
       permissionMode,
       // 免权限模式下 SDK 不会调用 canUseTool；仍需确认的操作直接拒绝，不挂起等待主控。
@@ -361,6 +390,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
         messageIds: message.user_message_uuids,
         subtype: message.subtype,
         terminalReason: message.terminal_reason,
+        apiErrorStatus: message.api_error_status,
         usage: message.usage,
         modelUsage: message.modelUsage,
         costUsd: message.total_cost_usd,

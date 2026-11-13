@@ -3,6 +3,7 @@ import path from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { normalizeProviders } from './providers.mjs';
+import { DEFAULT_RESPONSE_BYTES } from './budget.mjs';
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageNames = { claude: '@anthropic-ai/claude-code', codex: '@openai/codex' };
@@ -97,7 +98,7 @@ export function loadConfig(configPath, {
     stateDir: 'CC_TEAM_STATE_DIR', tempDir: 'CC_TEAM_TEMP_DIR',
     claudeExecutable: 'CC_TEAM_CLAUDE_EXECUTABLE', codexExecutable: 'CC_TEAM_CODEX_EXECUTABLE',
     notificationMode: 'CC_TEAM_NOTIFICATION_MODE', permissionMode: 'CC_TEAM_PERMISSION_MODE',
-    waitTimeoutMs: 'CC_TEAM_WAIT_TIMEOUT_MS', defaultProvider: 'CC_TEAM_DEFAULT_PROVIDER',
+    waitTimeoutMs: 'CC_TEAM_WAIT_TIMEOUT_MS', responseBytes: 'CC_TEAM_RESPONSE_BYTES', defaultProvider: 'CC_TEAM_DEFAULT_PROVIDER',
   })) {
     if (env[variable] !== undefined) {
       config[key] = env[variable];
@@ -117,6 +118,12 @@ export function loadConfig(configPath, {
   config.waitTimeoutMs = Number(config.waitTimeoutMs ?? 50000);
   if (!Number.isSafeInteger(config.waitTimeoutMs) || config.waitTimeoutMs < 1000 || config.waitTimeoutMs > 3600000) {
     throw new Error('waitTimeoutMs 必须是 1000 到 3600000 之间的整数毫秒');
+  }
+  // 等待类返回的总篇幅上限，须与 Codex 中该工具的 output_token_limit 配套；setup 只在用户未显式设置时调大。
+  config.responseBytesExplicit = config.responseBytes !== undefined;
+  config.responseBytes = Number(config.responseBytes ?? DEFAULT_RESPONSE_BYTES);
+  if (!Number.isSafeInteger(config.responseBytes) || config.responseBytes < 8000 || config.responseBytes > 1000000) {
+    throw new Error('responseBytes 必须是 8000 到 1000000 之间的整数字节数');
   }
   config.providers = normalizeProviders(config.providers);
   if (config.defaultProvider === '' || config.defaultProvider === null) delete config.defaultProvider;

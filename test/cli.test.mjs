@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { mcpConfiguration, runCli } from '../src/cli.mjs';
+import { inspectCodexServer } from '../src/codex-config.mjs';
 import { loadConfig } from '../src/config.mjs';
 
 function harness(overrides = {}) {
@@ -184,10 +185,15 @@ function fakeCodex(directory) {
   const codexHome = path.join(directory, 'codex home');
   mkdirSync(codexHome);
   // 模拟 codex mcp add 写出的表结构；FAKE_CODEX_SKIP_CONFIG 模拟无法定位配置表。
-  writeFileSync(script, `import {appendFileSync, writeFileSync} from 'node:fs';
+  writeFileSync(script, `import {appendFileSync, readFileSync, writeFileSync} from 'node:fs';
 import path from 'node:path';
 const args = process.argv.slice(2);
-if (args[0] === 'mcp' && args[1] === 'get') { process.stderr.write("Error: No MCP server named '" + args[2] + "' found.\\n"); process.exit(1); }
+if (args[0] === 'mcp' && args[1] === 'get') {
+  let text = '';
+  try { text = readFileSync(path.join(process.env.CODEX_HOME, 'config.toml'), 'utf8'); } catch {}
+  if (process.env.FAKE_CODEX_REJECT_CONFIG && text.includes('output_token_limit')) { process.stderr.write('Error: unknown field output_token_limit\\n'); process.exit(1); }
+  process.stderr.write("Error: No MCP server named '" + args[2] + "' found.\\n"); process.exit(1);
+}
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
 if (args[0] === 'mcp' && args[1] === 'add' && !process.env.FAKE_CODEX_SKIP_CONFIG) {
   writeFileSync(path.join(process.env.CODEX_HOME, 'config.toml'), 'model = "gpt"\\n\\n[mcp_servers.' + args[2] + ']\\ncommand = "node"\\nargs = ["cli.mjs"]\\n\\n[mcp_servers.' + args[2] + '.env]\\nA = "1"\\n');
@@ -209,13 +215,38 @@ test('setup 用实际子进程注册并同步长等待与工具超时，不修�
   assert.equal(codex.calls().length, 1);
   assert.deepEqual(args.slice(0, 3), ['mcp', 'add', 'cc_custom']);
   assert.deepEqual(args.slice(args.indexOf('--') + 1), [process.execPath, entryPath, 'serve', '--config', h.config.configPath]);
-  assert.deepEqual(args.slice(3, args.indexOf('--')), ['--env', 'CC_TEAM_WAIT_TIMEOUT_MS=570000']);
+  assert.deepEqual(args.slice(3, args.indexOf('--')), ['--env', 'CC_TEAM_WAIT_TIMEOUT_MS=570000', '--env', 'CC_TEAM_RESPONSE_BYTES=96000']);
   const toml = readFileSync(codex.configFile, 'utf8');
-  assert.match(toml, /\[mcp_servers\.cc_custom\]\ntool_timeout_sec = 600\ncommand = "node"/);
+  // 工具直接进入初始工具列表（不必先 tool_search），等待类工具的输出预算与返回篇幅配套。
+  assert.match(toml, /\[mcp_servers\.cc_custom\]\ntool_timeout_sec = 600\nomit_tools_from = \["deferred"\]\ntools\.team_dispatch\.output_token_limit = 40000\n/);
+  for (const tool of ['team_wait', 'team_send', 'team_reply', 'team_resume', 'team_review', 'team_result', 'team_diff', 'team_status']) {
+    assert.match(toml, new RegExp(`\\ntools\\.${tool}\\.output_token_limit = 40000\\n`));
+  }
+  assert.match(toml, /output_token_limit = 40000\ncommand = "node"/);
   assert.match(toml, /\[mcp_servers\.cc_custom\.env\]\nA = "1"/);
   assert.doesNotMatch(toml, /env_vars/);
   assert.match(h.stdout, /已注册 MCP/);
   assert.match(h.stdout, /tool_timeout_sec = 600/);
+  assert.match(h.stdout, /omit_tools_from = \["deferred"\]/);
+  assert.match(h.stdout, /output_token_limit = 40000/);
+  const inspected = inspectCodexServer(codex.configFile, 'cc_custom');
+  assert.deepEqual(inspected.omitToolsFrom, ['deferred']);
+  assert.equal(inspected.outputTokenLimits.team_wait, 40000);
+});
+
+test('setup 写入后 Codex 无法读取配置时还原文件并退回默认等待', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-cli-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const codex = fakeCodex(directory);
+  const h = harness({ codexExecutable: codex.script, configPath: path.join(directory, 'config.json'), waitTimeoutMs: 50000 });
+  const env = { ...process.env, CODEX_HOME: codex.codexHome, FAKE_CODEX_REJECT_CONFIG: '1' };
+  assert.equal(await runCli(['setup'], { ...h.options, env, home: directory }), 0, h.stderr);
+  const calls = codex.calls();
+  assert.deepEqual(calls.map(call => call.slice(0, 3)), [['mcp', 'add', 'cc_team'], ['mcp', 'remove', 'cc_team'], ['mcp', 'add', 'cc_team']]);
+  assert(calls[2].includes('CC_TEAM_WAIT_TIMEOUT_MS=50000'));
+  assert(calls[2].includes('CC_TEAM_RESPONSE_BYTES=40000'));
+  assert.doesNotMatch(readFileSync(codex.configFile, 'utf8'), /omit_tools_from|output_token_limit|tool_timeout_sec/);
+  assert.match(h.stdout, /Codex 无法读取写入后的配置，已还原/);
 });
 
 test('setup 保留显式等待并转发 provider 凭据变量', async t => {
@@ -249,4 +280,46 @@ test('setup 无法写入工具超时时退回默认等待，避免 team_wait 超
   assert.equal(existsSync(codex.configFile), false);
   assert.match(h.stdout, /未能写入/);
   assert.match(h.stdout, /50000 毫秒/);
+});
+
+test('doctor 检查 Codex 中本服务的等待设置，等待过短时给出可选提示', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-codex-home-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'config.toml');
+  const run = async () => {
+    const h = harness({ codexExecutable: undefined });
+    const code = await runCli(['doctor'], { ...h.options, env: { CODEX_HOME: directory }, executeImpl: async () => ({ stdout: '1.0.0\n', stderr: '' }) });
+    return { code, check: JSON.parse(h.stdout).checks.codexWait };
+  };
+  let { code, check } = await run();
+  assert.equal(code, 0, '等待设置只影响速度，不判定环境失败');
+  assert.equal(check.optional, true);
+  assert.match(check.hint, /未在 Codex 配置中找到 \[mcp_servers\.cc_team\]/);
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\n\n[mcp_servers.cc_team.env]\nCC_TEAM_STATE_DIR = "/x"\n');
+  ({ check } = await run());
+  assert.deepEqual([check.ok, check.toolTimeoutSec, check.waitTimeoutMs], [false, 60, 50000]);
+  assert.match(check.hint, /tool_timeout_sec = 600/);
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\ntool_timeout_sec = 600\n\n[mcp_servers.cc_team.env]\nCC_TEAM_WAIT_TIMEOUT_MS = "570000"\n\n[mcp_servers.other]\ntool_timeout_sec = 1\n');
+  ({ check } = await run());
+  assert.deepEqual([check.ok, check.toolTimeoutSec, check.waitTimeoutMs, check.hint], [true, 600, 570000, undefined]);
+});
+
+test('doctor 检查本服务的工具是否直接可见及输出预算，缺少时给出可选提示', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-codex-home-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'config.toml');
+  const run = async () => {
+    const h = harness({ codexExecutable: undefined });
+    const code = await runCli(['doctor'], { ...h.options, env: { CODEX_HOME: directory }, executeImpl: async () => ({ stdout: '1.0.0\n', stderr: '' }) });
+    return { code, check: JSON.parse(h.stdout).checks.codexTools };
+  };
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\n');
+  let { code, check } = await run();
+  assert.equal(code, 0, '只影响速度，不判定环境失败');
+  assert.deepEqual([check.ok, check.optional], [false, true]);
+  assert.match(check.hint, /omit_tools_from = \["deferred"\].*tool_search/);
+  assert.match(check.hint, /team_dispatch、team_wait.*output_token_limit/);
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\nomit_tools_from = ["deferred"]\ntools.team_dispatch.output_token_limit = 40000\ntools.team_wait.output_token_limit = 40000\n');
+  ({ check } = await run());
+  assert.deepEqual([check.ok, check.hint, check.omitToolsFrom], [true, undefined, ['deferred']]);
 });

@@ -6,29 +6,36 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { executableCommand, loadConfig, projectRoot } from './config.mjs';
-import { codexConfigPath, updateCodexServer } from './codex-config.mjs';
+import { codexConfigPath, inspectCodexServer, updateCodexServer } from './codex-config.mjs';
 import { providerSourceVariables } from './providers.mjs';
+import { DEFAULT_RESPONSE_BYTES } from './budget.mjs';
 
 const execute = promisify(execFile);
 const DEFAULT_WAIT_MS = 50000;
 // setup 默认让 team_wait 单次最多等 9.5 分钟，Codex 工具超时同步设为 10 分钟。
 const LONG_WAIT_MS = 570000;
+// setup 同时放宽等待类返回的篇幅，并为这些工具设置配套的 Codex 输出预算，多个工作者的报告不被截断。
+const LONG_RESPONSE_BYTES = 96000;
+const LARGE_OUTPUT_TOOLS = ['team_dispatch', 'team_wait', 'team_send', 'team_reply', 'team_resume', 'team_review', 'team_result', 'team_diff', 'team_status'];
+// 按最坏情况（中文）每 2.4 字节约 1 个 token 估算，留出余量。
+const outputTokenLimit = responseBytes => Math.max(40000, Math.ceil(responseBytes / 2.4));
 const cliPath = fileURLToPath(import.meta.url);
 const help = `CC Team MCP — Codex 协调本机 Claude Code
 
-用法：cc-team-mcp [serve|doctor|print-config|setup|prune|recover] [选项]
+用法：cc-team-mcp [serve|doctor|print-config|setup|stats|prune|recover] [选项]
 
   serve         启动标准输入/输出 MCP 服务（默认命令）
   doctor        检查客户端、运行时及目录权限；不调用模型、不创建目录
   print-config  输出通用 MCP JSON 配置
   setup         使用 codex mcp add 注册服务，并设置长等待和工具超时；保留已有同名配置
+  stats         汇总团队耗时：主控（Codex）在调用之间的时间、CC 运行、验证与合并时间
   prune         预览已关闭团队的历史结果清理，保护仍被引用的版本
   recover       预览异常退出团队的锁及日志尾行恢复，拒绝未完成收尾的任务
-  --team ID     prune/recover 的团队 ID
+  --team ID     stats/prune/recover 的团队 ID
   --keep-results N  prune 每名工作者至少保留最近 N 份结果（必填）
   --apply       prune/recover 实际执行；省略时仅预览
   --config PATH 指定 JSON 配置文件
-  --name NAME   MCP 注册名称（默认 cc_team；setup/print-config）
+  --name NAME   MCP 注册名称（默认 cc_team；setup/print-config/doctor）
   --help        显示帮助
   --version     显示版本
 
@@ -49,7 +56,7 @@ function parseArgs(args) {
       continue;
     }
     if (arg === '--apply') { options.apply = true; continue; }
-    if (['serve', 'doctor', 'print-config', 'setup', 'prune', 'recover'].includes(arg) && !commandSeen) {
+    if (['serve', 'doctor', 'print-config', 'setup', 'stats', 'prune', 'recover'].includes(arg) && !commandSeen) {
       options.command = arg;
       commandSeen = true;
       continue;
@@ -57,10 +64,12 @@ function parseArgs(args) {
     throw new Error(`未知参数：${arg}；使用 --help 查看用法`);
   }
   if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,79}$/.test(options.name)) throw new Error('--name 只能包含字母、数字、下划线和连字符，最多 80 字符');
-  if (options.name !== 'cc_team' && !['setup', 'print-config'].includes(options.command)) throw new Error('--name 仅适用于 setup 或 print-config');
+  if (options.name !== 'cc_team' && !['setup', 'print-config', 'doctor'].includes(options.command)) throw new Error('--name 仅适用于 setup、print-config 或 doctor');
   const maintenance = ['prune', 'recover'].includes(options.command);
-  if (maintenance && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(options.team ?? '')) throw new Error('维护命令需要有效的 --team ID');
-  if (!maintenance && (options.team !== undefined || options.apply)) throw new Error('--team/--apply 仅适用于 prune 或 recover');
+  const teamCommand = maintenance || options.command === 'stats';
+  if (teamCommand && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(options.team ?? '')) throw new Error(`${options.command} 需要有效的 --team ID`);
+  if (!teamCommand && options.team !== undefined) throw new Error('--team 仅适用于 stats、prune 或 recover');
+  if (!maintenance && options.apply) throw new Error('--apply 仅适用于 prune 或 recover');
   if (options.command === 'prune') {
     if (!/^[1-9][0-9]*$/.test(options['keep-results'] ?? '') || !Number.isSafeInteger(Number(options['keep-results']))) throw new Error('prune 需要正整数 --keep-results N');
   } else if (options['keep-results'] !== undefined) throw new Error('--keep-results 仅适用于 prune');
@@ -76,6 +85,7 @@ export function mcpConfiguration(config, name = 'cc_team', entryPath = cliPath) 
     CC_TEAM_NOTIFICATION_MODE: config.notificationMode,
     CC_TEAM_PERMISSION_MODE: config.permissionMode,
     CC_TEAM_WAIT_TIMEOUT_MS: String(config.waitTimeoutMs),
+    CC_TEAM_RESPONSE_BYTES: String(config.responseBytes ?? DEFAULT_RESPONSE_BYTES),
     ...(config.claudeExecutable ? { CC_TEAM_CLAUDE_EXECUTABLE: config.claudeExecutable } : {}),
     ...(config.codexExecutable ? { CC_TEAM_CODEX_EXECUTABLE: config.codexExecutable } : {}),
   };
@@ -98,6 +108,43 @@ function inspectDirectory(directory) {
   }
 }
 
+/**
+ * Codex 侧等待设置：team_wait 单次等待太短时，CC 运行期间主控要反复调用，每次都是一轮慢的主控回合。
+ * 只影响速度，不影响可用性，因此标为可选检查。
+ */
+function codexWaitCheck(file, name) {
+  let found;
+  try { found = inspectCodexServer(file, name); }
+  catch (error) { return { ok: false, optional: true, file, error: error.message }; }
+  if (!found.found) return { ok: false, optional: true, file, hint: `未在 Codex 配置中找到 [mcp_servers.${name}]；运行 cc-team-mcp setup 注册` };
+  const waitTimeoutMs = found.waitTimeoutMs ?? DEFAULT_WAIT_MS;
+  const toolTimeoutSec = found.toolTimeoutSec ?? 60;
+  const ok = waitTimeoutMs >= 120000 && toolTimeoutSec * 1000 > waitTimeoutMs;
+  return { ok, optional: true, file, toolTimeoutSec, waitTimeoutMs,
+    ...(ok ? {} : { hint: `team_wait 单次只等 ${Math.round(Math.min(waitTimeoutMs, toolTimeoutSec * 1000) / 1000)} 秒，CC 运行期间主控要多轮调用。` +
+      `在 [mcp_servers.${name}] 设置 tool_timeout_sec = 600，并把 env 中的 CC_TEAM_WAIT_TIMEOUT_MS 设为 "570000"` }) };
+}
+
+/**
+ * Codex 侧的工具暴露与输出预算：MCP 工具默认藏在 tool_search 之后，主控每个会话要多一轮才能看到 team_dispatch；
+ * 输出预算不足时多个工作者的报告会被截断。只影响速度，标为可选检查。
+ */
+function codexToolsCheck(file, name) {
+  let found;
+  try { found = inspectCodexServer(file, name); }
+  catch (error) { return { ok: false, optional: true, file, error: error.message }; }
+  if (!found.found) return { ok: false, optional: true, file, hint: `未在 Codex 配置中找到 [mcp_servers.${name}]；运行 cc-team-mcp setup 注册` };
+  const direct = (found.omitToolsFrom ?? []).includes('deferred');
+  const missing = ['team_dispatch', 'team_wait'].filter(tool => !found.outputTokenLimits[tool]);
+  const ok = direct && !missing.length;
+  return { ok, optional: true, file, omitToolsFrom: found.omitToolsFrom ?? [], outputTokenLimits: found.outputTokenLimits,
+    ...(found.responseBytes ? { responseBytes: found.responseBytes } : {}),
+    ...(ok ? {} : { hint: [
+      direct ? '' : `在 [mcp_servers.${name}] 加入 omit_tools_from = ["deferred"]，让工具直接进入 Codex 的初始工具列表，省掉每个会话一轮 tool_search`,
+      missing.length ? `在 [mcp_servers.${name}] 为 ${missing.join('、')} 加入 tools.<工具名>.output_token_limit = 40000，避免多个报告被 Codex 截断` : '',
+    ].filter(Boolean).join('；') }) };
+}
+
 export async function runCli(args = process.argv.slice(2), {
   stdout = process.stdout, stderr = process.stderr, executeImpl = execute,
   loadConfigImpl = loadConfig, runServerImpl, entryPath = cliPath, env = process.env, home = homedir(),
@@ -110,7 +157,13 @@ export async function runCli(args = process.argv.slice(2), {
       return 0;
     }
     const maintenance = ['prune', 'recover'].includes(options.command);
-    const config = loadConfigImpl(options.config, { requireClaude: !maintenance && options.command !== 'doctor', diagnostic: maintenance || options.command === 'doctor' });
+    const offline = maintenance || options.command === 'stats';
+    const config = loadConfigImpl(options.config, { requireClaude: !offline && options.command !== 'doctor', diagnostic: offline || options.command === 'doctor' });
+    if (options.command === 'stats') {
+      const { teamStats } = await import('./timing.mjs');
+      stdout.write(`${JSON.stringify(teamStats(config, options.team), null, 2)}\n`);
+      return 0;
+    }
     if (maintenance) {
       const { pruneTeam, recoverTeam } = await import('./maintenance.mjs');
       const result = options.command === 'prune'
@@ -148,6 +201,8 @@ export async function runCli(args = process.argv.slice(2), {
           checks.notifications = { ok: false, mode: 'codex-queue', error: `当前 Codex 不支持 queue 通知：${error.message}；可将 notificationMode 设置为 poll` };
         }
       }
+      checks.codexWait = codexWaitCheck(codexConfigPath(env, home), options.name);
+      checks.codexTools = codexToolsCheck(codexConfigPath(env, home), options.name);
       checks.stateDir = inspectDirectory(config.stateDir);
       checks.tempDir = inspectDirectory(config.tempDir);
       stdout.write(`${JSON.stringify({ checks, stateDir: config.stateDir, tempDir: config.tempDir,
@@ -167,34 +222,60 @@ export async function runCli(args = process.argv.slice(2), {
         if (!/No MCP server named .+ found\./i.test(`${error.stderr ?? ''}\n${error.stdout ?? ''}`)) throw error;
       }
       if (existing) throw new Error(`MCP 配置 ${options.name} 已存在。请使用 --name 选择其他名称，或先用 codex mcp remove ${options.name} 移除旧配置。`);
-      const register = async waitMs => {
+      const register = async (waitMs, responseBytes) => {
         const registration = mcpConfiguration(config, options.name, entryPath).mcpServers[options.name];
-        const envArgs = Object.entries({ ...registration.env, CC_TEAM_WAIT_TIMEOUT_MS: String(waitMs) })
+        const envArgs = Object.entries({ ...registration.env, CC_TEAM_WAIT_TIMEOUT_MS: String(waitMs), CC_TEAM_RESPONSE_BYTES: String(responseBytes) })
           .flatMap(([key, value]) => ['--env', `${key}=${value}`]);
         await call(config.codexExecutable, ['mcp', 'add', options.name, ...envArgs, '--', registration.command, ...registration.args]);
       };
-      // 等待上限必须低于 Codex 的工具超时：两者一起写入，写不进工具超时就退回默认等待。
+      // 等待上限必须低于 Codex 的工具超时，返回篇幅必须在工具输出预算之内：都随 Codex 配置一起写入，写不进就退回默认值。
       const waitMs = config.waitTimeoutExplicit ? config.waitTimeoutMs : LONG_WAIT_MS;
+      const defaultResponseBytes = config.responseBytes ?? DEFAULT_RESPONSE_BYTES;
+      const responseBytes = config.responseBytesExplicit ? defaultResponseBytes : LONG_RESPONSE_BYTES;
       const toolTimeoutSec = Math.ceil(waitMs / 1000) + 30;
+      const tokenLimit = outputTokenLimit(responseBytes);
       const forward = providerSourceVariables(config.providers);
       const configFile = codexConfigPath(env, home);
-      await register(waitMs);
+      await register(waitMs, responseBytes);
       let tuned;
-      try { tuned = updateCodexServer(configFile, options.name, { toolTimeoutSec, envVars: forward }); }
-      catch (error) {
+      try {
+        tuned = updateCodexServer(configFile, options.name, { toolTimeoutSec, envVars: forward, omitDeferred: true,
+          outputTokenLimits: Object.fromEntries(LARGE_OUTPUT_TOOLS.map(tool => [tool, tokenLimit])) });
+        // 确认 Codex 仍能读取改过的配置；读不了就写回原文件，按写入失败处理。
+        try { await call(config.codexExecutable, ['mcp', 'get', options.name, '--json']); }
+        catch (error) {
+          if (!/No MCP server named .+ found\./i.test(`${error.stderr ?? ''}\n${error.stdout ?? ''}`)) {
+            tuned.restore();
+            throw new Error(`Codex 无法读取写入后的配置，已还原：${String(error.stderr || error.message).trim().split('\n').slice(-3).join(' ')}`);
+          }
+        }
+      } catch (error) {
         let effectiveWait = waitMs;
-        if (waitMs > DEFAULT_WAIT_MS) {
+        if (waitMs > DEFAULT_WAIT_MS || responseBytes > defaultResponseBytes) {
           await call(config.codexExecutable, ['mcp', 'remove', options.name]);
-          await register(DEFAULT_WAIT_MS);
-          effectiveWait = DEFAULT_WAIT_MS;
+          effectiveWait = Math.min(waitMs, DEFAULT_WAIT_MS);
+          await register(effectiveWait, defaultResponseBytes);
         }
         stdout.write(`已注册 MCP：${options.name}，但未能写入 ${configFile}：${error.message}\n` +
           `team_wait 单次最多等待 ${effectiveWait} 毫秒。需要更长等待时，在 [mcp_servers.${options.name}] 中手动设置 tool_timeout_sec = 600 并把 CC_TEAM_WAIT_TIMEOUT_MS 改为 570000` +
+          `；并加入 omit_tools_from = ["deferred"] 让工具直接可见` +
           `${forward.length ? `；并添加 env_vars = [${forward.map(name => JSON.stringify(name)).join(', ')}] 转发 provider 凭据` : ''}。\n`);
         return 0;
       }
+      // 输出预算没写进去时，返回篇幅也退回默认值，避免超出 Codex 的默认截断预算。
+      let effectiveBytes = responseBytes;
+      if (tuned.outputLimits !== 'set' && responseBytes > defaultResponseBytes) {
+        await call(config.codexExecutable, ['mcp', 'remove', options.name]);
+        await register(waitMs, defaultResponseBytes);
+        effectiveBytes = defaultResponseBytes;
+      }
       stdout.write(`已注册 MCP：${options.name}。请重新打开 Codex 会话后使用；可用 codex mcp get ${options.name} 查看配置。\n` +
         `已在 ${configFile} 设置 tool_timeout_sec = ${toolTimeoutSec}，team_wait 单次最多等待 ${waitMs} 毫秒。\n` +
+        (tuned.omitToolsFrom === 'set' ? '已设置 omit_tools_from = ["deferred"]：团队工具直接进入 Codex 的初始工具列表，不必先 tool_search。\n'
+          : tuned.omitToolsFrom === 'unmanaged' ? `现有 omit_tools_from 是多行数组，未自动修改；请手动加入 "deferred"。\n` : '') +
+        (tuned.outputLimits === 'set' ? `已为 ${LARGE_OUTPUT_TOOLS.length} 个工具设置 output_token_limit = ${tokenLimit}，单次返回最多 ${responseBytes} 字节。\n`
+          : tuned.outputLimits === 'unmanaged' ? `配置中已有 tools 表，未自动设置输出预算，单次返回保持 ${effectiveBytes} 字节；` +
+            `如需放宽，请为 team_wait、team_dispatch 等工具手动设置 output_token_limit = ${tokenLimit} 并把 CC_TEAM_RESPONSE_BYTES 改为 ${responseBytes}。\n` : '') +
         (tuned.forwarded.length ? `已转发 provider 所需环境变量：${tuned.forwarded.join(', ')}。\n` : '') +
         (tuned.unmanagedEnvVars ? `现有 env_vars 是多行数组，未自动修改；请手动加入：${forward.join(', ')}。\n` : ''));
       return 0;

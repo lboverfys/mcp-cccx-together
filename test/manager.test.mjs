@@ -57,7 +57,8 @@ async function fixture(t) {
     assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
     rmSync(dir, { recursive: true, force: true });
   });
-  const spec = (name, extra = {}) => ({ name, cwd, access: 'read', scope: ['.'], prompt: `执行 ${name}`, allowedTools: [], ...extra });
+  // 多数用例覆盖主控验收流程，默认显式交主控验收；需要默认值的用例传 review: undefined。
+  const spec = (name, extra = {}) => ({ name, cwd, access: 'read', scope: ['.'], prompt: `执行 ${name}`, allowedTools: [], review: 'codex', ...extra });
   return { dir, cwd, config, controllers, create, spec };
 }
 
@@ -127,10 +128,13 @@ test('批量保存失败不登记任务；提交后创建事件失败仍返回�
   manager.review(workers[0].id, true, '通过');
   assert.equal(f.controllers.length, 2);
   assert(f.controllers.every(controller => controller.sent.length === 1));
-  assert.throws(() => manager.dispatch([f.spec('B')]), /已存在/);
+  // 同名但任务不同（没有依赖）不是重试：自动改名后照常派发。
+  const renamed = [];
+  assert.equal(manager.dispatch([f.spec('B')], renamed)[0].name, 'B2');
+  assert.ok(renamed.some(warning => /名字“B”已被占用.*B2/.test(warning)));
   await manager.close();
   const reopened = await f.create();
-  assert.deepEqual(reopened.status().workers.map(worker => worker.id), workers.map(worker => worker.id));
+  assert.deepEqual(reopened.status().workers.map(worker => worker.id).slice(0, 2), workers.map(worker => worker.id));
 });
 
 test('批量提交后调度失败返回已保存警告，恢复调度只投递原批次一次', async t => {
@@ -376,7 +380,7 @@ test('旧记录的重名不猜测目标，长历史名字仍可准确定位且�
   assert.throws(() => reopened.get('历史同名'), /多个历史工作者.*ID/);
   assert.equal(reopened.get(a.id).data.id, a.id);
   assert.equal(reopened.get(oldName).data.id, c.id);
-  assert.throws(() => reopened.dispatch([f.spec('历史同名')]), /已存在/);
+  assert.equal(reopened.dispatch([f.spec('历史同名')])[0].name, '历史同名2');
   const history = await reopened.events({ workerIds: [oldName] });
   assert.equal(history.events.find(event => event.data.summary === '旧版未带名字的事件').workerName, oldName);
 });
@@ -1567,7 +1571,7 @@ fs.writeFileSync(path.join(temporary, 'verification.txt'), 'ok');
 `);
   const manager = await f.create();
   const [worker] = manager.dispatch([f.spec('验证', {
-    verify: `"${process.execPath}" "${script}" "${path.join(f.config.tempDir, 'test-team')}"`,
+    review: undefined, verify: `"${process.execPath}" "${script}" "${path.join(f.config.tempDir, 'test-team')}"`,
   })]);
   f.controllers[0].emit('result', { success: true, text: '完成' });
   const result = await manager.wait({ workerIds: [worker.id], timeoutMs: 10000 });
@@ -1699,27 +1703,120 @@ test('team_wait 报告两次等待之间进程已退出的工作者，不把它�
   assert.equal((await reopened.wait({ timeoutMs: 1000 })).workers.length, 0);
 });
 
-test('没有 verify 时默认交主控验收，write 任务不能无验证自动验收；非 git 目录写入退回共享工作区', async t => {
+test('read/verify 任务默认自动验收，没有 verify 的 write 任务交主控验收且不能自动验收；非 git 目录写入退回共享工作区', async t => {
   const f = await fixture(t);
   const manager = await f.create();
   const verify = `"${process.execPath}" -e "process.exit(0)"`;
   const warnings = [];
-  const [plain, verified, writer] = manager.dispatch([
-    f.spec('A'), f.spec('B', { verify }), f.spec('C', { access: 'write', scope: ['front'], verify }),
+  const [plain, checker, verified, writer, manual] = manager.dispatch([
+    f.spec('A', { review: undefined }), f.spec('V', { access: 'verify', review: undefined }), f.spec('B', { verify, review: undefined }),
+    f.spec('C', { access: 'write', scope: ['front'], verify, review: undefined }),
+    f.spec('W', { access: 'write', scope: ['back'], review: undefined }),
   ], warnings);
-  assert.equal(manager.get(plain.id).data.review, 'codex');
-  assert.equal(manager.get(verified.id).data.review, 'auto');
+  assert.deepEqual([plain, checker, verified, writer, manual].map(item => manager.get(item.id).data.review),
+    ['auto', 'auto', 'auto', 'auto', 'codex']);
   assert.equal(manager.get(writer.id).data.isolation, 'shared');
   assert.equal(manager.get(plain.id).data.isolation, 'shared');
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /不是 git 仓库/);
+  assert.equal(warnings.length, 2);
+  assert.ok(warnings.every(warning => /不是 git 仓库/.test(warning)));
   assert.throws(() => manager.dispatch([f.spec('D', { access: 'write', scope: ['back'], review: 'auto' })]), /必须提供 verify/);
+  assert.throws(() => manager.dispatch([f.spec('X', { access: 'read', prompt: undefined })]), /只有给出 verify 命令的 verify 任务可以省略 prompt/);
+  // verify: auto 识别不出命令时，写任务退回主控验收，命令任务直接拒绝。
+  const fallback = [];
+  const [guessed] = manager.dispatch([f.spec('Y', { access: 'write', scope: ['back'], verify: 'auto', review: undefined })], fallback);
+  assert.equal(manager.get(guessed.id).data.review, 'codex');
+  assert.equal(manager.get(guessed.id).data.verify, undefined);
+  assert.ok(fallback.some(warning => /未识别出测试命令，改由主控验收/.test(warning)));
+  assert.throws(() => manager.dispatch([f.spec('Z', { access: 'verify', verify: 'auto', prompt: undefined })]), /未识别出测试命令/);
   assert.throws(() => manager.dispatch([f.spec('E', { access: 'write', scope: ['back'], isolation: 'worktree' })]), /不在 git 仓库中/);
   assert.throws(() => manager.dispatch([f.spec('F', { isolation: 'worktree' })]), /只有 write 任务/);
   assert.throws(() => manager.dispatch([f.spec('G', { access: 'write', scope: ['back'], links: ['../x'] })]), /links 必须是 cwd 内/);
-  // 只读任务可以显式选择 auto，成功即放行。
-  const [explicit] = manager.dispatch([f.spec('H', { review: 'auto' })]);
-  assert.equal(manager.get(explicit.id).data.review, 'auto');
+  // 只读任务可以显式选择交主控验收。
+  const [explicit] = manager.dispatch([f.spec('H', { review: 'codex' })]);
+  assert.equal(manager.get(explicit.id).data.review, 'codex');
+});
+
+test('只读任务默认完成即验收并回收进程，team_wait 补报两次等待之间完成的结果且只报一次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A', { review: undefined }), f.spec('B', { review: undefined, dependsOn: ['A'] })]);
+  // A 在主控调用 team_wait 之前就已完成并被回收。
+  f.controllers[0].emit('result', { success: true, text: 'A 结论', sessionId: 'session-a' });
+  await until(() => manager.get(a.id).data.status === 'closed', '自动验收后应关闭只读工作者');
+  assert.equal(f.controllers[0].closeCalls, 1);
+  assert.equal(manager.get(a.id).data.lastReview.accepted, true);
+  assert.equal(manager.get(b.id).data.status, 'running');
+  const first = await manager.wait({ timeoutMs: 20 });
+  assert.equal(first.timedOut, true);
+  const reported = first.workers.find(worker => worker.id === a.id);
+  assert.equal(reported.summary, 'A 结论');
+  assert.equal(reported.attention, false);
+  assert.equal(first.workers.find(worker => worker.id === b.id).summary, undefined);
+  f.controllers[1].emit('result', { success: true, text: 'B 结论' });
+  const second = await manager.wait({ timeoutMs: 10000 });
+  assert.equal(second.done, true);
+  assert.deepEqual(second.workers.map(worker => [worker.name, worker.status, worker.summary]), [['B', 'closed', 'B 结论']]);
+  // 没有可等的工作者时补发一次最近一批结果，之后不再重复。
+  const repeated = await manager.wait({ timeoutMs: 1000 });
+  assert.equal(repeated.repeated, true);
+  assert.deepEqual(repeated.workers.map(worker => worker.summary), ['B 结论']);
+  assert.deepEqual((await manager.wait({ timeoutMs: 1000 })).workers, []);
+  // 追问已关闭的只读工作者时恢复原会话，新结果再报告一次。
+  manager.resume(a.id, '补充检查');
+  f.controllers[2].emit('result', { success: true, text: 'A 补充结论' });
+  const third = await manager.wait({ timeoutMs: 10000 });
+  assert.deepEqual(third.workers.map(worker => worker.summary), ['A 补充结论']);
+});
+
+test('team_wait 从完整交付补足被截断的报告，过长时标记 summaryTruncated', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [medium, long] = manager.dispatch([f.spec('中', { review: undefined }), f.spec('长', { review: undefined })]);
+  f.controllers[0].emit('result', { success: true, text: '中'.repeat(4000) });
+  f.controllers[1].emit('result', { success: true, text: '长'.repeat(7000) });
+  const result = await manager.wait({ workerIds: [medium.id, long.id], timeoutMs: 10000 });
+  const [first, second] = result.workers;
+  assert.equal(first.summary.length, 4000);
+  assert.equal(first.summaryTruncated, undefined);
+  assert.equal(second.summary.length, 6000);
+  assert.equal(second.summaryTruncated, true);
+});
+
+test('team_wait 的证据取自完整报告，引用在摘要截断位置之后也能读出；未停下的工作者不带证据', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.cwd, 'front', 'view.js'), 'one\ntwo\nthree\n');
+  const manager = await f.create();
+  const [long, running] = manager.dispatch([f.spec('长', { review: undefined }), f.spec('运行', { review: undefined })]);
+  f.controllers[0].emit('result', { success: true, text: `${'长'.repeat(2500)} 证据 front/view.js:2`, durationMs: 1500, numTurns: 3 });
+  const result = await manager.wait({ workerIds: [long.id, running.id], timeoutMs: 50 });
+  const [first, second] = result.workers;
+  assert.equal(first.summary.length, 2500 + ' 证据 front/view.js:2'.length);
+  assert.deepEqual(first.evidence, [{ ref: 'front/view.js:2', file: 'front/view.js', ok: true, lines: '1-3', text: '1| one\n2| two\n3| three' }]);
+  assert.deepEqual([first.durationMs, first.turns], [1500, 3]);
+  assert.deepEqual([second.summary, second.evidence, second.durationMs], [undefined, undefined, undefined]);
+});
+
+test('工作者说明要求结论先行的简短报告，默认允许子 agent，explore: false 时禁止', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader, explorer, writer] = manager.dispatch([
+    f.spec('读取', { explore: false }), f.spec('检索'), f.spec('写入', { access: 'write', scope: ['front'] }),
+  ]);
+  const text = id => manager.get(id).data.instructions;
+  assert.match(text(reader.id), /1500 字以内.*直接回答任务.*文件:行号/);
+  assert.match(text(reader.id), /已证实.*与推测分开写/);
+  assert.match(text(reader.id), /开头会被直接转述给用户/);
+  assert.match(text(reader.id), /MCP 会按行号读出原文给主控核对，行号必须准确/);
+  assert.match(text(reader.id), /不要自行再创建 agent/);
+  assert.doesNotMatch(text(reader.id), /修改的文件/);
+  assert.match(text(explorer.id), /subagent_type 只能是 Explore/);
+  assert.doesNotMatch(text(explorer.id), /不要自行再创建 agent/);
+  assert.equal(manager.status([explorer.id]).workers[0].explore, undefined);
+  assert.equal(manager.status([reader.id]).workers[0].explore, false);
+  assert.match(text(writer.id), /列出修改的文件、验证命令及结果和未完成项/);
+  assert.match(text(writer.id), /Explore 或 general-purpose/);
+  // 主控回应慢：工作者按合理假设继续，不轻易提问。
+  assert.match(text(reader.id), /按最合理的理解继续，并在报告里写明所作假设/);
 });
 
 test('provider 校验来源变量，默认 provider 生效，预算估算给出警告', async t => {
@@ -1753,4 +1850,243 @@ test('前置交付摘要被截断时，下游指令明确要求读取完整交�
   assert.equal(manager.get(up.id).data.lastResult.text.length, 2000);
   manager.review(up.id, true, '通过');
   assert.match(f.controllers[1].options.worker.instructions, /摘要已截断为前 2000 字符，开始前必须用 mcp__team__read_dependency 读取完整交付/);
+});
+
+test('命令任务不启动 CC：MCP 直接运行 verify 命令，通过即验收并回收，失败交主控并带输出和证据', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.cwd, 'front', 'view.js'), 'const broken = 1;\n');
+  const manager = await f.create();
+  const pass = `"${process.execPath}" -e "console.log('all good')"`;
+  const fail = `"${process.execPath}" -e "console.error('front/view.js:1 broke'); process.exit(3)"`;
+  const [ok, bad] = manager.dispatch([
+    f.spec('通过', { access: 'verify', verify: pass, prompt: undefined, review: undefined }),
+    f.spec('失败', { access: 'verify', verify: fail, prompt: undefined, review: undefined }),
+  ]);
+  assert.equal(f.controllers.length, 0, '命令任务不启动 CC');
+  assert.equal(manager.get(ok.id).data.command, pass);
+  assert.equal(manager.get(ok.id).data.verify, undefined, '命令只运行一次，不再作为验收命令重复执行');
+  assert.equal(manager.status([ok.id]).workers[0].model, '命令任务（不启动 CC）');
+
+  const passed = (await manager.wait({ workerIds: [ok.id], timeoutMs: 10000 })).workers[0];
+  assert.equal(passed.attention, false);
+  assert.match(passed.summary, /^命令通过：.*all good/s);
+  assert.equal(passed.review.accepted, true);
+  await until(() => manager.get(ok.id).data.status === 'closed', '通过后回收');
+
+  const failed = (await manager.wait({ workerIds: [bad.id], timeoutMs: 10000 })).workers[0];
+  assert.equal(failed.attention, true);
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.summary, /命令未通过：.*退出码 3.*front\/view\.js:1 broke/s);
+  assert.deepEqual(failed.evidence.map(item => [item.ref, item.ok]), [['front/view.js:1', true]]);
+  assert.equal(failed.turns, 0);
+  // 主控修好后 team_send 即重新运行同一命令。
+  manager.send(bad.id, '重新运行');
+  await until(() => manager.get(bad.id).data.lastResult.resultId !== failed.resultId, '重新运行');
+  assert.equal(f.controllers.length, 0);
+});
+
+test('验证命令无法运行（找不到命令）时直接交主控，不消耗修复轮次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [writer] = manager.dispatch([f.spec('写', { access: 'write', scope: ['front'], verify: 'cc-team-no-such-command-xyz', maxFixRounds: 2, review: undefined })]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '完成' });
+  await until(() => manager.get(writer.id).data.lastReview, '自动拒绝');
+  assert.equal(manager.get(writer.id).data.lastReview.accepted, false);
+  assert.match(manager.get(writer.id).data.lastReview.note, /找不到命令或程序/);
+  assert.equal(controller.sent.length, 1, '没有发回工作者修复');
+  assert.equal(manager.get(writer.id).data.fixRounds ?? 0, 0);
+});
+
+test('自动验收后回收中的工作者不拖住 team_wait，进程关闭前即返回结果', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader] = manager.dispatch([f.spec('读取', { review: undefined })]);
+  const controller = f.controllers[0];
+  controller.closeGate = deferred();
+  const waiting = manager.wait({ workerIds: [reader.id], timeoutMs: 5000 });
+  controller.emit('result', { success: true, text: '结论' });
+  const result = await waiting;
+  assert.equal(result.timedOut, false);
+  assert.equal(result.done, true);
+  assert.equal(result.workers[0].summary, '结论');
+  assert.equal(manager.get(reader.id).data.status, 'closing');
+  controller.closeGate.resolve();
+  await until(() => manager.get(reader.id).data.status === 'closed', '关闭完成');
+  assert.equal((await manager.wait({ timeoutMs: 1000 })).repeated, true);
+  assert.equal((await manager.wait({ timeoutMs: 1000 })).workers.length, 0);
+});
+
+test('工作者计时累计 CC 运行和验证耗时，status 汇总主控调用节奏', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('读取', { review: undefined, verify: `"${process.execPath}" -e "0"` })]);
+  f.controllers[0].emit('result', { success: true, text: '完成', durationMs: 1200 });
+  await until(() => manager.get(worker.id).data.lastReview, '验收');
+  assert.equal(manager.get(worker.id).data.timing.runMs, 1200);
+  assert.ok(manager.get(worker.id).data.timing.verifyMs >= 0);
+  manager.recordCall({ tool: 'team_dispatch', ms: 5000, at: 0, end: 5000 });
+  manager.recordCall({ tool: 'team_status', ms: 10, gap: 3000, at: 8000, end: 8010 });
+  const { timing } = manager.status();
+  assert.deepEqual(timing.codex, { turns: 1, ms: 3000 });
+  assert.deepEqual(timing.mcpCalls, { count: 2, ms: 5010, blockedWaitingMs: 5000 });
+  assert.equal(timing.workerRunMs, 1200);
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal(reopened.status().timing.mcpCalls.count, 2, '计时随团队持久保存');
+});
+
+test('主控放弃的等待不把结果记为已返回：取消信号和串行调用中的新等待都会结束旧等待，结果下次照常带回', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [a, b] = manager.dispatch([f.spec('A', { review: undefined }), f.spec('B', { review: undefined })]);
+  // 客户端取消（例如工具超时）：等待立即结束，期间完成的结果不算送达。
+  const abort = new AbortController();
+  const cancelled = manager.wait({ timeoutMs: 10000, signal: abort.signal });
+  f.controllers[0].emit('result', { success: true, text: 'A 结论' });
+  await until(() => manager.get(a.id).data.status === 'closed', 'A 自动验收');
+  abort.abort();
+  await cancelled;
+  // 新的等待到达时旧等待仍未返回：旧的那次已被主控放弃。
+  const stale = manager.wait({ timeoutMs: 10000 });
+  await tick();
+  const current = manager.wait({ timeoutMs: 10000 });
+  const abandoned = await stale;
+  assert.ok(abandoned.waitedMs < 5000);
+  f.controllers[1].emit('result', { success: true, text: 'B 结论' });
+  const result = await current;
+  assert.equal(result.done, true);
+  assert.deepEqual(result.workers.map(worker => worker.summary).sort(), ['A 结论', 'B 结论']);
+  assert.deepEqual([a.id, b.id].map(id => manager.get(id).reportedResultId), [a.id, b.id].map(id => manager.get(id).data.lastResult.resultId));
+});
+
+test('客户端以超时取消等待时记下实际工具超时，之后的等待提前以 timedOut 返回并提示检查配置', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  manager.dispatch([f.spec('A')]);
+  const abort = new AbortController();
+  const waiting = manager.wait({ timeoutMs: 60000, signal: abort.signal });
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() + 8000);
+  abort.abort('Request timed out');
+  await waiting;
+  t.mock.restoreAll();
+  assert.ok(manager.clientTimeoutMs >= 8000 && manager.clientTimeoutMs < 9000);
+  const started = Date.now();
+  const next = await manager.wait({ timeoutMs: 60000 });
+  assert.equal(next.timedOut, true);
+  assert.ok(Date.now() - started < manager.clientTimeoutMs, '等待应短于客户端实际超时');
+  assert.match(next.hint, /被 Codex 放弃.*tool_timeout_sec/);
+  assert.equal((await manager.wait({ timeoutMs: 20 })).hint, undefined, '提示只出现一次');
+});
+
+test('同名同任务在结果返回前重发视为重试：接上原工作者，不重复启动；结果已返回后重发则改名新建', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [first] = manager.dispatch([f.spec('A', { review: undefined })]);
+  const warnings = [];
+  const [again] = manager.dispatch([f.spec('A', { review: undefined })], warnings);
+  assert.equal(again.id, first.id);
+  assert.equal(again.retried, true);
+  assert.equal(f.controllers.length, 1);
+  assert.ok(warnings.some(warning => /视为重试/.test(warning)));
+  f.controllers[0].emit('result', { success: true, text: 'A 结论' });
+  // 原调用没送达时，重发等到的就是原任务的结果。
+  const result = await manager.wait({ workerIds: [again.id], timeoutMs: 10000 });
+  assert.equal(result.workers[0].summary, 'A 结论');
+  const [rerun] = manager.dispatch([f.spec('A', { review: undefined })]);
+  assert.equal(rerun.name, 'A2');
+  assert.equal(f.controllers.length, 2);
+});
+
+test('返回最前面的 next 写明下一步：完成时直接转述，提问和待验收时给出要调用的工具和标识', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader, writer] = manager.dispatch([f.spec('读', { review: undefined, scope: ['back'] }), f.spec('写', { access: 'write', scope: ['front'] })]);
+  const timed = await manager.wait({ timeoutMs: 20 });
+  assert.equal(Object.keys(timed)[0], 'next');
+  assert.match(timed.next, /直接再调用 team_wait.*不要自己调查/);
+  const question = f.controllers[0].request('question', { questions: [{ question: '选哪个？' }] });
+  const asked = await manager.wait({ timeoutMs: 10000 });
+  const requestId = asked.workers.find(worker => worker.id === reader.id).requests[0].id;
+  assert.match(asked.next, new RegExp(`读 在等回答：team_reply\\(requestId: "${requestId}"`));
+  manager.reply(requestId, { text: 'A' });
+  await question;
+  f.controllers[0].emit('result', { success: true, text: '读的结论' });
+  f.controllers[1].emit('result', { success: true, text: '写完了' });
+  const review = await manager.wait({ timeoutMs: 10000 });
+  const resultId = manager.get(writer.id).data.lastResult.resultId;
+  assert.match(review.next, new RegExp(`写 待验收.*team_review\\(resultId: "${resultId}"`));
+  manager.review(writer.id, true, '已核对');
+  const done = await manager.wait({ workerIds: [reader.id, writer.id], timeoutMs: 10000 });
+  assert.match(done.next, /全部完成.*summary 开头直接转述.*不必再打开文件/);
+});
+
+test('等待类返回超出篇幅预算时按份压缩，每份报告保留开头并标记截断', async t => {
+  const f = await fixture(t);
+  f.config.responseBytes = 12000;
+  writeFileSync(path.join(f.cwd, 'front', 'big.js'), Array.from({ length: 40 }, (_, i) => `line ${i} ${'x'.repeat(200)}`).join('\n'));
+  const manager = await f.create();
+  const specs = ['甲', '乙', '丙'].map(name => f.spec(name, { review: undefined }));
+  const workers = manager.dispatch(specs);
+  const refs = Array.from({ length: 8 }, (_, i) => `front/big.js:${i * 4 + 3}`).join(' ');
+  workers.forEach((worker, index) => f.controllers[index].emit('result', { success: true, text: `结论${index}：${'很长的说明'.repeat(400)} ${refs}` }));
+  const result = await manager.wait({ timeoutMs: 10000 });
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 10000, `返回 ${Buffer.byteLength(JSON.stringify(result))} 字节`);
+  assert.equal(result.compacted, true);
+  assert.equal(result.workers.length, 3);
+  result.workers.forEach((worker, index) => {
+    assert.ok(worker.summary.startsWith(`结论${index}：`));
+    assert.equal(worker.summaryTruncated, true);
+  });
+});
+
+test('瞬时 API 错误先退避后在原会话自动重试，次数用完才交主控；需改配置的错误直接交主控', async t => {
+  const f = await fixture(t);
+  const manager = await f.create({ retryDelays: [10, 10] });
+  const [a, b] = manager.dispatch([f.spec('A', { review: undefined }), f.spec('B', { review: undefined })]);
+  const [controller, other] = f.controllers;
+  const failure = { success: false, text: 'API Error: 429', terminalReason: 'api_error', apiErrorStatus: 429, errors: ['429 Too Many Requests'] };
+  controller.emit('result', failure);
+  assert.equal(manager.get(a.id).data.status, 'running');
+  assert.equal((await manager.wait({ workerIds: [a.id], timeoutMs: 20 })).workers[0].attention, false);
+  await until(() => controller.sent.length === 2, '第一次自动重试');
+  assert.match(controller.sent[1].text, /API 错误中断（api_error 429）.*自动重试（1\/2）/);
+  controller.emit('result', { ...failure, messageIds: [controller.sent[1].messageId] });
+  await until(() => controller.sent.length === 3, '第二次自动重试');
+  controller.emit('result', { ...failure, messageIds: [controller.sent[2].messageId] });
+  const exhausted = await manager.wait({ workerIds: [a.id], timeoutMs: 10000 });
+  assert.equal(exhausted.workers[0].status, 'failed');
+  assert.equal(exhausted.workers[0].attention, true);
+  // 主控追加指令后重试次数重新计算。
+  manager.send(a.id, '继续');
+  assert.equal(manager.get(a.id).data.apiRetries, 0);
+  other.emit('result', { ...failure, apiErrorStatus: 401, text: 'API Error: 401' });
+  assert.equal(manager.get(b.id).data.status, 'failed');
+  assert.equal(other.sent.length, 1);
+});
+
+test('自动验收的写任务告知工作者 MCP 会运行的验证命令，不必自己完整再跑；交主控验收的写任务照旧', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const verify = `"${process.execPath}" -e "0"`;
+  const [auto, manual] = manager.dispatch([
+    f.spec('自动', { access: 'write', scope: ['front'], verify, review: undefined }),
+    f.spec('人工', { access: 'write', scope: ['back'], review: undefined }),
+  ]);
+  const text = id => manager.get(id).data.instructions;
+  assert.match(text(auto.id), /完成后 MCP 会在你的工作区运行验证命令：.*不必自己再完整运行这条命令/);
+  assert.match(text(auto.id), /你运行过的定向检查及结果/);
+  assert.doesNotMatch(text(manual.id), /MCP 会在你的工作区运行验证命令/);
+  assert.match(text(manual.id), /验证命令及结果/);
+});
+
+test('verify: auto 识别不出命令时只读任务忽略 verify 照常派发，非 git 目录的写任务缺少 scope 时拒绝', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const warnings = [];
+  const [reader] = manager.dispatch([f.spec('读', { verify: 'auto', review: undefined })], warnings);
+  assert.equal(manager.get(reader.id).data.verify, undefined);
+  assert.ok(warnings.some(warning => /未识别出测试命令，已忽略 verify/.test(warning)));
+  assert.throws(() => manager.dispatch([f.spec('写', { access: 'write', scope: undefined })]), /不在 git 仓库中.*必须显式指定 scope/);
 });

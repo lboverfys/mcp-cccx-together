@@ -107,14 +107,22 @@ function linkPaths(source, target, links) {
   return linked;
 }
 
-/** 以主工作区当前内容为基线创建分离 HEAD 的 worktree，返回需持久化的记录。 */
-export function createWorktree({ cwd, root, tempDir, links = [] }) {
+/**
+ * 以主工作区当前内容为基线创建分离 HEAD 的 worktree，返回需持久化的记录。
+ * bases 按仓库缓存基线快照：同一轮调度中的多个写任务共用一次全量快照。
+ */
+export function createWorktree({ cwd, root, tempDir, links = [], bases }) {
   const repo = repoRoot(cwd);
   if (!repo) throw new Error('cwd 不在 git 仓库中或未安装 git，无法创建隔离工作区');
   const relativeCwd = path.relative(repo, cwd);
   if (existsSync(root)) throw new Error(`隔离工作区路径已存在但未登记：${root}；请核实其中内容后删除再重试`);
-  const tree = snapshotTree(repo, { tempDir });
-  const base = commitTree(repo, tree, head(repo), 'cc-team-mcp worktree base');
+  let snapshot = bases?.get(repo);
+  if (!snapshot) {
+    const snapshotTreeId = snapshotTree(repo, { tempDir });
+    snapshot = { tree: snapshotTreeId, base: commitTree(repo, snapshotTreeId, head(repo), 'cc-team-mcp worktree base') };
+    bases?.set(repo, snapshot);
+  }
+  const { tree, base } = snapshot;
   mkdirSync(path.dirname(root), { recursive: true });
   git(repo, ['worktree', 'add', '--detach', root, base], { hooksPath: emptyHooks(tempDir) });
   const physicalRoot = realpathSync(root);
@@ -147,15 +155,19 @@ export function worktreeDiff(worktree, { tempDir }) {
     patch: git(worktree.repoRoot, ['diff', ...DIFF_OPTIONS, ...range]) };
 }
 
-function mergeTrees(repo, base, ours, theirs) {
+/** 三方合并两棵树；有冲突时 allowConflicts 返回带冲突标记的树和冲突文件，否则抛出 CONFLICT。 */
+function mergeTrees(repo, base, ours, theirs, { allowConflicts = false } = {}) {
   // merge-tree 需要提交对象：两侧都以基线为父提交，合并基点即为基线。
   const baseCommit = commitTree(repo, base, undefined, 'cc-team-mcp merge base');
   try {
-    return git(repo, ['merge-tree', '--write-tree', '--name-only', '--no-messages',
+    const tree = git(repo, ['merge-tree', '--write-tree', '--name-only', '--no-messages',
       commitTree(repo, ours, baseCommit, 'cc-team-mcp main'), commitTree(repo, theirs, baseCommit, 'cc-team-mcp worker')]).split('\n')[0].trim();
+    return allowConflicts ? { tree, conflicts: [] } : tree;
   } catch (error) {
     if (error.status === 1 && error.stdout) {
-      const conflicts = error.stdout.split('\n').slice(1).map(line => line.trim()).filter(Boolean);
+      const [tree, ...rest] = error.stdout.split('\n');
+      const conflicts = rest.map(line => line.trim()).filter(Boolean);
+      if (allowConflicts) return { tree: tree.trim(), conflicts };
       throw failure('CONFLICT', `与主工作区的改动冲突：${list(conflicts)}`, conflicts);
     }
     throw failure('MERGE', `主工作区也改动了相同文件，三方合并需要 git 2.38 及以上的 merge-tree：${error.message}`);
@@ -206,6 +218,27 @@ export function integrateWorktree(worktree, { allowed, tempDir }) {
   if (outsideTargets.length) throw failure('SCOPE', `合并目标超出分配范围：${list(outsideTargets)}`, outsideTargets);
   writeEntries(worktree.repoRoot, target, entries, tempDir);
   return { tree: theirs, files: entries };
+}
+
+/**
+ * 合并冲突时把主工作区的最新内容并入隔离工作区：工作者的改动保留，冲突文件留下冲突标记，
+ * 基线改为主工作区当前快照，之后验收只合并工作者在此之上的改动。返回新的记录和冲突文件。
+ */
+export function rebaseWorktree(worktree, { tempDir }) {
+  const repo = worktree.repoRoot;
+  const theirs = snapshotTree(worktree.root, { tempDir, excludes: worktree.links ?? [] });
+  const ours = snapshotTree(repo, { tempDir });
+  const { tree: merged, conflicts } = ours === worktree.baseTree ? { tree: theirs, conflicts: [] }
+    : mergeTrees(repo, worktree.baseTree, ours, theirs, { allowConflicts: true });
+  const hooksPath = emptyHooks(tempDir);
+  // 先让 worktree 的索引对应工作者当前内容，再整体切换到合并结果，新增、修改和删除都同步到文件。
+  git(worktree.root, ['read-tree', theirs]);
+  git(worktree.root, ['read-tree', '-u', '--reset', merged], { hooksPath });
+  const base = commitTree(repo, ours, worktree.base, 'cc-team-mcp worktree base');
+  git(worktree.root, ['update-ref', '--no-deref', 'HEAD', base], { hooksPath });
+  // 索引回到新基线，git status/diff 显示的正是工作者相对主工作区最新内容的改动（含冲突标记）。
+  git(worktree.root, ['read-tree', ours]);
+  return { worktree: { ...worktree, base, baseTree: ours, rebasedAt: new Date().toISOString() }, conflicts };
 }
 
 /** 先拆除链接（不跟随进入主工作区），再删除 worktree 及其登记。 */

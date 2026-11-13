@@ -3,35 +3,58 @@ import { realpathSync, statSync, mkdirSync, existsSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
 import { Store, assertBackgroundTasksStopped, processIsAlive } from './store.mjs';
 import { createClaudeWorker } from './claude-worker.mjs';
+import { createCommandWorker } from './command-worker.mjs';
 import { ResultStore } from './results.mjs';
 import { dependencyGraph as buildDependencyGraph } from './dependencies.mjs';
 import { WorktreeIsolation } from './isolation.mjs';
 import { inside, pathKey, physicalPath } from './paths.mjs';
 import { providerEnvironment } from './providers.mjs';
-import { runVerify } from './verify.mjs';
+import { commandMissing, detectVerify, runVerify } from './verify.mjs';
+import { addCall, summarizeTiming } from './timing.mjs';
+import { collectEvidence } from './evidence.mjs';
+import { DEFAULT_RESPONSE_BYTES, fitResponse } from './budget.mjs';
 
 const active = new Set(['starting', 'running', 'needs_input', 'awaiting_review', 'interrupting', 'idle']);
 const clip = (text, max = 12000) => String(text ?? '').slice(0, max);
+const MAX_NAME = 24;
 const SUMMARY_CHARS = 2000;
+// 本轮因瞬时 API 错误结束时自动重试的退避间隔（毫秒）；次数用完才交主控。
+const API_RETRY_DELAYS = [15000, 45000];
+const TRANSIENT_REASONS = new Set(['api_error', 'model_error']);
+// 没有状态码（网络错误）或以下状态码视为瞬时错误；400/401/403/404 等改配置才能好的错误不重试。
+const TRANSIENT_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529]);
+const transientFailure = data => !data.success && !data.interrupted && !data.background && TRANSIENT_REASONS.has(data.terminalReason)
+  && (data.apiErrorStatus == null || TRANSIENT_STATUS.has(data.apiErrorStatus));
+// team_wait 直接带回的报告上限；工作者按要求控制篇幅，超出时才需要 team_result 续读。
+const REPORT_CHARS = 6000;
+// 待主控验收的隔离写入随 team_wait 附带的补丁长度；更长时用 team_diff 翻页。
+const DIFF_CHARS = 12000;
 // team_wait 判定：working 仍会自行推进；needsParent 必须由主控处理；settled 表示本轮已停下。
-const working = worker => Boolean(worker.verifying || worker.closingPromise)
-  || ['starting', 'running', 'interrupting', 'closing'].includes(worker.data.status);
+// 验收后回收中的工作者（retiring）结果已定，不必等进程退出再返回给主控。
+const working = worker => Boolean(worker.verifying || (worker.closingPromise && !worker.retiring))
+  || ['starting', 'running', 'interrupting'].includes(worker.data.status)
+  || (worker.data.status === 'closing' && !worker.retiring);
 const needsParent = worker => Boolean(worker.lifecycleError)
   || ['needs_input', 'failed', 'blocked', 'stopped'].includes(worker.data.status)
   || (worker.data.status === 'awaiting_review' && !worker.verifying);
-const settled = worker => needsParent(worker) || ['idle', 'closed'].includes(worker.data.status);
+const settled = worker => needsParent(worker) || ['idle', 'closed'].includes(worker.data.status) || Boolean(worker.retiring);
 const unconfirmedProcess = data => data.status !== 'closed' && !data.processExited && processIsAlive(data.lastPid);
 const unconfirmedResources = data => data.backgroundTasks?.length || unconfirmedProcess(data);
 
 export class TeamManager {
-  constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, notifier, platform = process.platform, env = process.env }) {
+  constructor({ config, teamId, constraints, maxConcurrent, factory = createClaudeWorker, commandFactory = createCommandWorker, notifier, platform = process.platform, env = process.env, retryDelays = API_RETRY_DELAYS }) {
     this.config = config;
+    this.retryDelays = retryDelays;
+    // 主控尚未收到返回的等待调用；最近一批首次返回给主控的结果（主控处理过的工作者会移出）。
+    this.pendingWaits = new Set();
+    this.lastReported = new Map();
     this.env = env;
     this.isolation = new WorktreeIsolation(this);
     this.teamId = teamId;
     this.constraints = constraints;
     this.maxConcurrent = maxConcurrent;
     this.factory = factory;
+    this.commandFactory = commandFactory;
     this.notifier = notifier;
     this.platform = platform;
     this.store = new Store(resolve(config.stateDir, teamId));
@@ -52,6 +75,7 @@ export class TeamManager {
       this.maxConcurrent = this.maxConcurrent ?? saved.maxConcurrent ?? 8;
       this.assertConcurrency(this.maxConcurrent);
       this.updateConstraints(this.constraints ?? saved.constraints ?? '');
+      this.timing = saved.timing;
       for (const data of this.store.listWorkers()) {
         data.dependsOn ??= [];
         data.queuedMessages ??= [];
@@ -144,7 +168,8 @@ export class TeamManager {
       workers: selected.map(({ data, controller, deliveryWarning, lifecycleError, verifying }) => ({
       id: data.id, name: data.name, task: clip(data.prompt, 1000), cwd: data.cwd, scope: data.scope, access: data.access,
       review: data.review ?? 'codex', ...(data.verify ? { verify: data.verify } : {}), ...(verifying ? { verifying } : {}),
-      model: data.model ?? this.config.providers?.[data.provider]?.model ?? '继承 CC 配置',
+      ...(data.explore === false ? { explore: false } : {}), ...(data.command ? { command: data.command } : {}),
+      model: data.command ? '命令任务（不启动 CC）' : data.model ?? this.config.providers?.[data.provider]?.model ?? '继承 CC 配置',
       ...(data.provider ? { provider: data.provider } : {}), isolation: data.isolation ?? 'shared',
       ...(data.worktree ? { worktree: { root: data.worktree.root, cwd: data.worktree.cwd, exists: existsSync(data.worktree.root) } } : {}),
       status: data.status, sessionId: data.sessionId,
@@ -158,8 +183,27 @@ export class TeamManager {
       backgroundTasks: data.backgroundTasks ?? [],
       ...(deliveryWarning ? { deliveryWarning } : {}),
       ...(lifecycleError ? { lifecycleError } : {}),
+      ...(data.timing ? { timing: data.timing } : {}),
       requests: requests.get(data.id) ?? [],
-    })) };
+    })), timing: this.timingSummary() };
+  }
+
+  /** 累计工作者各阶段耗时（毫秒），供 team_status 和 stats 拆分主控、CC 与 MCP 自身的时间。 */
+  addTiming(worker, key, ms) {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    worker.data.timing = { ...worker.data.timing, [key]: (worker.data.timing?.[key] ?? 0) + Math.round(ms) };
+  }
+
+  /** 记录一次主控工具调用；计时失败不影响调用结果。 */
+  recordCall(call) {
+    try {
+      this.timing = addCall(this.timing, call);
+      this.store.saveTeam({ ...this.store.loadTeam(), timing: this.timing });
+    } catch { /* 计时只用于统计 */ }
+  }
+
+  timingSummary() {
+    return summarizeTiming(this.timing, [...this.workers.values()].map(worker => worker.data));
   }
 
   prepare(spec) {
@@ -180,8 +224,34 @@ export class TeamManager {
   /** 派发时补全默认值：验收方式、隔离方式、provider，并拒绝不安全的组合。 */
   normalizeSpec(spec, warnings) {
     const label = spec.name;
-    // 没有 verify 时默认交主控验收，工作者的完成声明不会自动放行下游。
-    const review = spec.review ?? (spec.verify ? 'auto' : 'codex');
+    spec = { ...spec };
+    if (spec.verify === 'auto') {
+      // 主控不先查代码：verify 填 auto 时按项目文件推断测试命令，识别不了的写任务退回主控验收。
+      const detected = detectVerify(spec.cwd, { platform: this.platform });
+      if (detected) {
+        spec.verify = detected.command;
+        warnings.push(`${label}：verify 自动识别为 ${detected.command}`);
+      } else {
+        delete spec.verify;
+        // 命令任务没有命令可跑只能拒绝；其余任务照常派发，避免整批打回多花一轮主控。
+        if (!spec.prompt) throw new Error(`${label}：verify 为 auto 但未识别出测试命令，请直接给出命令`);
+        if (spec.access === 'write') {
+          warnings.push(`${label}：未识别出测试命令，改由主控验收；可以直接给出 verify 命令以自动验收`);
+          if (spec.review === 'auto') delete spec.review;
+        } else warnings.push(`${label}：未识别出测试命令，已忽略 verify`);
+      }
+    }
+    // 命令任务：verify 任务不写 prompt 时由 MCP 直接运行 verify 命令，不启动 CC。
+    if (!spec.prompt) {
+      if (spec.access !== 'verify' || !spec.verify) throw new Error(`${label}：只有给出 verify 命令的 verify 任务可以省略 prompt`);
+      spec.command = spec.verify;
+      spec.prompt = `运行命令：${spec.verify}`;
+      delete spec.verify;
+      delete spec.explore;
+    }
+    // read/verify 任务不改文件，验收只决定是否放行下游，默认自动验收，免得主控为放行而重做调查；
+    // write 任务没有 verify 时交主控验收，工作者的完成声明不会自动合并或放行下游。
+    const review = spec.review ?? (spec.verify || spec.access !== 'write' ? 'auto' : 'codex');
     if (review === 'auto' && !spec.verify && spec.access === 'write') {
       throw new Error(`${label}：write 任务使用 review "auto" 时必须提供 verify 命令，否则改用 review "codex"`);
     }
@@ -219,7 +289,7 @@ export class TeamManager {
       for (;;) {
         const entry = index.get(ancestor);
         for (const owner of worker.access !== 'write' ? (entry?.writer ? [entry.writer] : []) : entry?.owners ?? []) {
-          if (owner !== worker && !graph.before(owner.id, worker.id) && !graph.before(worker.id, owner.id)) {
+          if (owner !== worker && !graph.before(owner.id, worker.id) && !graph.before(worker.id, owner.id) && this.scopesOverlap(owner, worker)) {
             throw new Error(`工作范围冲突：${owner.name} 与 ${worker.name}。请拆分 scope、声明串行 dependsOn 或使用独立工作区`);
           }
         }
@@ -238,20 +308,52 @@ export class TeamManager {
     if (this.closing) throw new Error('团队正在关闭');
     const prepared = specs.map(spec => {
       const normalized = this.normalizeSpec(this.prepare(spec), warnings);
+      // 隔离写入验收时只合并范围内改动，缺省范围取整个 cwd；直接改主工作区的写入必须由主控明确范围。
+      if (normalized.access === 'write' && !spec.scope?.length && normalized.isolation !== 'worktree') {
+        throw new Error(`${normalized.name}：cwd 不在 git 仓库中，write 任务会直接修改主工作区，必须显式指定 scope`);
+      }
       return { ...this.prepare(normalized), ...(spec.cwd !== normalized.cwd ? { requestedCwd: spec.cwd } : {}), id: randomUUID() };
     });
-    const names = new Map([...this.workers.values()].map(worker => [worker.data.name, worker.data.id]));
+    const batch = new Set();
     for (const spec of prepared) {
-      if (names.has(spec.name)) throw new Error(`名字“${spec.name}”已存在，请另起一个以cc结尾且完整名字不超过 24 个字符的职责名；继续原任务请按原名 send 或 resume`);
-      names.set(spec.name, spec.id);
+      if (batch.has(spec.name)) throw new Error(`同一批次中名字“${spec.name}”已存在，请为每个任务另起职责名`);
+      batch.add(spec.name);
     }
-    const batchNames = new Map(prepared.map(spec => [spec.name, spec.id]));
+    // 重名不整批打回（每次打回都要主控重写整批再来一轮）：与本会话中尚未把结果交给主控的同名同任务一致时视为重试，
+    // 例如派发调用在 Codex 侧超时后重发，直接接上原任务；否则自动改名，并在 warnings 中告知实际名字。
+    const references = new Map();
+    const taken = new Set([...this.workers.values()].map(worker => worker.data.name).concat([...batch]));
+    const resolveReference = reference => references.get(reference) ?? (batch.has(reference) ? undefined
+      : this.workers.has(reference) || this.names.get(reference)?.size ? this.get(reference).data.id : undefined);
+    const outcome = [];
+    const fresh = [];
     for (const spec of prepared) {
-      spec.dependsOn = [...new Set((spec.dependsOn ?? []).map(reference => batchNames.get(reference) ?? this.get(reference).data.id))];
+      const previous = [...(this.names.get(spec.name) ?? [])];
+      if (previous.length) {
+        const dependsOn = (spec.dependsOn ?? []).map(resolveReference);
+        const same = !dependsOn.includes(undefined) && previous.find(worker => this.isRetry(worker, spec, dependsOn));
+        if (same) {
+          references.set(spec.name, same.data.id);
+          warnings.push(`${spec.name}：与已派发、结果尚未返回的同名任务一致，视为重试，接上原任务而不重复创建`);
+          outcome.push({ id: same.data.id, name: same.data.name, status: same.data.status, retried: true, ...(same.data.error ? { error: same.data.error } : {}) });
+          continue;
+        }
+        const renamed = this.freeName(spec.name, taken);
+        taken.add(renamed);
+        warnings.push(`名字“${spec.name}”已被占用，本次任务改名为“${renamed}”，后续请用新名字`);
+        references.set(spec.name, spec.id);
+        spec.name = renamed;
+      } else references.set(spec.name, spec.id);
+      fresh.push(spec);
+      outcome.push(spec);
     }
+    for (const spec of fresh) {
+      spec.dependsOn = [...new Set((spec.dependsOn ?? []).map(reference => references.get(reference) ?? this.get(reference).data.id))];
+    }
+    if (!fresh.length) return outcome;
     // 只校验依赖；范围重叠不再整批拒绝，由调度按提交顺序排队（waiting_scope）。
-    this.dependencyGraph(prepared);
-    const created = prepared.map(spec => {
+    this.dependencyGraph(fresh);
+    const created = fresh.map(spec => {
       const id = spec.id;
       const worker = { data: {
         ...spec, id, status: 'queued', pendingMessages: [], sessionId: null,
@@ -274,21 +376,66 @@ export class TeamManager {
     }
     try { this.schedule(warnings); }
     catch (error) { warnings.push(`任务已保存，但后续调度失败：${error.message}`); }
-    return created.map(({ data }) => ({ id: data.id, name: data.name, status: data.status, error: data.error }));
+    return outcome.map(entry => {
+      if (entry.retried) return entry;
+      const { data } = this.workers.get(entry.id);
+      return { id: data.id, name: data.name, status: data.status, error: data.error };
+    });
+  }
+
+  /**
+   * 同名派发是否只是重试：本会话派发过、结果还没交给主控，且任务内容（目录、权限、范围、命令、提示和依赖）完全一致。
+   * 结果已返回过的同名任务视为主控有意重跑，不在此列。
+   */
+  isRetry(worker, spec, dependsOn) {
+    const { data } = worker;
+    if (!worker.touched || data.cancelled) return false;
+    if (data.lastResult ? worker.reportedResultId === data.lastResult.resultId : ['closing', 'closed'].includes(data.status)) return false;
+    const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    return data.cwd === spec.cwd && data.access === spec.access && data.prompt === spec.prompt && same(data.scope, spec.scope)
+      && same(data.command, spec.command) && same(data.verify, spec.verify)
+      && same([...(data.dependsOn ?? [])].sort(), [...dependsOn].sort());
+  }
+
+  /** 为重名任务找一个可用的新名字：在 cc 尾缀前加序号，超长时截短职责名。 */
+  freeName(name, taken) {
+    const suffix = /cc$/.test(name) ? 'cc' : '';
+    const base = [...(suffix ? name.slice(0, -2) : name)];
+    for (let n = 2; ; n++) {
+      const tail = `${n}${suffix}`;
+      const candidate = `${base.slice(0, Math.max(1, MAX_NAME - tail.length)).join('')}${tail}`;
+      if (!taken.has(candidate)) return candidate;
+    }
   }
 
   instructions(spec) {
+    // 自动验收的写任务由 MCP 在工作者完成后运行 verify；工作者不必自己再完整跑一遍。
+    const mcpVerifies = spec.access === 'write' && spec.verify && spec.review === 'auto';
+    const subagents = spec.explore === false ? '不要自行再创建 agent。'
+      : spec.access === 'write'
+        ? '可以用 Agent 工具（subagent_type 为 Explore 或 general-purpose）把互不重叠的定位或修改分给子 agent 并行，子 agent 同样只能改分配范围内的文件；小改动自己做。'
+        : '可以用 Agent 工具（subagent_type 只能是 Explore）把互不重叠的目录或子问题分给子 agent 并行检索；一两次搜索能解决的部分自己查。';
     return `你是由 Codex 主控派发的 Claude Code 工作者，使用中文汇报。\n` +
       `你的名字是“${spec.name}”，主控和用户会用这个名字指代你。\n` +
       `工作目录：${spec.worktree?.cwd ?? spec.cwd}\n分配范围：${spec.scope.join(', ')}\n访问模式：${spec.access}\n` +
       (spec.worktree ? `隔离工作区：你在独立的 git worktree 中工作，它对应主工作区 ${spec.cwd}。只在 ${spec.worktree.cwd} 内修改；` +
         `任务里出现 ${spec.cwd} 下的路径时，改用隔离工作区下的同名路径。不要 git commit、checkout、reset 或 stash；` +
         `验收通过后由 MCP 把分配范围内的改动合并回主工作区，范围外的改动会导致验收失败。\n` : '') +
-      `只执行主控任务，遵循项目约定，不扩大修改范围。上下文不自动共享；需要主控决定时通过 ask_parent 提问。\n` +
-      `不要自行再创建 agent。没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
-      `工具报错必须明确报告，不得虚报验证通过。结束时说明修改文件、验证结果、未完成项；你报告完成后由主控验收。清理本任务启动的服务，不得停止原有服务。\n` +
+      `只执行主控任务，遵循项目约定，不扩大修改范围。上下文不自动共享。` +
+      `主控回应很慢，每次 ask_parent 都会让你停下等待：除非操作具有破坏性或不可逆，或需求有多种理解且选错会白做，否则按最合理的理解继续，并在报告里写明所作假设。\n` +
+      subagents +
+      `没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
+      `工具报错必须明确报告，不得虚报验证通过。清理本任务启动的服务，不得停止原有服务。\n` +
+      `最终报告是主控唯一会读的内容，开头会被直接转述给用户，控制在 1500 字以内，不复述过程：先用一两句话直接回答任务，写成可以直接给用户看的结论；` +
+      `再列出不超过 5 条关键证据，用 文件:行号（相对工作目录或绝对路径，区间写成 文件:起-止）或命令输出标注，MCP 会按行号读出原文给主控核对，行号必须准确；` +
+      `已证实（有代码或命令输出支撑）与推测分开写，说明无法判断的部分及验证方法；不要给没有证据的可能性排序。` +
+      (spec.access === 'write'
+        ? mcpVerifies ? '另外列出修改的文件、你运行过的定向检查及结果和未完成项。\n' : '另外列出修改的文件、验证命令及结果和未完成项。\n'
+        : spec.access === 'verify' ? '另外列出运行的命令及结果。\n' : '\n') +
+      (mcpVerifies ? `完成后 MCP 会在你的工作区运行验证命令：${spec.verify}；失败时会把输出发回给你修复。` +
+        '你只需运行与改动直接相关的定向测试或检查，不必自己再完整运行这条命令。\n' : '') +
       (spec.access === 'read' ? '当前为只读任务，不允许修改项目或运行命令。\n'
-        : spec.access === 'verify' ? '当前为验证任务：可以运行测试、构建和检查命令，不要修改项目文件。\n' : '') +
+        : spec.access === 'verify' ? '当前为验证任务：可以运行测试、构建、git 和其他检查命令，不要修改项目文件。\n' : '') +
       `工作者补充约束：\n${spec.taskInstructions ?? spec.instructions ?? ''}\n` +
       `团队当前约束（约束冲突时以当前约束为准）：\n${this.constraints}`;
   }
@@ -361,6 +508,10 @@ export class TeamManager {
 
   scopesOverlap(first, second) {
     if (first.access !== 'write' && second.access !== 'write') return false;
+    // worktree 隔离的写入在验收合并前不改主工作区，可与只读任务和其他隔离写入并行：合并时做三方合并，
+    // 冲突发回原工作者解决。verify 会在主工作区运行命令，仍须等写入合并。
+    const isolated = item => item.access === 'write' && item.isolation === 'worktree';
+    if ((isolated(first) && (second.access === 'read' || isolated(second))) || (isolated(second) && first.access === 'read')) return false;
     const firstPaths = first.scopes.map(path => this.scopeKey(path));
     const secondPaths = second.scopes.map(path => this.scopeKey(path));
     return firstPaths.some(a => secondPaths.some(b => inside(a, b) || inside(b, a)));
@@ -379,6 +530,8 @@ export class TeamManager {
         .sort((a, b) => graph.rank.get(a.data.id) - graph.rank.get(b.data.id));
       // 本轮仍在排队的任务；后提交且范围重叠的任务不得越过它们，避免宽范围写入被饿死。
       const waitingAhead = [];
+      // 本轮启动的隔离写任务共用一次主工作区快照。
+      const bases = new Map();
       for (const worker of queued) {
         const dependencies = worker.data.dependsOn.map(id => this.get(id)).filter(dependency => !this.accepted(dependency, acceptance));
         if (dependencies.length) {
@@ -411,17 +564,11 @@ export class TeamManager {
           this.setQueueState(worker, 'queued', conflicts.length || earlier.length ? 'waiting_scope' : 'waiting_capacity',
             conflicts.length ? conflicts : earlier);
           waitingAhead.push(worker);
-          for (const item of retiring) {
-            this.closeWorker(item.data.id).catch(error => {
-              item.data.error = clip(error.message, 2000);
-              this.save(item);
-              this.event(item.data.id, 'close_failed', { summary: item.data.error });
-            }).catch(error => this.lifecycleFailed(item, error));
-          }
+          for (const item of retiring) this.retire(item);
           continue;
         }
         if (worker.data.isolation === 'worktree') {
-          try { this.isolation.ensure(worker, warnings); }
+          try { this.isolation.ensure(worker, warnings, bases); }
           catch (error) { this.fail(worker, error); continue; }
         }
         worker.data.writeRoots = this.isolation.writeRoots(worker);
@@ -463,6 +610,16 @@ export class TeamManager {
     }
   }
 
+  /** 后台回收已验收的空闲进程；关闭失败记入状态，不影响验收结论。 */
+  retire(worker) {
+    worker.retiring = true;
+    this.closeWorker(worker.data.id, { automatic: true }).finally(() => { worker.retiring = false; }).catch(error => {
+      worker.data.error = clip(error.message, 2000);
+      this.save(worker);
+      this.event(worker.data.id, 'close_failed', { summary: worker.data.error });
+    }).catch(error => this.lifecycleFailed(worker, error));
+  }
+
   diff(reference, options) {
     return this.isolation.diff(this.get(reference), options);
   }
@@ -473,7 +630,7 @@ export class TeamManager {
     try {
       mkdirSync(tempDir, { recursive: true });
       worker.lifecycleError = undefined;
-      worker.controller = this.factory({
+      worker.controller = (worker.data.command ? this.commandFactory : this.factory)({
         worker: worker.data, config: { ...this.config, tempDir }, env: this.env,
         emit: (type, data) => { if (worker.generation === generation) this.receive(worker, type, data); },
         request: (kind, payload, signal) => worker.generation === generation
@@ -529,6 +686,7 @@ export class TeamManager {
 
   receive(worker, type, data) {
     const previousStatus = worker.data.status;
+    let retry;
     if (type === 'session') worker.data.sessionId = data.sessionId;
     if (type === 'background_tasks') {
       worker.data.backgroundTasks = data.tasks;
@@ -540,6 +698,7 @@ export class TeamManager {
       const dependencyResultIds = Object.fromEntries(Object.entries(worker.data.dependencyResults ?? {}).map(([id, snapshot]) => [id, snapshot.resultId]));
       data = { ...data, dependencyResultIds };
       const saved = this.results.save(worker.data.id, data);
+      this.addTiming(worker, 'runMs', data.durationMs);
       worker.data.lastResult = { resultId: saved.resultId, success: data.success && !data.interrupted && !data.background,
         text: clip(data.text, SUMMARY_CHARS), ...(String(data.text ?? '').length > SUMMARY_CHARS ? { textTruncated: true } : {}),
         // SDK 按 Anthropic 价格估算费用，对其他 provider 没有参考价值。
@@ -558,9 +717,19 @@ export class TeamManager {
       }
       worker.data.error = data.success || data.interrupted || data.background ? undefined : clip(data.errors?.join('; ') || data.text || 'CC 执行失败', 2000);
       if (data.sessionId) worker.data.sessionId = data.sessionId;
+      if (worker.data.lastResult.success) worker.data.apiRetries = 0;
+      // 瞬时 API 错误（限流、过载、网络）先由 MCP 退避后让同一会话继续，不叫醒主控；次数用完才按失败交主控。
+      if (worker.data.status === 'failed' && transientFailure(data) && worker.controller && !this.closing
+        && (worker.data.apiRetries ?? 0) < this.retryDelays.length) {
+        worker.data.apiRetries = (worker.data.apiRetries ?? 0) + 1;
+        worker.data.status = 'running';
+        retry = { delay: this.retryDelays[worker.data.apiRetries - 1],
+          reason: `${data.terminalReason}${data.apiErrorStatus ? ` ${data.apiErrorStatus}` : ''}` };
+      }
       data = { ...worker.data.lastResult, errors: data.errors?.map(error => clip(error, 500)),
         messageId: data.messageId, messageIds: data.messageIds, queuedTurnCount: data.queuedTurnCount,
-        resultIndex: data.resultIndex, startupFailureReason: data.startupFailureReason };
+        resultIndex: data.resultIndex, startupFailureReason: data.startupFailureReason,
+        ...(data.apiErrorStatus != null ? { apiErrorStatus: data.apiErrorStatus } : {}) };
     }
     if ((type === 'activity' || type === 'progress') && ['starting', 'running', 'interrupting'].includes(worker.data.status)) {
       worker.data.status = 'running';
@@ -574,12 +743,34 @@ export class TeamManager {
     if (type === 'session' || type === 'result' || type === 'background_tasks' || worker.data.status !== previousStatus) this.save(worker);
     else worker.data.updatedAt = new Date().toISOString();
     this.event(worker.data.id, type, data);
+    if (retry) this.scheduleApiRetry(worker, retry);
     if (type === 'result' || type === 'background_tasks') this.schedule();
+  }
+
+  /** 退避后在原会话里让工作者接着做；期间状态保持 running，team_wait 继续等待。 */
+  scheduleApiRetry(worker, { delay, reason }) {
+    const generation = worker.generation;
+    const attempt = worker.data.apiRetries;
+    clearTimeout(worker.retryTimer);
+    worker.retryTimer = setTimeout(() => {
+      worker.retryTimer = undefined;
+      // 进程已换代或退出时由退出处理交主控；主控已追加指令或状态已变时不再重试。
+      if (worker.generation !== generation || this.closing || !worker.controller
+        || !['running', 'idle'].includes(worker.data.status) || worker.data.pendingMessages.length) return;
+      try {
+        this.send(worker.data.id, `上一轮因 API 错误中断（${reason}）。这是 MCP 的自动重试（${attempt}/${this.retryDelays.length}），` +
+          '请从中断处继续完成原任务，并照常交付最终报告。', { automatic: true });
+      } catch (error) { this.fail(worker, error); }
+    }, delay);
+    worker.retryTimer.unref?.();
+    try { this.event(worker.data.id, 'api_retry_scheduled', { attempt, delayMs: delay, reason }); }
+    catch { /* 记录失败不影响重试 */ }
   }
 
   /**
    * 自动验收：在工作者的实际目录执行 verify；通过后隔离任务先把范围内改动合并回主工作区再验收。
-   * verify 失败或改动越界时发回工作者修复，超过 maxFixRounds 或合并冲突时拒绝并交主控。
+   * verify 失败、改动越界或与主工作区冲突时发回工作者修复，超过 maxFixRounds 时拒绝并交主控；
+   * 验证命令本身无法运行（找不到命令）时直接交主控，不消耗修复轮次。
    */
   async autoReview(worker) {
     const resultId = worker.data.lastResult?.resultId;
@@ -590,6 +781,7 @@ export class TeamManager {
       if (worker.data.verify && !this.closing && worker.data.status === 'awaiting_review') {
         check = await runVerify(worker.data.verify, worker.data.worktree?.cwd ?? worker.data.cwd, abort.signal,
           resolve(this.config.tempDir, this.teamId, worker.data.id));
+        this.addTiming(worker, 'verifyMs', check.ms);
       }
     } finally {
       if (worker.verifyAbort === abort) {
@@ -601,6 +793,7 @@ export class TeamManager {
     if (abort.signal.aborted || this.closing || worker.data.status !== 'awaiting_review' || worker.data.lastReview
       || worker.data.lastResult?.resultId !== resultId) return;
     const { verify, maxFixRounds = 0 } = worker.data;
+    const canFix = () => (worker.data.fixRounds ?? 0) < maxFixRounds && Boolean(worker.controller);
     const sendFix = problem => {
       worker.data.fixRounds = (worker.data.fixRounds ?? 0) + 1;
       if (worker.data.fixRounds > maxFixRounds || !worker.controller) return false;
@@ -608,8 +801,12 @@ export class TeamManager {
       return true;
     };
     if (!check.ok) {
+      if (check.missing || commandMissing(check.code, this.platform)) {
+        this.review(worker.data.id, false, `自动验收未通过：验证命令无法运行（找不到命令或程序），请修正 verify 后 team_send 或 team_review：${verify}\n${check.output}`, undefined, resultId, { automatic: true });
+        return;
+      }
       if (sendFix(`验证命令未通过：${verify}\n${check.output}`)) return;
-      this.review(worker.data.id, false, `自动验收未通过：${verify}\n${check.output}`, undefined, resultId);
+      this.review(worker.data.id, false, `自动验收未通过：${verify}\n${check.output}`, undefined, resultId, { automatic: true });
       return;
     }
     let note = verify ? `自动验收：${verify} 通过` : '自动验收：执行成功';
@@ -619,12 +816,30 @@ export class TeamManager {
       merge = this.isolation.merge(worker);
       if (!merge.ok) {
         if (merge.kind === 'scope' && sendFix(`${merge.error}\n请撤销分配范围外的修改，只保留 ${worker.data.scope.join(', ')} 内的改动`)) return;
-        this.review(worker.data.id, false, `自动验收未通过：${merge.error}`, undefined, resultId);
+        if (merge.kind === 'conflict' && canFix() && this.sendConflict(worker, merge, sendFix)) return;
+        this.review(worker.data.id, false, `自动验收未通过：${merge.error}`, undefined, resultId, { automatic: true });
         return;
       }
       note += merge.files.length ? `；已把 ${merge.files.length} 个文件合并回主工作区` : '；隔离工作区没有文件改动';
     }
-    this.review(worker.data.id, true, note, undefined, resultId, { merge });
+    this.review(worker.data.id, true, note, undefined, resultId, { merge, automatic: true });
+    // read/verify 任务验收后没有改动要合并，直接回收进程，主控不必再 team_close；追问时 team_resume 恢复原会话。
+    if (worker.data.access !== 'write' && worker.controller) this.retire(worker);
+  }
+
+  /**
+   * 与主工作区冲突：把主工作区最新内容并入隔离工作区（冲突处留标记）后发回原工作者解决，不交主控。
+   * 返回是否已发回；并入失败时隔离工作区保持原样，由调用方按验收失败处理。
+   */
+  sendConflict(worker, merge, send) {
+    const rebased = this.isolation.rebase(worker);
+    if (!rebased.ok) return false;
+    const files = (rebased.conflicts.length ? rebased.conflicts : merge.files).slice(0, 20);
+    try { this.event(worker.data.id, 'rebased', { conflicts: rebased.conflicts, worktree: worker.data.worktree.root }); }
+    catch { /* 事件记录失败不影响发回 */ }
+    return send(`合并回主工作区时冲突：其他任务在你工作期间也改了 ${files.join(', ')}。` +
+      `MCP 已把主工作区的最新内容并入你的隔离工作区，冲突处留有 <<<<<<< ======= >>>>>>> 标记。` +
+      '请保留双方改动的意图解决全部冲突标记，重新验证后报告结果');
   }
 
   autoReviewFailed(worker, error) {
@@ -633,56 +848,190 @@ export class TeamManager {
     for (const check of [...this.waitChecks]) check();
   }
 
-  /** 阻塞到目标全部停下或任一需要主控处理，返回精简结果；替代逐条轮询事件。 */
-  async wait({ workerIds, timeoutMs = 50000 } = {}) {
-    // 本次服务中派发、恢复或追加过的工作者即使进程已退出，也要报告其失败或待处理状态。
-    const targets = workerIds ? [...new Set(workerIds.map(ref => this.get(ref)))]
-      : [...this.workers.values()].filter(worker => !['idle', 'closed'].includes(worker.data.status)
+  /**
+   * 主控的新调用到达时仍未返回的等待已被主控放弃（Codex 对同一服务的调用是串行的，只有工具超时或被中断才会这样）。
+   * 让它们立即结束，且不把其中的结果记为已返回，下次等待照常带回。
+   */
+  abandonWaits() {
+    for (const pending of [...this.pendingWaits]) pending.abandon();
+  }
+
+  /**
+   * 主控处理了最近一批返回中的某个工作者（追加、答复、验收、恢复、关闭、读取结果），说明那次返回已送达，整批不再补发。
+   * 处理更早批次的工作者不能证明最近一批已送达，保留补发。
+   */
+  acknowledge(id) {
+    if (this.lastReported.has(id)) this.lastReported.clear();
+  }
+
+  /** 记录被放弃的等待：客户端注明超时取消时记下实际的工具超时，之后的等待提前以 timedOut 返回，不在 Codex 侧报错。 */
+  noteAbandoned(ms, reason) {
+    if (ms < 5000) return;
+    const text = typeof reason === 'string' ? reason : reason?.message ?? '';
+    if (/time[ds]?[\s_-]?out|超时/i.test(text)) this.clientTimeoutMs = Math.min(this.clientTimeoutMs ?? Infinity, ms);
+    this.abandonedNote = `上一次等待在约 ${Math.round(ms / 1000)} 秒时被 Codex 放弃（工具超时或被中断），其中的结果已在本次补发；` +
+      '如果不是手动中断，说明 Codex 的 tool_timeout_sec 短于服务端单次等待，请运行 cc-team-mcp doctor 检查';
+  }
+
+  /** 阻塞到目标全部停下或任一需要主控处理，返回精简结果；替代逐条轮询事件。signal 中止表示主控已放弃这次调用。 */
+  async wait({ workerIds, timeoutMs = 50000, signal } = {}) {
+    this.abandonWaits();
+    // 本次服务中派发、恢复或追加过的工作者即使进程已退出，也要报告其失败或待处理状态；
+    // 在两次等待之间已完成（含自动验收后关闭）但结果还没返回给主控的，也要带回结果。
+    const unreported = worker => worker.touched && worker.data.lastResult
+      && worker.reportedResultId !== worker.data.lastResult.resultId;
+    let targets = workerIds ? [...new Set(workerIds.map(ref => this.get(ref)))]
+      : [...this.workers.values()].filter(worker => unreported(worker) || (!['idle', 'closed'].includes(worker.data.status)
         && (worker.controller || worker.verifying || ['queued', 'blocked'].includes(worker.data.status)
-          || (worker.touched && needsParent(worker))));
+          || (worker.touched && needsParent(worker)))));
+    // 没有可等的对象却又来等待，多半是上次的返回没送到主控：把最近一批结果再发一次。
+    let repeated = false;
+    if (!workerIds && !targets.length) {
+      targets = [...this.lastReported].map(([id, resultId]) => this.workers.get(id))
+        .filter(worker => worker && worker.data.lastResult?.resultId === this.lastReported.get(worker.data.id));
+      repeated = targets.length > 0;
+    }
+    if (this.clientTimeoutMs) timeoutMs = Math.min(timeoutMs, Math.max(1000, this.clientTimeoutMs - 3000));
     // 全队没有仍在推进的工作者时，继续等待也不会有变化。
     const ready = () => this.closing || targets.some(needsParent) || targets.every(settled)
       || ![...this.workers.values()].some(working);
+    const started = Date.now();
     let timedOut = false;
-    if (!ready()) {
+    const call = { abandoned: Boolean(signal?.aborted) };
+    if (!call.abandoned && !ready()) {
       await new Promise(resolveWait => {
         const finish = () => {
           clearTimeout(timer);
+          signal?.removeEventListener('abort', abandon);
           this.store.off('appended', check);
           this.waitChecks.delete(check);
           this.waiters.delete(finish);
+          this.pendingWaits.delete(call);
           resolveWait();
         };
+        const abandon = () => { call.abandoned = true; finish(); };
+        call.abandon = abandon;
         // 部分流程先写事件再更新状态（如提问），延后到当前同步步骤结束再判断。
         const check = () => queueMicrotask(() => { if (ready()) finish(); });
         const timer = setTimeout(() => { timedOut = true; finish(); }, timeoutMs);
+        signal?.addEventListener('abort', abandon, { once: true });
         this.store.on('appended', check);
         this.waitChecks.add(check);
         this.waiters.add(finish);
+        this.pendingWaits.add(call);
       });
     }
+    const waitedMs = Date.now() - started;
+    if (call.abandoned) this.noteAbandoned(waitedMs, signal?.reason);
     const requests = new Map();
     for (const request of this.requests.values()) {
       if (!requests.has(request.workerId)) requests.set(request.workerId, []);
       requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(request.encodedPayload, 1000) });
     }
-    return {
-      done: targets.every(worker => settled(worker) && !needsParent(worker)), timedOut,
-      ...(this.closing ? { closing: true } : {}),
-      workers: targets.map(worker => {
-        const { data } = worker;
-        return {
-          id: data.id, name: data.name, status: data.status, attention: needsParent(worker),
-          ...(data.queueReason ? { queueReason: data.queueReason } : {}),
-          ...(data.blockedBy?.length ? { blockedBy: data.blockedBy.map(item => item.name) } : {}),
-          ...(settled(worker) && data.lastResult ? { resultId: data.lastResult.resultId, summary: data.lastResult.text } : {}),
-          ...(data.error ? { error: data.error } : {}),
-          ...(data.lastReview ? { review: { accepted: data.lastReview.accepted, note: clip(data.lastReview.note, 6500) } } : {}),
-          ...(requests.has(data.id) ? { requests: requests.get(data.id) } : {}),
-          ...(worker.lifecycleError ? { lifecycleError: worker.lifecycleError } : {}),
-        };
-      }),
+    const firstReports = [];
+    const workers = targets.map(worker => {
+      const { data } = worker;
+      const report = settled(worker) && data.lastResult ? this.report(worker) : undefined;
+      // 主控已放弃的调用收不到这份返回，不记为已返回。
+      if (report && !call.abandoned) {
+        if (worker.reportedResultId !== data.lastResult.resultId) firstReports.push(worker);
+        worker.reportedResultId = data.lastResult.resultId;
+      }
+      const pendingReview = data.status === 'awaiting_review' && !worker.verifying && data.worktree;
+      return {
+        id: data.id, name: data.name, status: data.status, attention: needsParent(worker),
+        ...(data.queueReason ? { queueReason: data.queueReason } : {}),
+        ...(data.blockedBy?.length ? { blockedBy: data.blockedBy.map(item => item.name) } : {}),
+        ...(report ? { resultId: data.lastResult.resultId, ...report } : {}),
+        ...(report && data.lastResult.durationMs !== undefined ? { durationMs: data.lastResult.durationMs } : {}),
+        ...(report && data.lastResult.numTurns !== undefined ? { turns: data.lastResult.numTurns } : {}),
+        ...(data.error ? { error: data.error } : {}),
+        ...(data.lastReview ? { review: { accepted: data.lastReview.accepted, note: clip(data.lastReview.note, 6500) } } : {}),
+        ...(pendingReview ? this.pendingDiff(worker) : {}),
+        ...(requests.has(data.id) ? { requests: requests.get(data.id) } : {}),
+        ...(worker.lifecycleError ? { lifecycleError: worker.lifecycleError } : {}),
+      };
+    });
+    if (!call.abandoned) {
+      if (repeated) this.lastReported.clear();
+      else if (firstReports.length) this.lastReported = new Map(firstReports.map(worker => [worker.data.id, worker.data.lastResult.resultId]));
+    }
+    const done = targets.every(worker => settled(worker) && !needsParent(worker));
+    const hint = !call.abandoned && this.abandonedNote;
+    if (hint) this.abandonedNote = undefined;
+    const response = {
+      next: this.nextStep({ done, timedOut, repeated }, workers), done, timedOut, waitedMs,
+      ...(this.closing ? { closing: true } : {}), ...(repeated ? { repeated: true } : {}), ...(hint ? { hint } : {}),
+      workers,
     };
+    // 预留给调用方附加的字段（团队 ID、警告、本次操作的回执）。
+    return fitResponse(response, Math.max(4000, (this.config.responseBytes ?? DEFAULT_RESPONSE_BYTES) - 2000));
+  }
+
+  /** 返回最前面的一句话：主控下一步做什么。主控先读到它，省去推理，也不会去重查已交付的结论。 */
+  nextStep({ done, timedOut, repeated }, workers) {
+    if (this.closing) return '团队正在关闭';
+    const actions = workers.filter(item => item.attention).map(item => this.attentionStep(item));
+    if (actions.length) return `需要主控处理：${actions.join('；')}。处理后默认继续等待其余工作者`;
+    if (!workers.length) return '没有进行中或待返回的工作者，全部完成';
+    if (!done) return timedOut ? '工作者仍在运行：直接再调用 team_wait，不要自己调查已派出的问题' : '直接再调用 team_wait';
+    return `${repeated ? '以下是上次已返回过的结果（上次可能没送达）。' : ''}全部完成：把各 summary 开头直接转述给用户；` +
+      'evidence 是 MCP 按行号读出的原文，不必再打开文件或重查。追问某个工作者用 team_resume（保留它的上下文）';
+  }
+
+  attentionStep(item) {
+    const worker = this.workers.get(item.id);
+    const { name } = item;
+    if (item.lifecycleError) return `${name} 收尾异常（见 lifecycleError），用 team_status 核对`;
+    if (item.requests?.length) {
+      return item.requests.map(request => request.kind === 'permission'
+        ? `${name} 请求工具授权：team_reply(requestId: "${request.id}", allow: true 或 false)`
+        : `${name} 在等回答：team_reply(requestId: "${request.id}", text: …)`).join('；');
+    }
+    if (item.status === 'awaiting_review') {
+      return item.review?.accepted === false
+        ? `${name} 自动验收未通过（见 review.note）：team_send 让它修复，或 team_review(resultId: "${item.resultId}", accepted: false)`
+        : `${name} 待验收：核对附带的 diff 后 team_review(resultId: "${item.resultId}", accepted: true 或 false, note)`;
+    }
+    if (item.status === 'blocked') return `${name} 被 ${(item.blockedBy ?? []).join('、') || '上游任务'} 阻塞：先处理上游`;
+    if (item.status === 'failed' && worker?.controller) return `${name} 失败（见 error）：team_send 指示修复，或 team_close`;
+    return `${name} ${item.status === 'stopped' ? '进程已退出' : '失败且进程已退出'}（见 error）：team_resume 继续，或 team_close`;
+  }
+
+  /**
+   * team_wait 返回的报告：摘要被截断时从完整交付补足，主控通常无需再调 team_result；
+   * 报告里引用的 文件:行号 由 MCP 读出原文附在 evidence，主控核对证据不必再打开文件。
+   */
+  report(worker) {
+    const { data } = worker;
+    const { resultId, text, textTruncated } = data.lastResult;
+    let full = text;
+    let report = { summary: text };
+    if (textTruncated) {
+      // 完整交付读取失败时退回摘要并标记截断，由 team_result 报告具体错误。
+      try {
+        full = String(this.results.get(data.id, resultId).text ?? '');
+        report = { summary: clip(full, REPORT_CHARS), ...(full.length > REPORT_CHARS ? { summaryTruncated: true } : {}) };
+      } catch { report = { summary: text, summaryTruncated: true }; }
+    }
+    const roots = [...(data.worktree?.cwd && existsSync(data.worktree.cwd) ? [data.worktree.cwd] : []), data.cwd];
+    let evidence;
+    try { evidence = collectEvidence(full, roots, { platform: this.platform }); }
+    catch (error) { evidence = [{ ok: false, reason: `证据读取失败：${clip(error.message, 500)}` }]; }
+    return { ...report, ...(evidence.length ? { evidence } : {}) };
+  }
+
+  /** 待主控验收的隔离写入直接附上改动，主控核对后即可 team_review，不必先调 team_diff。 */
+  pendingDiff(worker) {
+    try {
+      const diff = this.isolation.diff(worker, { limit: DIFF_CHARS });
+      return { diff: { files: diff.files.slice(0, 100).map(file => `${file.status} ${file.path}`),
+        ...(diff.files.length > 100 ? { fileCount: diff.files.length } : {}),
+        ...(diff.outsideScope.length ? { outsideScope: diff.outsideScope.slice(0, 100) } : {}),
+        patch: diff.text, ...(diff.hasMore ? { patchTruncated: true, totalLength: diff.totalLength } : {}) } };
+    } catch (error) {
+      return { diffError: clip(error.message, 1000) };
+    }
   }
 
   send(id, text, { automatic = false } = {}) {
@@ -718,9 +1067,13 @@ export class TeamManager {
       this.deliver(worker, text, messageId, warnings);
     }
     if (!automatic) {
-      // 主控的新指令开启新一轮：取消进行中的验证并重置自动修复次数，随下次保存持久化。
+      // 主控的新指令开启新一轮：取消进行中的验证和待发的自动重试，重置自动修复与重试次数，随下次保存持久化。
       worker.verifyAbort?.abort();
+      clearTimeout(worker.retryTimer);
+      worker.retryTimer = undefined;
       if (worker.data.fixRounds) worker.data.fixRounds = 0;
+      if (worker.data.apiRetries) worker.data.apiRetries = 0;
+      this.acknowledge(id);
     }
     try { this.schedule(warnings); }
     catch (error) { warnings.push(`消息已接受，但后续调度失败：${error.message}`); }
@@ -840,6 +1193,7 @@ export class TeamManager {
     this.requests.delete(requestId);
     item.cleanup();
     item.resolve(answer);
+    this.acknowledge(item.workerId);
     const warnings = [];
     try { this.event(item.workerId, 'request_answered', { requestId, kind: item.kind }); }
     catch (error) {
@@ -902,7 +1256,7 @@ export class TeamManager {
     if (worker.data.status === 'closing' || worker.closingPromise) throw new Error('工作者正在关闭');
     if (worker.controller) throw new Error('工作进程仍在运行，请用 send 追加指令');
     assertBackgroundTasksStopped(worker.data);
-    if (!worker.data.sessionId && worker.data.startedAt) throw new Error('没有可恢复的 CC 会话 ID；请新建工作者重试启动');
+    if (!worker.data.command && !worker.data.sessionId && worker.data.startedAt) throw new Error('没有可恢复的 CC 会话 ID；请新建工作者重试启动');
     if (unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活，请核实并关闭原进程后恢复`);
     }
@@ -927,7 +1281,7 @@ export class TeamManager {
     const previousData = worker.data;
     worker.touched = true;
     worker.data = { ...prepared, instructions: this.instructions(prepared), status: 'queued', error: undefined,
-      pendingMessages: [], queuedMessages, lastReview: undefined, cancelled: false, fixRounds: 0 };
+      pendingMessages: [], queuedMessages, lastReview: undefined, cancelled: false, fixRounds: 0, apiRetries: 0 };
     let saved = false;
     try {
       this.save(worker);
@@ -941,6 +1295,7 @@ export class TeamManager {
       }
       throw error;
     }
+    this.acknowledge(id);
     const warnings = [];
     try { this.schedule(warnings); }
     catch (error) { warnings.push(`恢复任务已保存，但后续调度失败：${error.message}`); }
@@ -961,13 +1316,22 @@ export class TeamManager {
     }
   }
 
-  review(id, accepted, note, handoff, expectedResultId, { merge } = {}) {
+  review(id, accepted, note, handoff, expectedResultId, { merge, automatic = false } = {}) {
     const worker = this.get(id);
     id = worker.data.id;
     this.assertReviewable(worker, accepted, expectedResultId);
     // 隔离任务以合并成功为验收前提：合并失败则验收不生效，改动留在隔离工作区。
     if (accepted && worker.data.worktree && !merge) {
       merge = this.isolation.merge(worker);
+      // 冲突不必主控处理：并入主工作区最新内容后发回原工作者解决，完成后再次待验收。
+      if (!merge.ok && merge.kind === 'conflict' && worker.controller && this.sendConflict(worker, merge, text => {
+        this.send(id, text, { automatic: true });
+        return true;
+      })) {
+        if (!automatic) this.acknowledge(id);
+        return { id, name: worker.data.name, accepted: false, sentBack: true, status: worker.data.status,
+          note: `合并冲突已发回 ${worker.data.name} 在隔离工作区解决，完成后会再次待验收；用 team_wait 等待` };
+      }
       if (!merge.ok) {
         throw new Error(`验收未生效，改动未合并回主工作区：${merge.error}。可用 team_diff 查看改动，team_send 让工作者修正，或 team_review accepted:false`);
       }
@@ -979,6 +1343,7 @@ export class TeamManager {
       status: accepted ? 'idle' : 'awaiting_review' };
     try { this.save(worker); }
     catch (error) { worker.data = previous; this.acceptanceCache = undefined; throw error; }
+    if (!automatic) this.acknowledge(id);
     // 持久化成功即为验收提交点；辅助步骤失败不能伪报验收未生效。
     const warnings = [];
     try { this.event(id, 'review', worker.data.lastReview); }
@@ -989,8 +1354,9 @@ export class TeamManager {
       ...(warnings.length ? { warnings } : {}) };
   }
 
-  async closeWorker(id) {
+  async closeWorker(id, { automatic = false } = {}) {
     const worker = this.get(id);
+    if (!automatic) this.acknowledge(worker.data.id);
     if (worker.closingPromise) return worker.closingPromise;
     worker.closingPromise = this.finishCloseWorker(worker);
     try { return await worker.closingPromise; } finally { worker.closingPromise = null; this.schedule(); }
@@ -999,6 +1365,8 @@ export class TeamManager {
   async finishCloseWorker(worker) {
     const id = worker.data.id;
     worker.verifyAbort?.abort();
+    clearTimeout(worker.retryTimer);
+    worker.retryTimer = undefined;
     if (!worker.controller) assertBackgroundTasksStopped(worker.data);
     if (!worker.controller && unconfirmedProcess(worker.data)) {
       throw new Error(`上次工作进程 PID ${worker.data.lastPid} 仍存活且不由当前团队控制，请核实原进程后重试关闭`);
