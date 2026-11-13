@@ -10,10 +10,30 @@ const TOTAL_CHARS = 6000;
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 // 只扫描报告开头；超长交付后部的引用主控本来也不会读到。
 const SCAN_CHARS = 50000;
-// 文件:行号、文件:起-止、文件#L行号；路径前不能紧接路径字符，行号后不能紧接数字。
-const REFERENCE = /(?<![\w./\\-])((?:[A-Za-z]:)?[\w./\\-]+?)(?::(\d+)(?:[-–](\d+))?|#L(\d+)(?:-L?(\d+))?)(?!\d)/g;
+// 每个引用最多尝试的前缀剥离次数，防止长段无标点中文逐字试探。
+const MAX_CANDIDATES = 32;
+// 文件:行号、文件:起-止、文件#L行号；路径可含中文等非 ASCII 字符，路径前不能紧接 ASCII 路径字符，行号后不能紧接数字。
+const REFERENCE = /(?<![\w./\\-])((?:[A-Za-z]:)?[\p{L}\p{N}_./\\-]+?)(?::(\d+)(?:[-–](\d+))?|#L(\d+)(?:-L?(\d+))?)(?!\d)/gu;
 const hasSeparator = path => /[/\\]/.test(path);
 const looksLikeFile = path => hasSeparator(path) || /\.[A-Za-z]\w*$/.test(path);
+const ascii = char => char.charCodeAt(0) < 0x80;
+
+/**
+ * 中文行文常把路径紧贴在说明文字后面（如“位于src/a.go:3”），匹配会带上前面的字。
+ * 依次去掉第一段中非 ASCII 字符之前的部分作为候选，由文件系统判定哪一个是真实路径；按从长到短排列。
+ */
+function candidates(text) {
+  const firstSeparator = text.search(/[/\\]/);
+  const limit = firstSeparator < 0 ? text.length : firstSeparator + 1;
+  const result = [text];
+  let offset = 0;
+  for (const char of text) {
+    offset += char.length;
+    if (offset >= limit || result.length >= MAX_CANDIDATES) break;
+    if (!ascii(char)) result.push(text.slice(offset));
+  }
+  return result;
+}
 
 function isFile(path) {
   try { return statSync(path).isFile(); } catch { return false; }
@@ -55,19 +75,30 @@ export function collectEvidence(text, roots, { platform = process.platform } = {
   let budget = TOTAL_CHARS;
   for (const match of String(text ?? '').slice(0, SCAN_CHARS).matchAll(REFERENCE)) {
     if (evidence.length >= MAX_REFERENCES) break;
-    const [ref, path] = match;
+    const [matched, raw] = match;
+    const location = matched.slice(raw.length);
     const start = Number(match[2] ?? match[4]);
     const end = Number(match[3] ?? match[5] ?? start);
-    if (!looksLikeFile(path) || path.startsWith('//') || start < 1) continue;
-    const found = locate(path, roots, platform);
-    if (found === undefined) continue;
-    if (found === null) {
-      if (!hasSeparator(path)) continue;
+    if (start < 1) continue;
+    let found;
+    let path;
+    const missing = [];
+    for (const candidate of candidates(raw)) {
+      if (!looksLikeFile(candidate) || candidate.startsWith('//')) continue;
+      const located = locate(candidate, roots, platform);
+      if (located) { found = located; path = candidate; break; }
+      if (located === null) missing.push(candidate);
+    }
+    if (!found) {
+      // 都找不到时优先报告去掉说明文字、以 ASCII 开头的路径；裸文件名找不到不报告，避免误判主机名、版本号。
+      path = missing.find(candidate => candidate !== raw && ascii(candidate[0])) ?? missing[0];
+      if (!path || !hasSeparator(path)) continue;
       if (seen.has(`missing:${path}`)) continue;
       seen.add(`missing:${path}`);
-      evidence.push({ ref, ok: false, reason: '工作目录内找不到该文件' });
+      evidence.push({ ref: `${path}${location}`, ok: false, reason: '工作目录内找不到该文件' });
       continue;
     }
+    const ref = `${path}${location}`;
     const id = `${found.full}:${start}-${end}`;
     if (seen.has(id)) continue;
     seen.add(id);

@@ -78,3 +78,20 @@ test('指向项目外的符号链接不读取', t => {
   catch (error) { t.skip(`当前环境不能创建符号链接：${error.code}`); return; }
   assert.deepEqual(collectEvidence('src/link.txt:1', [w.root]), []);
 });
+
+test('中文路径和紧贴说明文字的引用都能定位，找不到时报告去掉说明文字后的路径', t => {
+  const w = workspace(t);
+  w.write('网关/转发.go', 'a\nb\nc\nd\ne\n');
+  const evidence = collectEvidence([
+    '见 网关/转发.go:3', `绝对路径 ${w.root}/网关/转发.go:1`, '根因位于src/app.js:2', '另见网关/转发.go#L5',
+    '这里写错了src/gone.js:4', '对应main.go:1行',
+  ].join('；'), [w.root]);
+  assert.deepEqual(evidence.map(item => [item.ref, item.file, item.ok, item.lines]), [
+    ['网关/转发.go:3', '网关/转发.go', true, '1-5'],
+    [`${w.root}/网关/转发.go:1`, '网关/转发.go', true, '1-3'],
+    ['src/app.js:2', 'src/app.js', true, '1-4'],
+    ['网关/转发.go#L5', '网关/转发.go', true, '3-5'],
+    ['src/gone.js:4', undefined, false, undefined],
+  ]);
+  assert.equal(evidence[0].text, '1| a\n2| b\n3| c\n4| d\n5| e');
+});

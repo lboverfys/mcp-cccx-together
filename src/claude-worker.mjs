@@ -390,6 +390,7 @@ export function createClaudeWorker({ worker, config, emit, request, readDependen
         messageIds: message.user_message_uuids,
         subtype: message.subtype,
         terminalReason: message.terminal_reason,
+        apiErrorStatus: message.api_error_status,
         usage: message.usage,
         modelUsage: message.modelUsage,
         costUsd: message.total_cost_usd,

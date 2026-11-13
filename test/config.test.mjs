@@ -167,3 +167,19 @@ test('provider 配置校验字段和变量名，默认 provider 必须存在，�
   assert.throws(() => load({ providers: { ds: { envFrom: { ANTHROPIC_AUTH_TOKEN: 'not a name' } } } }), /来源环境变量名/);
   assert.throws(() => load({ providers: { ds: { env: { A: '1' }, envFrom: { A: 'B' } } } }), /重复设置：A/);
 });
+
+test('等待类返回的篇幅上限默认 40000 字节，可由配置或环境变量覆盖并校验，是否显式设置可区分', t => {
+  const f = fixture(t);
+  const options = { ...f.options, requireClaude: false };
+  const defaults = loadConfig(undefined, options);
+  assert.equal(defaults.responseBytes, 40000);
+  assert.equal(defaults.responseBytesExplicit, false);
+  const configured = loadConfig(f.write('bytes.json', '{"responseBytes":96000}'), options);
+  assert.deepEqual([configured.responseBytes, configured.responseBytesExplicit], [96000, true]);
+  const overridden = loadConfig(undefined, { ...options, env: { ...options.env, CC_TEAM_RESPONSE_BYTES: '64000' } });
+  assert.equal(overridden.responseBytes, 64000);
+  assert.equal(overridden.registrationEnv.CC_TEAM_RESPONSE_BYTES, '64000');
+  for (const value of ['"big"', '7999', '1000001']) {
+    assert.throws(() => loadConfig(f.write('bad-bytes.json', `{"responseBytes":${value}}`), options), /responseBytes/);
+  }
+});

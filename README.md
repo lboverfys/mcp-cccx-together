@@ -52,9 +52,10 @@ sequenceDiagram
     Codex-->>You: summary
 ```
 
-- **One call per delegation.** Codex is the slow part, so the server saves Codex turns. `team_dispatch` submits every task at once and by default returns only when they have all stopped or one needs a decision, like Claude Code's own sub-agents. Codex hands over everything that needs reading code, searching, running commands or editing, and doesn't investigate first.
+- **One call per delegation.** Codex is the slow part, so the server saves Codex turns. `team_dispatch` submits every task at once and by default returns only when they have all stopped or one needs a decision, like Claude Code's own sub-agents. Handling a worker afterwards (`team_reply`, `team_send`, `team_review`, `team_resume`) waits again in the same call. Every result starts with `next`, one sentence on what Codex should do. Codex hands over everything that needs reading code, searching, running commands or editing, and doesn't investigate first.
 - **Verified, not self-reported.** With a `verify` command (for example `npm test`) the server checks the result itself and sends failures back to the same worker, up to `maxFixRounds` times. For write tasks without `verify`, Codex reviews the result before anything downstream starts.
 - **Each job is done once.** Read and verify tasks are accepted as soon as they finish, their processes are closed, and the full report comes back with the dispatch. Workers report in a fixed short format: an answer Codex can pass on as-is, `file:line` evidence, and verified facts kept apart from guesses. The server reads every cited line and returns it as `evidence`, flagging citations that don't exist, so Codex checks a report without opening files or repeating the investigation.
+- **Results reach Codex.** If Codex gives up on a wait (a tool timeout or an interrupt), its results are not counted as delivered, and the next `team_wait` brings them back. Responses stay within Codex's output budget: evidence and patches are shortened first, so every report keeps its opening. Transient API errors (rate limits, overload, network) are retried in the worker's own session before Codex hears about them.
 - **Isolated, parallel writes.** In a git repository, each write task works in its own git worktree, so write tasks run in parallel even when their scopes overlap. Their test runs don't see each other's half-finished edits. On acceptance, only changes inside the task's `scope` are merged back; anything outside is rejected. If another task changed the same lines first, the server merges the latest working tree into the worker's worktree, leaves conflict markers, and sends it back to the same worker.
 - **Parallel inside a worker.** Codex doesn't read the code before delegating, so it often can't split a task. Workers can, using Claude Code's own sub-agents: read and verify tasks fan out to the read-only Explore agent, write tasks may also use general-purpose agents, which are bound to the same scope.
 - **No extra sessions for plain commands.** A verify task without a prompt is a command task: the server runs its `verify` command directly, without starting Claude Code. Use it for the final test run after several writes.
@@ -91,8 +92,8 @@ cc-team-mcp doctor
 cc-team-mcp setup
 ```
 
-- `doctor` checks Node, Claude Code, Codex, the state/temp directories, and whether Codex lets `team_wait` block long enough (`codexWait`). It makes no model calls and creates nothing.
-- `setup` registers the server with Codex as `cc_team` (via `codex mcp add`). It also sets Codex's tool timeout so that `team_wait` can block for up to 9.5 minutes, and forwards any provider credentials (see [Longer waits](#longer-waits)). It refuses to overwrite an existing entry; use `--name` to pick another name.
+- `doctor` checks Node, Claude Code, Codex, the state/temp directories, whether Codex lets `team_wait` block long enough (`codexWait`), and whether the team's tools are visible from the first turn with enough output budget (`codexTools`). It makes no model calls and creates nothing.
+- `setup` registers the server with Codex as `cc_team` (via `codex mcp add`). It also sets Codex's tool timeout so that `team_wait` can block for up to 9.5 minutes, puts the team's tools in Codex's initial tool list with a larger output budget, and forwards any provider credentials (see [Longer waits](#longer-waits) and [Tool visibility and output budget](#tool-visibility-and-output-budget)). It refuses to overwrite an existing entry; use `--name` to pick another name, or `codex mcp remove cc_team` first to re-register with new settings.
 - `--omit=optional` skips the Claude binary bundled with the Agent SDK; your installed Claude Code is used instead.
 
 Open a new Codex session and run `/mcp` to confirm the server is connected.
@@ -138,9 +139,9 @@ Mention **`mct`** (or **`ctm`**) in your request to Codex:
 
 Codex then:
 
-1. Writes the clues it already has (error text, IDs, paths) into short prompts and calls `team_dispatch` once with all tasks, one worker per independent question. It doesn't search the code first. A team is opened automatically (call `team_open` first only to set constraints, change concurrency or reopen an old team).
-2. The call blocks until every task has stopped or one needs attention, and returns what `team_wait` returns: each stopped worker's full report (`summaryTruncated: true` if it is too long; read the rest with `team_result`), the cited lines as `evidence`, and the run's `durationMs` and `turns`. If the wait times out (`timedOut: true`), Codex calls `team_wait`. Pass `wait: false` to return right away when Codex has unrelated work of its own.
-3. Handles only workers marked `attention: true`:
+1. Writes the clues it already has (error text, IDs, paths) into short prompts and calls `team_dispatch` once with all tasks, one worker per independent question. It doesn't search the code first. A team is opened automatically (call `team_open` first only to set constraints, change concurrency or reopen an old team). If a name is already taken, the task is renamed and the new name is in `warnings`. The same task sent again before its result arrived (for example after a timed-out call) reattaches to the original.
+2. The call blocks until every task has stopped or one needs attention, and returns what `team_wait` returns: `next` (what to do now), each stopped worker's full report (`summaryTruncated: true` if it is too long; read the rest with `team_result`), the cited lines as `evidence`, and the run's `durationMs` and `turns`. If the wait times out (`timedOut: true`), Codex calls `team_wait`. Pass `wait: false` to return right away when Codex has unrelated work of its own.
+3. Handles only workers marked `attention: true`, as `next` describes. `team_reply`, `team_send`, `team_review` and `team_resume` then keep waiting in the same call:
 
    | Status | What Codex does |
    | --- | --- |
@@ -150,7 +151,7 @@ Codex then:
    | `blocked` | Fixes the upstream task listed in `blockedBy` |
    | `awaiting_review` | Checks the `diff` attached to the result (`team_diff` pages through a long patch), then `team_review` |
 
-4. Repeats `team_wait` until `done: true` and passes the reports on. After several write tasks, the overall test run is a command task in the same batch that depends on all of them (`access: "verify"`, a `verify` command, no `prompt`), not a Codex step. Auto-accepted read and verify workers are already closed, so no `team_close` is needed; use `team_resume` for follow-ups.
+4. Continues until `done: true` and passes the reports on. After several write tasks, the overall test run is a command task in the same batch that depends on all of them (`access: "verify"`, a `verify` command, no `prompt`), not a Codex step. Auto-accepted read and verify workers are already closed, so no `team_close` is needed; use `team_resume` for follow-ups.
 
 Workers ask Codex (`needs_input`) only when an action is destructive or a wrong guess would waste the work. Otherwise they go with the most reasonable reading and state the assumption in the report.
 
@@ -177,13 +178,13 @@ Each entry in `team_dispatch.workers` accepts:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `name` | — | Short role name. `cc` is appended if missing; at most 24 characters including `cc`; unique within the team. |
+| `name` | — | Short role name. `cc` is appended if missing; at most 24 characters including `cc` (longer names are shortened). If the team already has a worker with that name, the task is renamed (`apicc` → `api2cc`) and `warnings` says so; the same task sent again before its result arrived reattaches to the original. |
 | `cwd` | — | Absolute path of the project directory. |
 | `prompt` | — | The task. State the question or goal and the clues you already have; the worker does the searching. Leave it out on a verify task with `verify` to make a command task. |
 | `access` | `read` | `read`: Read/Glob/Grep only. `verify`: also Bash, for tests, builds, git history, logs or running a program (should not edit files). `write`: full toolset. |
-| `scope` | whole `cwd` | Paths relative to `cwd` (not globs). **Required** for `write`; use `["."]` when you don't know which files will change. File-editing tools and merging are limited to it. Isolated write tasks run in parallel even if their scopes overlap; shared ones and verify tasks wait for overlapping writers. |
+| `scope` | whole `cwd` | Paths relative to `cwd` (not globs). File-editing tools and merging are limited to it. A write task in a git repository works in its own worktree and only in-scope changes are merged, so leaving `scope` out is fine. Outside a git repository a write task edits your files directly and **must** set `scope`. Isolated write tasks run in parallel even if their scopes overlap; shared ones and verify tasks wait for overlapping writers. |
 | `dependsOn` | `[]` | Names or IDs of tasks that must be accepted first; may reference tasks in the same batch. |
-| `verify` | — | Shell command run after the worker succeeds, in the worker's worktree for isolated tasks. Exit code 0 means pass. Times out after 10 minutes. `auto` picks the command from the project files (`package.json` test script, `go.mod`, `Cargo.toml`, pytest config, Gradle, Maven, .NET, `make test`), searching up to the repository root; if none is found, a write task falls back to Codex review. |
+| `verify` | — | Shell command run after the worker succeeds, in the worker's worktree for isolated tasks. Exit code 0 means pass. Times out after 10 minutes. `auto` picks the command from the project files (`package.json` test script, `go.mod`, `Cargo.toml`, pytest config, Gradle, Maven, .NET, `make test`), searching up to the repository root; if none is found, a write task falls back to Codex review and other tasks ignore `verify`. A write worker under auto review is told the command, so it runs only targeted checks itself instead of the full suite. |
 | `review` | `auto` for read and verify tasks and for write tasks with `verify`, otherwise `codex` | `auto`: accept when the worker succeeds and `verify` (if any) passes; read and verify workers are then closed. `codex`: wait for Codex to call `team_review`. Write tasks need a `verify` command to use `auto`. |
 | `explore` | `true` | Let the worker split its work across Claude Code sub-agents when that pays off: Explore for read and verify tasks, also general-purpose for write tasks. Sub-agents cannot nest. `false` turns it off. |
 | `maxFixRounds` | `2` | How many times a failing `verify`, an out-of-scope change or a merge conflict is sent back to the worker before Codex is asked (0–5). A `verify` command that cannot run at all (command not found) goes to Codex right away. |
@@ -202,19 +203,19 @@ Team-wide options are set with `team_open`: `constraints` (text added to every w
 | Tool | Purpose |
 | --- | --- |
 | `team_dispatch` | Submit a batch of tasks (opens a team if none is open) and, unless `wait: false`, wait and return what `team_wait` returns |
-| `team_wait` | Block until all tasks stop or one needs attention; returns each stopped worker's full report, the cited lines (`evidence`), and the diff of write results awaiting review |
+| `team_wait` | Block until all tasks stop or one needs attention; returns `next`, each stopped worker's full report, the cited lines (`evidence`), and the diff of write results awaiting review. With nothing left to wait for, re-sends the latest results once (`repeated: true`) |
 | `team_open` | Create or reopen a team; set constraints and concurrency; lists configured providers |
 | `team_list` | List saved teams |
 | `team_status` | Full state: dependencies, queue reasons, processes, worktrees, requests, latest results and reviews, and `timing` (see [Measuring speed](#measuring-speed)) |
 | `team_events` | Raw event stream with cursor (for debugging; use `team_wait` to wait) |
 | `team_request` | Read a pending question or permission request in full |
-| `team_reply` | Answer a question, or allow/deny a tool call |
-| `team_result` | Read a full result, paged (up to 100 KB per page) |
+| `team_reply` | Answer a question, or allow/deny a tool call; then wait like `team_wait` unless `wait: false` |
+| `team_result` | Read a full result, paged (default page size follows `responseBytes`, up to 100 KB) |
 | `team_diff` | Show an isolated task's unmerged changes: files, out-of-scope files, stat and a paged patch |
-| `team_review` | Accept or reject a specific result version (`resultId` is required); accepting an isolated task merges it, and a merge conflict is sent back to the worker (`sentBack: true`) |
-| `team_send` | Send a follow-up instruction to a worker |
+| `team_review` | Accept or reject a specific result version (`resultId` is required); accepting an isolated task merges it, and a merge conflict is sent back to the worker (`sentBack: true`). Then waits like `team_wait` unless `wait: false` |
+| `team_send` | Send a follow-up instruction to a worker; then wait like `team_wait` unless `wait: false` |
 | `team_interrupt` | Interrupt a worker's current turn |
-| `team_resume` | Restart a closed worker in its original Claude Code session |
+| `team_resume` | Restart a closed worker in its original Claude Code session, keeping its context; then wait like `team_wait` unless `wait: false` |
 | `team_close` | Stop specific workers, keeping their sessions |
 | `team_shutdown` | Stop all workers and release the team |
 
@@ -282,6 +283,7 @@ No configuration file is needed for a standard install. To customise, copy [`tea
 | --- | --- | --- | --- |
 | `permissionMode` | `CC_TEAM_PERMISSION_MODE` | `bypassPermissions` | `bypassPermissions`, `acceptEdits`, or `default` (tool calls are approved by Codex via `team_reply`) |
 | `waitTimeoutMs` | `CC_TEAM_WAIT_TIMEOUT_MS` | `50000` (`setup` registers `570000`) | Longest single `team_wait`, in ms. Must stay below the client's tool timeout |
+| `responseBytes` | `CC_TEAM_RESPONSE_BYTES` | `40000` (`setup` registers `96000`) | Largest response of a waiting call, in UTF-8 bytes. Must fit the client's output budget for those tools |
 | `providers` | — | none | Named Anthropic-compatible providers (see [Models and providers](#models-and-providers)) |
 | `defaultProvider` | `CC_TEAM_DEFAULT_PROVIDER` | none | Provider used when a task doesn't name one |
 | `claudeExecutable` | `CC_TEAM_CLAUDE_EXECUTABLE` | auto-detected | Absolute path to Claude Code |
@@ -300,6 +302,8 @@ Codex stops a tool call after its tool timeout. Each wait that times out, whethe
 
 `cc-team-mcp doctor` reads these two settings from the Codex config and reports them under `checks.codexWait`, with a hint when the wait is short.
 
+If Codex gives up on a wait anyway (its tool timeout is shorter than the server's wait, or you interrupted it), nothing is lost: the results of that wait are not counted as delivered, and the next `team_wait` returns them with a `hint` to check the configuration. When Codex reports the cancellation as a timeout, later waits return `timedOut: true` before that limit instead of failing in Codex.
+
 For a manual setup, raise both limits together:
 
 ```toml
@@ -310,9 +314,21 @@ tool_timeout_sec = 600
 CC_TEAM_WAIT_TIMEOUT_MS = "570000"
 ```
 
+### Tool visibility and output budget
+
+Recent Codex versions load MCP tools on demand: before it can see `team_dispatch`, the model has to call `tool_search`, which costs one more slow turn in every session. Codex also truncates long tool output and doesn't page through what was cut, so the middle of a multi-worker result can disappear. `setup` therefore also writes, in the same table:
+
+```toml
+[mcp_servers.cc_team]
+omit_tools_from = ["deferred"]               # the team's tools are in Codex's initial tool list
+tools.team_wait.output_token_limit = 40000   # also team_dispatch, team_send, team_reply, team_resume, team_review, team_result, team_diff, team_status
+```
+
+It registers `CC_TEAM_RESPONSE_BYTES = 96000` to match. Codex versions that don't know these keys ignore them. After writing, `setup` checks that Codex can still read its config and restores the file if it can't. `doctor` reports both settings under `checks.codexTools`. Without them, the server keeps each response within 40,000 bytes, which fits Codex's default budget.
+
 ### Windows launcher
 
-From a source checkout, `Start-TeamCodex.ps1` starts Codex in a project with the server attached for that session only. This includes the longer wait settings and forwarding of provider environment variables, including those named in `envFrom`. Your global Codex config is not modified.
+From a source checkout, `Start-TeamCodex.ps1` starts Codex in a project with the server attached for that session only. This includes the longer wait settings, tool visibility and output budget, and forwarding of provider environment variables, including those named in `envFrom`. Your global Codex config is not modified.
 
 ```powershell
 .\Start-TeamCodex.ps1 -ProjectPath C:\work\my-app
@@ -374,7 +390,10 @@ Back up the state directory before upgrading. Older formats are migrated on the 
 | Codex doesn't show the tools | `codex mcp list` and `/mcp`; make sure the registered path still exists; open a new session |
 | Auth or network errors in workers | Run Claude Code on its own in the same environment; check `env_vars` forwarding |
 | "provider … 需要环境变量 …" (needs a variable) | The `envFrom` source variable isn't reaching the server. Re-run `setup`, or add it to `env_vars` |
-| `team_wait` fails with a tool timeout | Lower `CC_TEAM_WAIT_TIMEOUT_MS` or raise `tool_timeout_sec` ([Longer waits](#longer-waits)) |
+| `team_wait` fails with a tool timeout, or a result's `hint` says the last wait was abandoned | Lower `CC_TEAM_WAIT_TIMEOUT_MS` or raise `tool_timeout_sec` ([Longer waits](#longer-waits)). The results of the abandoned wait come back with the next `team_wait` |
+| Codex calls `tool_search` before it can use `team_dispatch` | The tools are deferred. Re-register with `setup`, or add `omit_tools_from = ["deferred"]` ([Tool visibility and output budget](#tool-visibility-and-output-budget)) |
+| A result has `compacted: true` or `summaryTruncated: true` | The response reached `responseBytes`. Read the rest with `team_result` or `team_diff`, or raise `responseBytes` together with the tools' `output_token_limit` |
+| A worker sits in `running` after an API error | The server retries transient API errors (429, 5xx, overload, network) in the same session, after 15 s and then 45 s; `team_events` shows `api_retry_scheduled`. If both retries fail, the worker is `failed` and reaches Codex |
 | Acceptance fails with "超出分配范围" (out of scope) | `team_diff` lists `outsideScope`. Ask the worker to revert those files, or re-dispatch with a wider `scope` |
 | Acceptance fails with "冲突" (conflict) | The conflict was sent back to the worker until `maxFixRounds` ran out, or the worker's process had exited. `team_resume` the worker to resolve it, or reject the result and re-dispatch from the current state |
 | Auto review fails with "找不到命令或程序" (command not found) | The `verify` command can't run in that directory. Fix the command (or use `auto`) and `team_send` the worker, or review it yourself |
@@ -401,7 +420,7 @@ CI runs on Windows, macOS and Linux with Node.js 22 and 24.
 
 `node scripts/smoke-live.mjs` runs an end-to-end session against your real Claude Code (two read-only workers, questions, multiple turns, resume). It **costs money**: each worker process is limited to 8 turns and an SDK-estimated $1. Add `--notify` to also test Codex notifications.
 
-Code layout: `src/server.mjs` (MCP tools), `src/manager.mjs` (team state machine and scheduling), `src/claude-worker.mjs` (one Claude Code process), `src/isolation.mjs` and `src/worktree.mjs` (worktrees and merging), `src/store.mjs` and `src/results.mjs` (durable state), `src/evidence.mjs` (reading cited lines for reports), `src/providers.mjs`, `src/config.mjs`, `src/cli.mjs`.
+Code layout: `src/server.mjs` (MCP tools), `src/manager.mjs` (team state machine and scheduling), `src/claude-worker.mjs` (one Claude Code process), `src/isolation.mjs` and `src/worktree.mjs` (worktrees and merging), `src/store.mjs` and `src/results.mjs` (durable state), `src/evidence.mjs` (reading cited lines for reports), `src/budget.mjs` (response size budget for waiting calls), `src/providers.mjs`, `src/config.mjs`, `src/cli.mjs`.
 
 ## Contributing
 

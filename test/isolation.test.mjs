@@ -303,3 +303,15 @@ test('主控验收遇到合并冲突时发回原工作者解决，不报错也�
   assert.match(readWorktree(two, 'src/a.txt'), /<<<<<<<[^\n]*\nfirst\n=======\nsecond\n>>>>>>>/);
   assert.equal(f.repo.read('src/a.txt'), 'first\n');
 });
+
+test('git 仓库中的写任务省略 scope 时在独立工作区修改，范围为整个 cwd', async t => {
+  const f = fixture(t);
+  const manager = await f.create();
+  const warnings = [];
+  const [worker] = manager.dispatch([f.spec('全局', { scope: undefined })], warnings);
+  const data = manager.get(worker.id).data;
+  assert.deepEqual(warnings, []);
+  assert.equal(data.isolation, 'worktree');
+  assert.deepEqual(data.scope, ['.']);
+  assert.equal(data.status, 'running');
+});

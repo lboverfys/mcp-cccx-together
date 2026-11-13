@@ -137,21 +137,21 @@ try {
     assert.equal(request.payload?.source, 'ask_parent');
     assert.equal(request.payload.questions.length, 1);
     assert.equal(request.payload.questions[0].question, `SMOKE_${['A', 'B'][index]}_QUESTION`);
-    await call('team_reply', { requestId: request.requestId, text: tokens.get(worker.id) });
+    await call('team_reply', { requestId: request.requestId, text: tokens.get(worker.id), wait: false });
   }
   log('replied', { workers: 2 });
   await pollUntil(() => [a, b].every(worker => resultFor(worker.id, undefined, 0)), '第一轮结果');
   for (const worker of [a, b]) {
     assert(resultFor(worker.id, undefined, 0).data.text.includes(tokens.get(worker.id)), '结果未包含主控回复令牌');
-    await call('team_review', { workerId: worker.id, resultId: resultFor(worker.id, undefined, 0).data.resultId, accepted: true, note: '核对了进度、阻塞提问、主控回复和结果令牌；未调用文件或命令工具。' });
+    await call('team_review', { workerId: worker.id, resultId: resultFor(worker.id, undefined, 0).data.resultId, accepted: true, note: '核对了进度、阻塞提问、主控回复和结果令牌；未调用文件或命令工具。', wait: false });
   }
   log('first_round_verified', { workers: 2 });
 
   let after = cursor;
-  const second = await call('team_send', { workerId: a.id, message: `${constraints}\n这是第二轮。先输出一行文字 SMOKE_A_SECOND，然后最终回答 SECOND_DONE，并原样复述第一轮主控回复的令牌。不要再提问。` });
+  const second = await call('team_send', { workerId: a.id, wait: false, message: `${constraints}\n这是第二轮。先输出一行文字 SMOKE_A_SECOND，然后最终回答 SECOND_DONE，并原样复述第一轮主控回复的令牌。不要再提问。` });
   await pollUntil(() => progress(a.id, 'SMOKE_A_SECOND', after) && resultFor(a.id, second.messageId, after), '追加指令');
   assert(resultFor(a.id, second.messageId, after).data.text.includes(tokens.get(a.id)), '第二轮未保留第一轮上下文');
-  await call('team_review', { workerId: a.id, resultId: resultFor(a.id, second.messageId, after).data.resultId, accepted: true, note: '追加指令的 messageId 和上下文令牌均符合预期。' });
+  await call('team_review', { workerId: a.id, resultId: resultFor(a.id, second.messageId, after).data.resultId, accepted: true, note: '追加指令的 messageId 和上下文令牌均符合预期。', wait: false });
   const beforeClose = (await status()).workers.find(worker => worker.id === a.id);
   assert(beforeClose.sessionId && beforeClose.pid, '缺少可恢复 sessionId 或实际 PID');
   const closed = await call('team_close', { workerIds: [a.id] });
@@ -161,12 +161,12 @@ try {
   log('closed_retained', { workerId: a.id, sessionId: beforeClose.sessionId });
 
   after = cursor;
-  const resumed = await call('team_resume', { workerId: a.id, message: `${constraints}\n这是关闭进程后的恢复测试。先输出一行文字 SMOKE_A_RESUMED，然后最终回答 RESUMED_DONE，并原样复述最初主控回复的令牌。不要再提问。` });
+  const resumed = await call('team_resume', { workerId: a.id, wait: false, message: `${constraints}\n这是关闭进程后的恢复测试。先输出一行文字 SMOKE_A_RESUMED，然后最终回答 RESUMED_DONE，并原样复述最初主控回复的令牌。不要再提问。` });
   await pollUntil(() => progress(a.id, 'SMOKE_A_RESUMED', after) && resultFor(a.id, resumed.messageId, after), '会话恢复');
   assert(resultFor(a.id, resumed.messageId, after).data.text.includes(tokens.get(a.id)), '恢复后未保留会话上下文');
   const resumedState = (await status()).workers.find(worker => worker.id === a.id);
   assert.equal(resumedState.sessionId, beforeClose.sessionId);
-  await call('team_review', { workerId: a.id, resultId: resultFor(a.id, undefined, after).data.resultId, accepted: true, note: '已核对恢复的 sessionId 和最初回复令牌。' });
+  await call('team_review', { workerId: a.id, resultId: resultFor(a.id, undefined, after).data.resultId, accepted: true, note: '已核对恢复的 sessionId 和最初回复令牌。', wait: false });
   log('resumed_verified', { workerId: a.id, sessionId: resumedState.sessionId });
 
   if (notify) {

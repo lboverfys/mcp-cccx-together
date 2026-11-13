@@ -42,19 +42,26 @@ $values = [ordered]@{
     startup_timeout_sec = 15
     tool_timeout_sec = 600
     env_vars = $environmentNames
+    # 团队工具直接进入 Codex 的初始工具列表，不必先 tool_search。
+    omit_tools_from = @('deferred')
 }
 $overrides = @()
 foreach ($key in $values.Keys) {
     $encodedValue = ConvertTo-Json -InputObject $values[$key] -Compress
     $overrides += @('-c', "mcp_servers.cc_team.$key=$encodedValue")
 }
+# 等待类返回的篇幅与这些工具的输出预算配套，多个工作者的报告不被 Codex 截断。
+foreach ($tool in @('team_dispatch', 'team_wait', 'team_send', 'team_reply', 'team_resume', 'team_review', 'team_result', 'team_diff', 'team_status')) {
+    $overrides += @('-c', "mcp_servers.cc_team.tools.$tool.output_token_limit=40000")
+}
 foreach ($property in $registration.env.PSObject.Properties) {
-    # team_wait 的等待上限与上面的 tool_timeout_sec 配套，单独覆盖。
-    if ($property.Name -eq 'CC_TEAM_WAIT_TIMEOUT_MS') { continue }
+    # team_wait 的等待上限与上面的 tool_timeout_sec 配套、返回篇幅与输出预算配套，单独覆盖。
+    if ($property.Name -in @('CC_TEAM_WAIT_TIMEOUT_MS', 'CC_TEAM_RESPONSE_BYTES')) { continue }
     $encodedValue = ConvertTo-Json -InputObject $property.Value -Compress
     $overrides += @('-c', "mcp_servers.cc_team.env.$($property.Name)=$encodedValue")
 }
 $overrides += @('-c', 'mcp_servers.cc_team.env.CC_TEAM_WAIT_TIMEOUT_MS="570000"')
+$overrides += @('-c', 'mcp_servers.cc_team.env.CC_TEAM_RESPONSE_BYTES="96000"')
 
 # 仅本次 Codex 启动生效，不改用户级配置、PATH 或模型设置。
 if ($teamConfig.codexExecutable -match '\.[cm]?js$') {
