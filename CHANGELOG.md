@@ -6,14 +6,19 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- **`team_dispatch` waits for results by default.** It returns what `team_wait` returns once the batch has stopped or a worker needs a decision, so a delegation costs Codex one call instead of two. Pass `wait: false` for the old immediate return.
+- **Server instructions set the division of labour, assuming Codex is the slow side.** Codex hands over everything that needs reading code, searching, running commands or editing, and doesn't investigate first or alongside a worker. It writes the clues it already has into short prompts, gives each independent question its own worker, and passes reports on instead of redoing or rewriting them. Write tasks may use `scope: ["."]` when the files aren't known yet. Overall testing after several writes is a verify task in the same batch, and a summary worker can merge many reports. The instructions are also shorter.
+- **Isolated writes no longer block read tasks.** A worktree write task doesn't touch the working tree until it is merged, so read tasks with overlapping scopes run alongside it. Verify tasks still wait.
 - **Read and verify tasks are accepted automatically.** `review` now defaults to `auto` for `read` and `verify` tasks (write tasks keep the 0.3.0 rule: `auto` only with `verify`). These tasks change no files, so manual review only made Codex redo the investigation before anything downstream could start. Pass `review: "codex"` to keep the old behaviour.
 - **Auto-accepted read and verify workers are closed.** Their processes are released right after acceptance, so Codex no longer calls `team_close`. Follow-ups use `team_resume`, which reopens the same Claude Code session.
 - **`team_wait` returns the full report.** A stopped worker's `summary` now holds up to 6,000 characters of its report, filled in from the stored result when the 2,000-character summary was cut. `summaryTruncated: true` marks longer reports. Without `workerIds`, `team_wait` also returns, once, any result Codex has not yet seen, such as one that finished and was auto-accepted between two waits.
-- **Shorter, checkable worker reports.** Worker instructions ask for at most 1,500 characters: the answer first, up to five pieces of `file:line` or command-output evidence, verified facts kept apart from guesses, and no unsupported likelihood rankings.
-- **Server instructions set the division of labour.** Codex is told not to investigate what it has delegated, to do a narrow lookup itself and delegate only independent sub-questions, to split broad work into non-overlapping parallel workers, and to use reports without redoing them.
+- **Shorter, checkable worker reports.** Worker instructions ask for at most 1,500 characters: first an answer Codex can pass to the user as-is, then up to five pieces of `file:line` or command-output evidence with exact line numbers (the server reads them back), verified facts kept apart from guesses, and no unsupported likelihood rankings.
 
 ### Added
 
+- **Cited lines come with the report.** The server reads every `file:line`, `file:start-end` or `file#Lline` citation in a report and returns the lines as `evidence`. Codex can check a report without opening files. Citations of missing files or past the end of a file are marked `ok: false`. Only files inside the worker's directory (its worktree first) are read, up to 8 citations and 6,000 characters.
+- **Write results awaiting review carry their diff.** `team_wait` attaches the changed files, out-of-scope files and up to 12,000 characters of patch, so Codex can call `team_review` without `team_diff` first.
+- `team_wait` reports each run's `durationMs` and `turns` and the call's own `waitedMs`. When the wait limit is under two minutes, a timed-out result carries a `hint` on how to raise it.
 - **`explore` task option.** A read task with `explore: true` may use Claude Code's Explore sub-agent for parallel searches. A hook keeps both the worker and its sub-agents on Read/Glob/Grep and blocks other agent types and nesting.
 
 ## [0.3.0]

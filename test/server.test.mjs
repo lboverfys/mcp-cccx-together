@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -252,8 +252,10 @@ async function fixture(t) {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const endpoint = {
       app, client,
+      // 多数用例逐步驱动模拟工作者，派发须立即返回；默认阻塞的派发单独测试，显式传 wait 时保留原值。
       raw(name, args = {}) {
-        return client.callTool({ name, arguments: args }, undefined, { timeout: 2500 });
+        const input = name === 'team_dispatch' && args.wait === undefined ? { ...args, wait: false } : args;
+        return client.callTool({ name, arguments: input }, undefined, { timeout: 2500 });
       },
       async call(name, args = {}) {
         const result = await this.raw(name, args);
@@ -308,6 +310,59 @@ test('team_dispatch 未打开团队时自动打开，team_wait 等到自动验�
   assert.equal((await endpoint.call('team_result', { workerId: '实现cc' })).hasMore, false);
 });
 
+test('team_dispatch 默认等到结果再返回，报告附带证据原文、耗时和轮数，一次调用完成委派', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 5000;
+  mkdirSync(path.join(f.cwd, 'src'));
+  writeFileSync(path.join(f.cwd, 'src', 'limit.go'), 'package gateway\n\nfunc limit() int {\n\treturn 429\n}\n');
+  const endpoint = await f.connect();
+  const call = endpoint.client.callTool({ name: 'team_dispatch', arguments: { workers: [
+    { name: '限流', cwd: f.cwd, prompt: '429 从哪里来' },
+  ] } }, undefined, { timeout: 5000 });
+  while (!f.controllers.length) await tick();
+  f.controllers[0].emit('result', { success: true, durationMs: 4200, numTurns: 6,
+    text: '429 由本地限流返回。证据：src/limit.go:4；src/missing.go:1 已不存在。' });
+  const response = await call;
+  assert.notEqual(response.isError, true, response.content?.[0]?.text);
+  const result = JSON.parse(response.content[0].text);
+  assert.equal(result.opened, true);
+  assert.equal(result.done, true);
+  assert.equal(typeof result.waitedMs, 'number');
+  const [worker] = result.workers;
+  assert.equal(worker.name, '限流cc');
+  assert.equal(worker.status, 'closed');
+  assert.equal(worker.review.accepted, true);
+  assert.match(worker.summary, /^429 由本地限流返回/);
+  assert.equal(worker.durationMs, 4200);
+  assert.equal(worker.turns, 6);
+  assert.deepEqual(worker.evidence, [
+    { ref: 'src/limit.go:4', file: 'src/limit.go', ok: true, lines: '2-5', text: '2| \n3| func limit() int {\n4| \treturn 429\n5| }' },
+    { ref: 'src/missing.go:1', ok: false, reason: '工作目录内找不到该文件' },
+  ]);
+  // 结果已随派发返回，之后的 team_wait 不再重复报告。
+  assert.deepEqual((await endpoint.call('team_wait')).workers, []);
+});
+
+test('阻塞派发等待超时如实返回并提示延长等待，结果随后由 team_wait 带回；wait: false 立即返回', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 1000;
+  const endpoint = await f.connect();
+  const timed = await endpoint.call('team_dispatch', { wait: true, workers: [{ name: '慢', cwd: f.cwd, prompt: '检查' }] });
+  assert.equal(timed.timedOut, true);
+  assert.equal(timed.done, false);
+  assert.equal(timed.workers[0].attention, false);
+  assert.match(timed.hint, /单次最多等待 1 秒.*tool_timeout_sec 设为 600/);
+  const quick = await endpoint.call('team_dispatch', { wait: false, workers: [{ name: '快', cwd: f.cwd, prompt: '检查' }] });
+  assert.deepEqual(quick.workers.map(worker => [worker.name, worker.status]), [['快cc', 'running']]);
+  assert.equal(quick.done, undefined);
+  f.controllers[0].emit('result', { success: true, text: '慢的结论' });
+  f.controllers[1].emit('result', { success: true, text: '快的结论' });
+  const waited = await endpoint.call('team_wait');
+  assert.equal(waited.done, true);
+  assert.equal(waited.hint, undefined);
+  assert.deepEqual(waited.workers.map(worker => worker.summary).sort(), ['快的结论', '慢的结论']);
+});
+
 test('MCP 关闭接口在主进程退出但后台任务未确认停止时返回明确失败', async t => {
   const f = await fixture(t);
   const endpoint = await f.connect();
@@ -358,6 +413,13 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
   assert.match(instructions, /没有 verify 的 write 任务默认由主控验收/);
   assert.match(instructions, /已派出的问题主控不要再自己调查/);
   assert.match(instructions, /summary 即工作者报告全文/);
+  assert.match(instructions, /主控不要先自己调查/);
+  assert.match(instructions, /wait: false/);
+  assert.match(instructions, /不确定改哪些文件时填 \["\."\]/);
+  assert.match(instructions, /evidence/);
+  assert.match(instructions, /dependsOn 全部写任务的 verify 工作者/);
+  assert.doesNotMatch(instructions, /几次搜索就能回答的窄问题，主控先自行定位/);
+  assert.equal(tools.find(tool => tool.name === 'team_dispatch').inputSchema.properties.wait.default, true);
   for (const name of ['team_status', 'team_events', 'team_request', 'team_wait', 'team_diff']) {
     assert.equal(tools.find(tool => tool.name === name).annotations.readOnlyHint, true);
   }

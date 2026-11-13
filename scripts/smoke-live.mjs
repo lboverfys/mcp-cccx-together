@@ -119,7 +119,7 @@ try {
   const team = await call('team_open', { teamId, constraints, notifications: false });
   opened = true;
   assert.equal(team.notifications, false);
-  const dispatched = await call('team_dispatch', { workers: ['A', 'B'].map(label => ({
+  const dispatched = await call('team_dispatch', { wait: false, workers: ['A', 'B'].map(label => ({
     name: `smoke-${label}cc`, cwd: root, access: 'read', scope: ['.'], review: 'codex',
     maxTurns: 8, maxBudgetUsd: 1,
     prompt: `${constraints}\n按顺序操作：1. 调用 mcp__team__report_progress，summary 为 SMOKE_${label}_PROGRESS。2. 调用 mcp__team__ask_parent，question 为 SMOKE_${label}_QUESTION，不设置选项，等待主控回复。3. 最终回答 SMOKE_${label}_DONE，并原样附上主控刚回复的令牌。不要在得到回复前结束。`,

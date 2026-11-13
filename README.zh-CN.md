@@ -46,15 +46,14 @@ sequenceDiagram
     MCP->>CC: 并行启动工作者，写入任务各用独立 worktree
     CC-->>MCP: 交付结果
     MCP->>MCP: 在 worktree 中运行验证 → 合并范围内改动，失败则发回修复
-    Codex->>MCP: team_wait
-    MCP-->>Codex: 全部完成，或某个工作者需要决策
-    Codex->>MCP: 需要主控验收时 team_diff / team_review
-    Codex-->>You: 最终检查与总结
+    MCP-->>Codex: 报告及引用行原文，或某个工作者需要决策
+    Codex->>MCP: 需要主控验收时 team_review（结果已附 diff）
+    Codex-->>You: 总结
 ```
 
-- **一次派发，一次等待。** Codex 一次提交全部任务，用 `team_wait` 阻塞等待而不是轮询。
+- **一次调用完成委派。** Codex 是慢的一方，所以服务尽量省 Codex 的轮数：`team_dispatch` 一次提交全部任务，默认等到全部停下或有任务需要决策才返回，和 Claude Code 自己的子 agent 一样。读代码、搜索、运行命令、修改文件都交给工作者，Codex 不先自己调查。
 - **以验证为准，不以自述为准。** 提供 `verify` 命令（例如 `npm test`）时，由服务自己检查结果，失败就发回同一工作者修复，最多 `maxFixRounds` 轮。没有 `verify` 的写入任务由 Codex 验收后才放行下游。
-- **同一件事只做一次。** 只读和验证任务完成即自动验收并回收进程，报告全文随 `team_wait` 返回；工作者按固定格式（结论先行、带 `文件:行号` 证据、已证实与推测分开）简短汇报，Codex 直接采用，不重做已派出的调查。
+- **同一件事只做一次。** 只读和验证任务完成即自动验收并回收进程，报告全文随派发结果返回。工作者按固定格式简短汇报：开头是 Codex 可以直接转述的答复，带 `文件:行号` 证据，已证实与推测分开。服务会读出每条引用的原文放在 `evidence` 里，并标出不存在的引用，Codex 不用打开文件就能核对，也不重做调查。
 - **写入隔离。** 在 git 仓库中，每个写入任务在独立的 git worktree 中工作，并行的写入者和各自的测试互不看到对方未完成的修改。验收时只合并任务 `scope` 内的改动，范围外的改动会被拒绝。
 - **依赖调度。** `dependsOn` 串联任务；前置结果验收后，下游立即启动，并收到上游交付作为交接。
 - **任意 Anthropic 兼容模型。** 配置一次 provider（例如 DeepSeek），然后按任务选择。
@@ -136,8 +135,8 @@ npm uninstall -g cc-team-mcp
 
 随后 Codex 会：
 
-1. 拆分工作，用一次 `team_dispatch` 提交全部任务。团队会自动打开（只有需要设置约束、调整并发或重新打开旧团队时，才先调用 `team_open`）。
-2. 调用 `team_wait`，阻塞到所有任务停下或有任务需要处理。已停下的工作者带回报告全文（过长时 `summaryTruncated: true`，再用 `team_result` 续读）；在两次等待之间完成的结果也会补报一次。派出去的问题 Codex 不再自己调查。
+1. 把已有的线索（报错原文、ID、路径）写成简短 prompt，用一次 `team_dispatch` 提交全部任务，每个独立问题一个工作者；不先自己查代码。团队会自动打开（只有需要设置约束、调整并发或重新打开旧团队时，才先调用 `team_open`）。
+2. 这次调用阻塞到所有任务停下或有任务需要处理，返回内容与 `team_wait` 相同：已停下工作者的报告全文（过长时 `summaryTruncated: true`，再用 `team_result` 续读）、引用行原文 `evidence`，以及本轮耗时 `durationMs` 和轮数 `turns`。等待超时（`timedOut: true`）时 Codex 再调用 `team_wait`。Codex 手上有不相关的工作时可以传 `wait: false` 立即返回。
 3. 只处理 `attention: true` 的工作者：
 
    | 状态 | Codex 的处理 |
@@ -146,9 +145,9 @@ npm uninstall -g cc-team-mcp
    | `failed` 或自动验收未通过 | 用 `team_send` 指示修复，或 `team_close` 后重新派发 |
    | `stopped` | 工作进程已退出；用 `team_resume` 恢复，或关闭 |
    | `blocked` | 先处理 `blockedBy` 中的上游任务 |
-   | `awaiting_review` | 用 `team_diff` 查看实际改动，再 `team_review` |
+   | `awaiting_review` | 查看结果附带的 `diff`（补丁过长时用 `team_diff` 翻页），再 `team_review` |
 
-4. 重复 `team_wait` 直到 `done: true`；有写入时按需做一次整体验证，再汇总。自动验收的只读和验证工作者已自动关闭，无需 `team_close`，追问用 `team_resume`。
+4. 重复 `team_wait` 直到 `done: true`，然后转述报告。有多个写入任务时，整体测试由同一批中依赖全部写任务的验证任务完成，不由 Codex 自己跑。自动验收的只读和验证工作者已自动关闭，无需 `team_close`，追问用 `team_resume`。
 
 ### 计划示例
 
@@ -174,9 +173,9 @@ npm uninstall -g cc-team-mcp
 | --- | --- | --- |
 | `name` | — | 简短的职责名。缺少 `cc` 时自动补上；包含 `cc` 最多 24 个字符；同一团队内唯一。 |
 | `cwd` | — | 项目目录的绝对路径。 |
-| `prompt` | — | 任务内容。写清目标、涉及的文件和验收方式。 |
+| `prompt` | — | 任务内容。写清要回答的问题或目标，以及已有的线索；搜索交给工作者。 |
 | `access` | `read` | `read`：仅 Read/Glob/Grep。`verify`：额外提供 Bash，用于运行测试和构建（不应修改文件）。`write`：完整工具集。 |
-| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**。写入范围重叠的任务依次执行；文件编辑工具和合并都限制在该范围内。 |
+| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**，不确定会改哪些文件时填 `["."]`。写入范围重叠的任务依次执行；文件编辑工具和合并都限制在该范围内。 |
 | `dependsOn` | `[]` | 需先通过验收的任务名字或 ID，可引用同一批次中的任务。 |
 | `verify` | — | 工作者成功后执行的 shell 命令；隔离任务在其 worktree 中执行。退出码 0 表示通过，超时 10 分钟。 |
 | `review` | `read`/`verify` 任务和带 `verify` 的写入任务为 `auto`，其余为 `codex` | `auto`：工作者成功且 `verify`（如有）通过即验收；`read`/`verify` 任务随后自动关闭进程。`codex`：等待 Codex 调用 `team_review`。写入任务使用 `auto` 必须提供 `verify`。 |
@@ -196,8 +195,8 @@ npm uninstall -g cc-team-mcp
 
 | 工具 | 用途 |
 | --- | --- |
-| `team_dispatch` | 批量提交任务；未打开团队时自动打开 |
-| `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回精简结果和已停下工作者的报告全文 |
+| `team_dispatch` | 批量提交任务（未打开团队时自动打开）；除非 `wait: false`，否则等待并返回与 `team_wait` 相同的内容 |
+| `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回已停下工作者的报告全文、引用行原文（`evidence`）和待验收写入的 diff |
 | `team_open` | 创建或重新打开团队，设置约束和并发；列出已配置的 provider |
 | `team_list` | 列出已保存的团队 |
 | `team_status` | 完整状态：依赖、排队原因、进程、worktree、待答复请求、最近结果和验收 |
@@ -227,7 +226,8 @@ npm uninstall -g cc-team-mcp
   - 每个改动的路径都必须在 `scope` 内，否则验收失败。自动验收会在 `maxFixRounds` 内把越界清单发回工作者；`team_review` 返回错误。
   - 期间你或其他任务改过相同文件时做三方合并；冲突会让验收失败，且不改动任何文件。
   - 合并结果只写入你的工作区文件，不会暂存或提交。
-- **合并前检查。** `team_diff` 显示尚未合并的改动、越界文件和分页补丁。
+- **并行只读。** 隔离的写入任务在合并前不改动你的工作区，因此范围重叠的只读任务可以同时运行。验证任务会在工作区里运行命令，仍需排队。
+- **合并前检查。** 等待 Codex 验收的写入结果附带改动文件、越界文件和最多 12,000 字符的补丁；其余部分用 `team_diff` 翻页查看。
 - **清理。** 关闭工作者时，已全部合并的 worktree 会被删除；仍有未合并改动的会保留（路径见 `team_status`）。`team_resume` 会在原路径重建已删除的 worktree，Claude Code 会话因此可以继续。`prune` 会清理遗留的无改动 worktree。
 
 下游任务的快照在上游改动合并之后才创建，因此能看到这些改动。
@@ -288,7 +288,7 @@ env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "
 
 ### 延长单次等待
 
-Codex 会在工具超时后终止调用。每次 `team_wait` 超时都要多花一轮 Codex，因此等待越长，慢速的 Codex 轮次越少。
+Codex 会在工具超时后终止调用。无论是 `team_dispatch` 还是 `team_wait`，每次等待超时都要多花一轮 Codex，因此等待越长，慢速的 Codex 轮次越少。上限低于两分钟时，超时结果会带上 `hint` 提示这一点。
 
 `setup` 会自动处理：注册 `CC_TEAM_WAIT_TIMEOUT_MS = 570000`，并在 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）的 `[mcp_servers.cc_team]` 表中写入 `tool_timeout_sec = 600`。如果你自己设置了 `waitTimeoutMs`，`setup` 会保留该值，并把工具超时设为比它多 30 秒。无法修改该文件时，`setup` 改为注册安全的 50 秒默认值，并输出手动步骤。
 
@@ -373,7 +373,7 @@ CI 在 Windows、macOS 和 Linux 上分别使用 Node.js 22 和 24 运行。
 
 `node scripts/smoke-live.mjs` 使用真实的 Claude Code 运行端到端流程（两个只读工作者、提问、多轮和恢复）。**会产生费用**：每个工作进程限制 8 轮和 SDK 估算的 1 美元。加 `--notify` 可同时验证 Codex 通知。
 
-代码结构：`src/server.mjs`（MCP 工具）、`src/manager.mjs`（团队状态机与调度）、`src/claude-worker.mjs`（单个 Claude Code 进程）、`src/isolation.mjs` 与 `src/worktree.mjs`（worktree 与合并）、`src/store.mjs` 与 `src/results.mjs`（持久化状态）、`src/providers.mjs`、`src/config.mjs`、`src/cli.mjs`。
+代码结构：`src/server.mjs`（MCP 工具）、`src/manager.mjs`（团队状态机与调度）、`src/claude-worker.mjs`（单个 Claude Code 进程）、`src/isolation.mjs` 与 `src/worktree.mjs`（worktree 与合并）、`src/store.mjs` 与 `src/results.mjs`（持久化状态）、`src/evidence.mjs`（读出报告引用的代码行）、`src/providers.mjs`、`src/config.mjs`、`src/cli.mjs`。
 
 ## 参与贡献
 

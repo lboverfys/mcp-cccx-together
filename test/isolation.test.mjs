@@ -215,3 +215,35 @@ test('stateDir 位于仓库内时拒绝 worktree 隔离，可显式改用共享�
   assert.equal(f.controllers[0].options.worker.worktree, undefined);
   assert.throws(() => manager.diff(worker.id), /只有 worktree 隔离/);
 });
+
+test('隔离写入与只读任务并行，verify 仍排队；待主控验收时 team_wait 直接附带改动和越界文件', async t => {
+  const f = fixture(t);
+  const manager = await f.create();
+  const [whole, reader, checker] = manager.dispatch([
+    f.spec('全量修改', { scope: ['.'] }),
+    f.spec('读取', { access: 'read', scope: ['.'] }),
+    f.spec('检查', { access: 'verify', scope: ['.'] }),
+  ]);
+  assert.equal(manager.get(whole.id).data.isolation, 'worktree');
+  assert.equal(manager.get(whole.id).data.status, 'running');
+  assert.equal(manager.get(reader.id).data.status, 'running', '隔离写入合并前不改主工作区，只读任务不必排队');
+  assert.equal(manager.get(checker.id).data.queueReason, 'waiting_scope', 'verify 在主工作区运行命令，仍等隔离写入完成');
+  await manager.closeWorker(checker.id);
+  await manager.closeWorker(whole.id);
+
+  const [scoped] = manager.dispatch([f.spec('范围修改')]);
+  const controller = f.controllers.at(-1);
+  f.edit(controller, 'src/a.txt', 'changed\n');
+  f.edit(controller, 'docs/x.txt', 'outside\n');
+  controller.emit('result', { success: true, text: '已修改 src/a.txt:1' });
+  const waited = await manager.wait({ workerIds: [scoped.id], timeoutMs: 1000 });
+  const [worker] = waited.workers;
+  assert.equal(worker.attention, true);
+  assert.deepEqual(worker.diff.files, ['M docs/x.txt', 'M src/a.txt']);
+  assert.deepEqual(worker.diff.outsideScope, ['docs/x.txt']);
+  assert.match(worker.diff.patch, /\+changed/);
+  assert.equal(worker.diff.patchTruncated, undefined);
+  // 证据优先读隔离工作区里尚未合并的内容。
+  assert.deepEqual(worker.evidence.map(item => [item.ok, item.text]), [[true, '1| changed']]);
+  assert.equal(f.repo.read('src/a.txt'), 'a\n');
+});

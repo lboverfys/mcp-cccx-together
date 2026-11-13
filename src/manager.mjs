@@ -9,12 +9,15 @@ import { WorktreeIsolation } from './isolation.mjs';
 import { inside, pathKey, physicalPath } from './paths.mjs';
 import { providerEnvironment } from './providers.mjs';
 import { runVerify } from './verify.mjs';
+import { collectEvidence } from './evidence.mjs';
 
 const active = new Set(['starting', 'running', 'needs_input', 'awaiting_review', 'interrupting', 'idle']);
 const clip = (text, max = 12000) => String(text ?? '').slice(0, max);
 const SUMMARY_CHARS = 2000;
 // team_wait 直接带回的报告上限；工作者按要求控制篇幅，超出时才需要 team_result 续读。
 const REPORT_CHARS = 6000;
+// 待主控验收的隔离写入随 team_wait 附带的补丁长度；更长时用 team_diff 翻页。
+const DIFF_CHARS = 12000;
 // team_wait 判定：working 仍会自行推进；needsParent 必须由主控处理；settled 表示本轮已停下。
 const working = worker => Boolean(worker.verifying || worker.closingPromise)
   || ['starting', 'running', 'interrupting', 'closing'].includes(worker.data.status);
@@ -295,7 +298,8 @@ export class TeamManager {
         : '不要自行再创建 agent。') +
       `没有明确授权不得提交、推送、创建 PR、删除已有工作、安装或更新工具、操作远程服务器。不要改动共享配置。依赖、下载和临时文件遵循用户及项目的目录约定；需要超出授权范围时询问。\n` +
       `工具报错必须明确报告，不得虚报验证通过。清理本任务启动的服务，不得停止原有服务。\n` +
-      `最终报告是主控唯一会读的内容，控制在 1500 字以内，不复述过程：先用一两句话直接回答任务；再列出不超过 5 条关键证据，用 文件:行号 或命令输出标注；` +
+      `最终报告是主控唯一会读的内容，开头会被直接转述给用户，控制在 1500 字以内，不复述过程：先用一两句话直接回答任务，写成可以直接给用户看的结论；` +
+      `再列出不超过 5 条关键证据，用 文件:行号（相对工作目录或绝对路径，区间写成 文件:起-止）或命令输出标注，MCP 会按行号读出原文给主控核对，行号必须准确；` +
       `已证实（有代码或命令输出支撑）与推测分开写，说明无法判断的部分及验证方法；不要给没有证据的可能性排序。` +
       (spec.access === 'write' ? '另外列出修改的文件、验证命令及结果和未完成项。\n'
         : spec.access === 'verify' ? '另外列出运行的命令及结果。\n' : '\n') +
@@ -373,6 +377,9 @@ export class TeamManager {
 
   scopesOverlap(first, second) {
     if (first.access !== 'write' && second.access !== 'write') return false;
+    // worktree 隔离的写入在验收合并前不改主工作区，可与只读任务并行；verify 会在主工作区运行命令，仍须排队。
+    const isolatedWithReader = (a, b) => a.access === 'write' && a.isolation === 'worktree' && b.access === 'read';
+    if (isolatedWithReader(first, second) || isolatedWithReader(second, first)) return false;
     const firstPaths = first.scopes.map(path => this.scopeKey(path));
     const secondPaths = second.scopes.map(path => this.scopeKey(path));
     return firstPaths.some(a => secondPaths.some(b => inside(a, b) || inside(b, a)));
@@ -663,6 +670,7 @@ export class TeamManager {
     // 全队没有仍在推进的工作者时，继续等待也不会有变化。
     const ready = () => this.closing || targets.some(needsParent) || targets.every(settled)
       || ![...this.workers.values()].some(working);
+    const started = Date.now();
     let timedOut = false;
     if (!ready()) {
       await new Promise(resolveWait => {
@@ -687,19 +695,23 @@ export class TeamManager {
       requests.get(request.workerId).push({ id: request.id, kind: request.kind, preview: clip(request.encodedPayload, 1000) });
     }
     return {
-      done: targets.every(worker => settled(worker) && !needsParent(worker)), timedOut,
+      done: targets.every(worker => settled(worker) && !needsParent(worker)), timedOut, waitedMs: Date.now() - started,
       ...(this.closing ? { closing: true } : {}),
       workers: targets.map(worker => {
         const { data } = worker;
         const report = settled(worker) && data.lastResult ? this.report(worker) : undefined;
         if (report) worker.reportedResultId = data.lastResult.resultId;
+        const pendingReview = data.status === 'awaiting_review' && !worker.verifying && data.worktree;
         return {
           id: data.id, name: data.name, status: data.status, attention: needsParent(worker),
           ...(data.queueReason ? { queueReason: data.queueReason } : {}),
           ...(data.blockedBy?.length ? { blockedBy: data.blockedBy.map(item => item.name) } : {}),
           ...(report ? { resultId: data.lastResult.resultId, ...report } : {}),
+          ...(report && data.lastResult.durationMs !== undefined ? { durationMs: data.lastResult.durationMs } : {}),
+          ...(report && data.lastResult.numTurns !== undefined ? { turns: data.lastResult.numTurns } : {}),
           ...(data.error ? { error: data.error } : {}),
           ...(data.lastReview ? { review: { accepted: data.lastReview.accepted, note: clip(data.lastReview.note, 6500) } } : {}),
+          ...(pendingReview ? this.pendingDiff(worker) : {}),
           ...(requests.has(data.id) ? { requests: requests.get(data.id) } : {}),
           ...(worker.lifecycleError ? { lifecycleError: worker.lifecycleError } : {}),
         };
@@ -707,15 +719,40 @@ export class TeamManager {
     };
   }
 
-  /** team_wait 返回的报告：摘要被截断时从完整交付补足，主控通常无需再调 team_result。 */
+  /**
+   * team_wait 返回的报告：摘要被截断时从完整交付补足，主控通常无需再调 team_result；
+   * 报告里引用的 文件:行号 由 MCP 读出原文附在 evidence，主控核对证据不必再打开文件。
+   */
   report(worker) {
-    const { resultId, text, textTruncated } = worker.data.lastResult;
-    if (!textTruncated) return { summary: text };
-    let full;
-    // 完整交付读取失败时退回摘要并标记截断，由 team_result 报告具体错误。
-    try { full = String(this.results.get(worker.data.id, resultId).text ?? ''); }
-    catch { return { summary: text, summaryTruncated: true }; }
-    return { summary: clip(full, REPORT_CHARS), ...(full.length > REPORT_CHARS ? { summaryTruncated: true } : {}) };
+    const { data } = worker;
+    const { resultId, text, textTruncated } = data.lastResult;
+    let full = text;
+    let report = { summary: text };
+    if (textTruncated) {
+      // 完整交付读取失败时退回摘要并标记截断，由 team_result 报告具体错误。
+      try {
+        full = String(this.results.get(data.id, resultId).text ?? '');
+        report = { summary: clip(full, REPORT_CHARS), ...(full.length > REPORT_CHARS ? { summaryTruncated: true } : {}) };
+      } catch { report = { summary: text, summaryTruncated: true }; }
+    }
+    const roots = [...(data.worktree?.cwd && existsSync(data.worktree.cwd) ? [data.worktree.cwd] : []), data.cwd];
+    let evidence;
+    try { evidence = collectEvidence(full, roots, { platform: this.platform }); }
+    catch (error) { evidence = [{ ok: false, reason: `证据读取失败：${clip(error.message, 500)}` }]; }
+    return { ...report, ...(evidence.length ? { evidence } : {}) };
+  }
+
+  /** 待主控验收的隔离写入直接附上改动，主控核对后即可 team_review，不必先调 team_diff。 */
+  pendingDiff(worker) {
+    try {
+      const diff = this.isolation.diff(worker, { limit: DIFF_CHARS });
+      return { diff: { files: diff.files.slice(0, 100).map(file => `${file.status} ${file.path}`),
+        ...(diff.files.length > 100 ? { fileCount: diff.files.length } : {}),
+        ...(diff.outsideScope.length ? { outsideScope: diff.outsideScope.slice(0, 100) } : {}),
+        patch: diff.text, ...(diff.hasMore ? { patchTruncated: true, totalLength: diff.totalLength } : {}) } };
+    } catch (error) {
+      return { diffError: clip(error.message, 1000) };
+    }
   }
 
   send(id, text, { automatic = false } = {}) {

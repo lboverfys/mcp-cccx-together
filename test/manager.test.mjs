@@ -1768,6 +1768,20 @@ test('team_wait 从完整交付补足被截断的报告，过长时标记 summar
   assert.equal(second.summaryTruncated, true);
 });
 
+test('team_wait 的证据取自完整报告，引用在摘要截断位置之后也能读出；未停下的工作者不带证据', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.cwd, 'front', 'view.js'), 'one\ntwo\nthree\n');
+  const manager = await f.create();
+  const [long, running] = manager.dispatch([f.spec('长', { review: undefined }), f.spec('运行', { review: undefined })]);
+  f.controllers[0].emit('result', { success: true, text: `${'长'.repeat(2500)} 证据 front/view.js:2`, durationMs: 1500, numTurns: 3 });
+  const result = await manager.wait({ workerIds: [long.id, running.id], timeoutMs: 50 });
+  const [first, second] = result.workers;
+  assert.equal(first.summary.length, 2500 + ' 证据 front/view.js:2'.length);
+  assert.deepEqual(first.evidence, [{ ref: 'front/view.js:2', file: 'front/view.js', ok: true, lines: '1-3', text: '1| one\n2| two\n3| three' }]);
+  assert.deepEqual([first.durationMs, first.turns], [1500, 3]);
+  assert.deepEqual([second.summary, second.evidence, second.durationMs], [undefined, undefined, undefined]);
+});
+
 test('工作者说明要求结论先行的简短报告，explore 只读任务允许 Explore 子 agent', async t => {
   const f = await fixture(t);
   const manager = await f.create();
@@ -1777,6 +1791,8 @@ test('工作者说明要求结论先行的简短报告，explore 只读任务允
   const text = id => manager.get(id).data.instructions;
   assert.match(text(reader.id), /1500 字以内.*直接回答任务.*文件:行号/);
   assert.match(text(reader.id), /已证实.*与推测分开写/);
+  assert.match(text(reader.id), /开头会被直接转述给用户/);
+  assert.match(text(reader.id), /MCP 会按行号读出原文给主控核对，行号必须准确/);
   assert.match(text(reader.id), /不要自行再创建 agent/);
   assert.doesNotMatch(text(reader.id), /修改的文件/);
   assert.match(text(explorer.id), /subagent_type 只能是 Explore/);
