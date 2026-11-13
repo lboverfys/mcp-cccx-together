@@ -11,6 +11,7 @@ import { TeamManager } from './manager.mjs';
 import { CodexNotifier } from './notifier.mjs';
 import { workerCatalog } from './store.mjs';
 import { providerSummary } from './providers.mjs';
+import { CallClock } from './timing.mjs';
 
 const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const MAX_NAME = 24;
@@ -24,15 +25,16 @@ const workerSpec = providers => z.object({
     .refine(name => name.slice(0, -2).trim().length > 0, 'cc 前必须有职责名')
     .refine(name => [...name].length <= MAX_NAME, `完整名字包含 cc 尾缀必须在 ${MAX_NAME} 个字符以内`)
     .describe(`按职责概括的短名字，以小写cc结尾（未带会自动补齐），含尾缀不超过 ${MAX_NAME} 个字符，如 计划功能cc、验证cc；同团队含已关闭会话不可重名`),
-  cwd: z.string().min(1), prompt: text,
+  cwd: z.string().min(1),
+  prompt: text.optional().describe('任务说明。只有填了 verify 的 verify 任务可以省略：此时是命令任务，由 MCP 直接运行 verify 命令，不启动 CC'),
   access: z.enum(['read', 'verify', 'write']).default('read')
-    .describe('read 只读；verify 可运行测试/构建命令但不改文件；write 可修改 scope 内文件'),
+    .describe('read 只读检索，不能运行命令；verify 可检索并运行测试、构建、git 等命令但不改文件，需要查 git 历史、日志或运行程序的调查用它；write 可修改 scope 内文件'),
   scope: z.array(z.string().min(1).max(500)).min(1).max(50).optional()
     .describe('相对于 cwd 的文件或目录；write 必须填，不确定要改哪些文件时填 ["."]；read/verify 省略时为整个工作目录'),
   review: z.enum(['auto', 'codex']).optional()
     .describe('一般不用填。默认 read/verify 任务和带 verify 的 write 任务为 auto（通过即自动验收并放行下游），没有 verify 的 write 任务为 codex（主控 team_review）；write 用 auto 必须给 verify'),
   explore: z.boolean().optional()
-    .describe('仅 read 任务：允许工作者用 Claude Code 的 Explore 子 agent 并行检索互不重叠的目录或子问题，适合跨多个模块的大范围搜索；几次搜索就能回答的窄问题不要开启'),
+    .describe('一般不用填。默认允许工作者自行用 Claude Code 子 agent 并行（read/verify 只能用只读的 Explore，write 还可用 general-purpose），由工作者判断是否值得拆分；传 false 关闭'),
   isolation: z.enum(['worktree', 'shared']).optional()
     .describe('一般不用填。git 仓库中的 write 任务默认 worktree（独立工作区修改，验收后只合并 scope 内改动），非 git 目录退回 shared（直接改主工作区）'),
   links: z.array(z.string().min(1).max(500)).max(20).optional()
@@ -40,9 +42,9 @@ const workerSpec = providers => z.object({
   provider: (providers.length ? z.enum(providers) : z.string().min(1).max(40)).optional()
     .describe(providers.length ? `执行模型的 provider，省略时使用默认 provider；可选：${providers.join('、')}` : '未配置 provider；工作者使用 Claude Code 自身的模型配置'),
   verify: z.string().trim().min(1).max(2000).optional()
-    .describe('完成后由 MCP 在 cwd 执行的验证命令，退出码 0 视为通过，例如 npm test'),
+    .describe('完成后由 MCP 在 cwd 执行的验证命令，退出码 0 视为通过，例如 npm test；不知道命令时填 auto，按项目文件推断（package.json、go.mod、Cargo.toml、pytest 等）'),
   maxFixRounds: z.number().int().min(0).max(5).default(2)
-    .describe('verify 失败时自动把输出发回工作者修复的最多轮数，超过后交主控处理'),
+    .describe('verify 失败、改动越界或合并冲突时自动发回工作者修复的最多轮数，超过后交主控处理'),
   instructions: z.string().max(20000).optional(), model: z.string().max(200).optional(),
   dependsOn: z.array(workerReference).max(50).default([]).describe('前置工作者完整名字或UUID，可引用同批次；主控验收通过后自动交接'),
   maxTurns: z.number().int().positive().optional(),
@@ -50,6 +52,8 @@ const workerSpec = providers => z.object({
   allowedTools: z.array(z.string().max(500)).max(50).default([]),
 }).refine(spec => spec.access !== 'write' || spec.scope !== undefined, {
   message: 'write 任务必须显式指定 scope，不能默认取得整个项目的写入范围', path: ['scope'],
+}).refine(spec => spec.prompt !== undefined || (spec.access === 'verify' && spec.verify !== undefined), {
+  message: '缺少 prompt；只有填了 verify 的 verify 任务（命令任务）可以省略', path: ['prompt'],
 });
 
 export function createTeamServer(config, { factory, notifierFactory = options => new CodexNotifier(options) } = {}) {
@@ -59,13 +63,16 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   let openingDone;
   let stopped = false;
   const waitLimit = config.waitTimeoutMs ?? 50000;
+  const clock = new CallClock();
   const providers = providerSummary(config.providers);
   const server = new McpServer({ name: 'cc-team', version }, { instructions:
     '本 MCP（cc_team / CC Team MCP）的调用别名是 mct 和 ctm，不区分大小写。用户要求“使用 mct”“用 mct”“使用 ctm”或“用 ctm”执行任务时，即要求通过本 MCP 委派 Claude Code（CC）子 agent：Codex 负责规划、协调和汇总，CC 负责执行。任务明确时直接委派，无需再次确认；仅说别名时结合当前上下文确定任务，仍无任务才询问；仅讨论、引用别名或明确要求不使用时不触发。' +
-    '分工（CC 执行快，主控每多一轮都更慢，目标是主控轮数最少）：读代码、搜索、运行命令、修改文件都交给 CC，主控不要先自己调查，已派出的问题主控不要再自己调查；主控只做 CC 做不到的事（看图片、向用户确认、最终决定），把上下文里已有的线索（报错原文、ID、路径、已知结论）写成简短 prompt 立即派发。互不依赖的子问题各派一个工作者并行，跨多个模块的只读检索可设 explore: true。' +
+    '分工（CC 执行快，主控每多一轮都更慢，目标是主控轮数最少）：读代码、搜索、运行命令、修改文件都交给 CC，主控不要先自己调查，已派出的问题主控不要再自己调查；主控只做 CC 做不到的事（向用户确认、最终决定），把上下文里已有的线索（报错原文、ID、路径、已知结论）写成简短 prompt 立即派发；图片有本地路径时把路径写进 prompt，CC 能直接读图。' +
+    '互不依赖的子问题各派一个工作者并行；拆不开时派一个工作者即可，它会自行用子 agent 并行。只读检索用 read；需要运行命令、查 git 历史或本地日志的调查用 verify。' +
     '派发：team_dispatch 一次提交全部任务，自动打开团队（传约束或恢复旧团队时先 team_list、team_open），默认等这批任务全部停下或需要主控处理才返回，返回内容同 team_wait；主控确有不重叠的工作时才传 wait: false，做完再 team_wait。只读问题只需填 name、cwd、prompt；dependsOn 表示先后。' +
-    '写入：write 任务必须给 scope，不确定改哪些文件时填 ["."]，由一个工作者完成定位、修改和验证，不要为了填 scope 先自己查代码。尽量填 verify（如 npm test）：通过即自动验收并合并回主工作区，失败自动发回修复；没有 verify 的 write 任务默认由主控验收。有多个写任务时同批加一个 dependsOn 全部写任务的 verify 工作者做整体验证，不要主控自己跑测试。' +
-    '结果：summary 即工作者报告全文，开头可直接转述给用户（summaryTruncated 时用 team_result 续读）；evidence 是 MCP 按报告中 文件:行号 读出的原文，ok 为 false 表示引用不存在。核对看 evidence，不要再打开文件或重做调查。工作者多于 3 个时可同批加一个 dependsOn 全部任务的只读汇总工作者，直接转述它的报告。' +
+    '写入：write 任务必须给 scope，不确定改哪些文件时填 ["."]，由一个工作者完成定位、修改和验证，不要为了填 scope 先自己查代码；git 仓库中的写任务各在独立工作区，范围重叠也并行，合并冲突由 MCP 发回原工作者解决。verify 填测试命令，不知道时填 "auto"：通过即自动验收并合并回主工作区，失败自动发回修复；没有 verify 的 write 任务由主控验收。' +
+    '有多个写任务时，同批加一个不写 prompt、只填 access: "verify"、verify 命令和 dependsOn 全部写任务的命令任务做整体验证，由 MCP 直接运行，不启动 CC，也不要主控自己跑测试。' +
+    '结果：summary 即工作者报告全文，开头可直接转述给用户（summaryTruncated 时用 team_result 续读）；evidence 是 MCP 按报告中 文件:行号 读出的原文，ok 为 false 表示引用不存在。核对看 evidence，不要再打开文件或重做调查；多个报告由主控直接合并转述，不要另派汇总工作者。' +
     '只处理 attention 为 true 的工作者：needs_input 用 team_reply；failed、stopped 或自动验收未通过用 team_send 指示修复（进程已退出用 team_resume）；blocked 先处理 blockedBy；待主控验收的写入附带 diff，核对后直接 team_review（传 resultId），diff 截断时再用 team_diff。处理后再 team_wait，timedOut 时直接再调用，直到 done 为 true。' +
     '派发后告诉用户名字与职责的对应。让某名字继续：仍运行用 team_send，已关闭用 team_resume，不能另建同名工作者；新对话先打开原 teamId。' +
     (providers.length ? `可用 provider：${providers.map(item => item.name).join('、')}${config.defaultProvider ? `（默认 ${config.defaultProvider}）` : ''}；按任务难度为工作者选择 provider。` : '') +
@@ -78,11 +85,16 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   };
   function register(name, description, inputSchema, action, readOnlyHint = false) {
     server.registerTool(name, { description, inputSchema, annotations: { readOnlyHint, destructiveHint: !readOnlyHint, openWorldHint: true } }, async input => {
+      const call = clock.begin();
       try {
         const result = await action(input);
         return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
       } catch (error) {
         return { isError: true, content: [{ type: 'text', text: error.message }] };
+      } finally {
+        // 调用之间的空档即主控自身的耗时，记入当前团队，供 team_status 和 stats 对比。
+        const end = clock.end();
+        manager?.recordCall({ tool: name, ms: end - call.at, gap: call.gap, at: call.at, end });
       }
     });
   }
@@ -159,7 +171,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   const waitHint = result => result.timedOut && waitLimit < 120000
     ? { ...result, hint: `单次最多等待 ${Math.round(waitLimit / 1000)} 秒，主控要多轮调用才能等到结果；运行 cc-team-mcp setup，或在 Codex 配置中把 tool_timeout_sec 设为 600、CC_TEAM_WAIT_TIMEOUT_MS 设为 570000 可减少轮数` }
     : result;
-  register('team_dispatch', `用户要求使用 mct / ctm（cc_team）时，用本工具把任务委派给 Claude Code（CC）子 agent。一次提交全部任务，未打开团队时自动打开；按 maxConcurrent、dependsOn 和写入范围自动排队。默认等到这批任务全部停下或需要主控处理才返回，返回内容同 team_wait（各工作者报告 summary、证据原文 evidence、待验收写入的 diff）；wait: false 时提交后立即返回。只读问题只需填 name、cwd、prompt。重名或环依赖整批拒绝；返回 warnings 时任务已保存，不要重复派发。`, {
+  register('team_dispatch', `用户要求使用 mct / ctm（cc_team）时，用本工具把任务委派给 Claude Code（CC）子 agent。一次提交全部任务，未打开团队时自动打开；按 maxConcurrent、dependsOn 和写入范围自动排队。默认等到这批任务全部停下或需要主控处理才返回，返回内容同 team_wait（各工作者报告 summary、证据原文 evidence、待验收写入的 diff）；wait: false 时提交后立即返回。只读问题只需填 name、cwd、prompt；只跑命令的验证填 access: "verify" 和 verify、不写 prompt，由 MCP 直接运行。重名或环依赖整批拒绝；返回 warnings 时任务已保存，不要重复派发。`, {
     workers: z.array(workerSpec(providers.map(item => item.name))).min(1),
     wait: z.boolean().default(true)
       .describe('默认 true：等到这批任务全部停下或需要主控处理再返回；主控确有与已派任务不重叠的工作时才传 false，做完再 team_wait'),
@@ -178,7 +190,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
     timeoutMs: z.number().int().min(1000).max(3600000).optional()
       .describe(`最长等待毫秒数；默认且最多为 ${waitLimit}，由 CC_TEAM_WAIT_TIMEOUT_MS 配置`),
   }, async ({ workerIds, timeoutMs }) => waitHint(await requireTeam().wait({ workerIds, timeoutMs: Math.min(timeoutMs ?? waitLimit, waitLimit) })), true);
-  register('team_status', '查看并发数、依赖/排队原因、工作者状态、最近交付/验收和待答复请求。不传workerIds则列出全部；可按完整名字或UUID筛选。', {
+  register('team_status', '查看并发数、依赖/排队原因、工作者状态、最近交付/验收、待答复请求和耗时统计 timing（主控、CC、验证与合并各自用时）。不传workerIds则列出全部；可按完整名字或UUID筛选。', {
     workerIds: z.array(workerReference).optional(),
   }, ({ workerIds }) => ({
     ...requireTeam().status(workerIds), notificationDelivery: notifier?.lastDelivery ?? null,
@@ -220,7 +232,7 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   register('team_resume', '恢复已关闭/停止的原工作者并重新排队；已取消且从未启动的任务也可按原名恢复。不得同时恢复仍运行的会话。返回warnings时恢复任务已保存，请检查状态，不要重复恢复。', {
     workerId: workerReference, message: text,
   }, ({ workerId, message }) => requireTeam().resume(workerId, message));
-  register('team_review', '检查完整交付、实际diff（隔离任务用 team_diff）和测试后验收，并传入读取到的resultId以防结果在审批期间变化。accepted才释放下游依赖；隔离任务在验收时把 scope 内改动合并回主工作区，合并失败或越界时验收不生效并返回原因。handoff交接接口/文件。排队任务需要时自动回收已验收进程。返回warnings时验收已持久保存，须按警告检查事件或调度状态，不要当作验收未生效而重试。', {
+  register('team_review', '检查完整交付、实际diff（隔离任务用 team_diff）和测试后验收，并传入读取到的resultId以防结果在审批期间变化。accepted才释放下游依赖；隔离任务在验收时把 scope 内改动合并回主工作区：与主工作区冲突时自动发回原工作者解决（返回 sentBack: true，之后 team_wait），越界或其他合并失败时验收不生效并返回原因。handoff交接接口/文件。排队任务需要时自动回收已验收进程。返回warnings时验收已持久保存，须按警告检查事件或调度状态，不要当作验收未生效而重试。', {
     workerId: workerReference, accepted: z.boolean(), note: z.string().trim().min(1).max(4000)
       .describe('实际检查的文件/差异、测试命令及结果、未验证项；不可仅复述工作者的完成声明'),
     handoff: z.string().max(12000).optional(),

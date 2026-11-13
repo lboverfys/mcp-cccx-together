@@ -88,7 +88,7 @@ async function pollUntil(predicate, label) {
       assert(event.type !== 'result' || event.data.success, `本轮失败：${JSON.stringify(event.data)}`);
       assert(event.type !== 'request' || event.data.kind === 'question', '只读冒烟任务出现了非预期权限请求');
       if (event.type === 'activity' && event.data.tool) {
-        assert(['mcp__team__report_progress', 'mcp__team__ask_parent'].includes(event.data.tool), `非预期工具：${event.data.tool}`);
+        assert.equal(event.data.tool, 'mcp__team__ask_parent', `非预期工具：${event.data.tool}`);
       }
     }
     assert(Date.now() < mainDeadline, `${label} 超过测试期限`);
@@ -96,7 +96,7 @@ async function pollUntil(predicate, label) {
 }
 
 const find = (workerId, type, after = 0) => events.find(event => event.workerId === workerId && event.type === type && event.cursor > after);
-const progress = (workerId, marker, after = 0) => events.find(event => event.workerId === workerId && event.type === 'progress' && event.cursor > after && event.data.source === 'report_progress' && event.data.summary.includes(marker));
+const progress = (workerId, marker, after = 0) => events.find(event => event.workerId === workerId && event.type === 'progress' && event.cursor > after && event.data.source === 'assistant' && event.data.summary.includes(marker));
 const resultFor = (workerId, messageId, after) => events.find(event => event.workerId === workerId && event.type === 'result' && event.cursor > after && (!messageId || event.data.messageId === messageId || event.data.messageIds?.includes(messageId)));
 function alive(pid) {
   try { process.kill(pid, 0); return true; }
@@ -108,7 +108,7 @@ async function verifyExited(pids, until) {
   const remaining = unique.filter(alive);
   assert.equal(remaining.length, 0, `进程仍存活，未按名称批量终止：${remaining.join(', ')}`);
 }
-const constraints = '这是协作接口的只读冒烟测试。禁止读取、创建、修改文件，禁止执行命令、网络请求、委派任务。只能调用 mcp__team__report_progress 和 mcp__team__ask_parent；不要调用其他工具。';
+const constraints = '这是协作接口的只读冒烟测试。禁止读取、创建、修改文件，禁止执行命令、网络请求、委派任务。只能调用 mcp__team__ask_parent；不要调用其他工具。';
 
 try {
   log('starting', { temp, notifications: notify, deadlineSeconds: 180 });
@@ -120,9 +120,9 @@ try {
   opened = true;
   assert.equal(team.notifications, false);
   const dispatched = await call('team_dispatch', { wait: false, workers: ['A', 'B'].map(label => ({
-    name: `smoke-${label}cc`, cwd: root, access: 'read', scope: ['.'], review: 'codex',
+    name: `smoke-${label}cc`, cwd: root, access: 'read', scope: ['.'], review: 'codex', explore: false,
     maxTurns: 8, maxBudgetUsd: 1,
-    prompt: `${constraints}\n按顺序操作：1. 调用 mcp__team__report_progress，summary 为 SMOKE_${label}_PROGRESS。2. 调用 mcp__team__ask_parent，question 为 SMOKE_${label}_QUESTION，不设置选项，等待主控回复。3. 最终回答 SMOKE_${label}_DONE，并原样附上主控刚回复的令牌。不要在得到回复前结束。`,
+    prompt: `${constraints}\n按顺序操作：1. 先输出一行文字 SMOKE_${label}_PROGRESS。2. 在同一回复中调用 mcp__team__ask_parent，question 为 SMOKE_${label}_QUESTION，不设置选项，等待主控回复。3. 最终回答 SMOKE_${label}_DONE，并原样附上主控刚回复的令牌。不要在得到回复前结束。`,
   })) });
   assert.equal(dispatched.workers.length, 2);
   for (const worker of dispatched.workers) assert(!worker.error, worker.error);
@@ -148,7 +148,7 @@ try {
   log('first_round_verified', { workers: 2 });
 
   let after = cursor;
-  const second = await call('team_send', { workerId: a.id, message: `${constraints}\n这是第二轮。先 report_progress 汇报 SMOKE_A_SECOND，然后最终回答 SECOND_DONE，并原样复述第一轮主控回复的令牌。不要再提问。` });
+  const second = await call('team_send', { workerId: a.id, message: `${constraints}\n这是第二轮。先输出一行文字 SMOKE_A_SECOND，然后最终回答 SECOND_DONE，并原样复述第一轮主控回复的令牌。不要再提问。` });
   await pollUntil(() => progress(a.id, 'SMOKE_A_SECOND', after) && resultFor(a.id, second.messageId, after), '追加指令');
   assert(resultFor(a.id, second.messageId, after).data.text.includes(tokens.get(a.id)), '第二轮未保留第一轮上下文');
   await call('team_review', { workerId: a.id, resultId: resultFor(a.id, second.messageId, after).data.resultId, accepted: true, note: '追加指令的 messageId 和上下文令牌均符合预期。' });
@@ -161,7 +161,7 @@ try {
   log('closed_retained', { workerId: a.id, sessionId: beforeClose.sessionId });
 
   after = cursor;
-  const resumed = await call('team_resume', { workerId: a.id, message: `${constraints}\n这是关闭进程后的恢复测试。先 report_progress 汇报 SMOKE_A_RESUMED，然后最终回答 RESUMED_DONE，并原样复述最初主控回复的令牌。不要再提问。` });
+  const resumed = await call('team_resume', { workerId: a.id, message: `${constraints}\n这是关闭进程后的恢复测试。先输出一行文字 SMOKE_A_RESUMED，然后最终回答 RESUMED_DONE，并原样复述最初主控回复的令牌。不要再提问。` });
   await pollUntil(() => progress(a.id, 'SMOKE_A_RESUMED', after) && resultFor(a.id, resumed.messageId, after), '会话恢复');
   assert(resultFor(a.id, resumed.messageId, after).data.text.includes(tokens.get(a.id)), '恢复后未保留会话上下文');
   const resumedState = (await status()).workers.find(worker => worker.id === a.id);

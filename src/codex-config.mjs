@@ -47,3 +47,30 @@ export function updateCodexServer(file, name, { toolTimeoutSec, envVars = [] }) 
   } finally { rmSync(temporary, { force: true }); }
   return { file, toolTimeoutSec, forwarded, unmanagedEnvVars };
 }
+
+/**
+ * 读取 Codex 配置中本服务的等待设置：tool_timeout_sec 与 env 中的 CC_TEAM_WAIT_TIMEOUT_MS。
+ * 只做行级解析；找不到配置文件或服务表时 found 为 false。
+ */
+export function inspectCodexServer(file, name) {
+  let text;
+  try { text = readFileSync(file, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return { file, found: false }; throw error; }
+  const table = suffix => new RegExp(`^\\s*\\[\\s*mcp_servers\\s*\\.\\s*(?:"${name}"|'${name}'|${name})${suffix}\\s*\\]\\s*(?:#.*)?$`);
+  let section;
+  let found = false;
+  const result = { file };
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      section = table('').test(line) ? 'server' : table('\\s*\\.\\s*env').test(line) ? 'env' : undefined;
+      if (section === 'server') found = true;
+      continue;
+    }
+    const timeout = section === 'server' && line.match(/^\s*tool_timeout_sec\s*=\s*([\d.]+)/);
+    if (timeout) result.toolTimeoutSec = Number(timeout[1]);
+    const wait = (section === 'env' && line.match(/^\s*CC_TEAM_WAIT_TIMEOUT_MS\s*=\s*["']?(\d+)/))
+      || (section === 'server' && line.match(/CC_TEAM_WAIT_TIMEOUT_MS\s*=\s*["']?(\d+)/));
+    if (wait) result.waitTimeoutMs = Number(wait[1]);
+  }
+  return { ...result, found };
+}

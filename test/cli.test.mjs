@@ -250,3 +250,25 @@ test('setup 无法写入工具超时时退回默认等待，避免 team_wait 超
   assert.match(h.stdout, /未能写入/);
   assert.match(h.stdout, /50000 毫秒/);
 });
+
+test('doctor 检查 Codex 中本服务的等待设置，等待过短时给出可选提示', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cc-team-codex-home-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'config.toml');
+  const run = async () => {
+    const h = harness({ codexExecutable: undefined });
+    const code = await runCli(['doctor'], { ...h.options, env: { CODEX_HOME: directory }, executeImpl: async () => ({ stdout: '1.0.0\n', stderr: '' }) });
+    return { code, check: JSON.parse(h.stdout).checks.codexWait };
+  };
+  let { code, check } = await run();
+  assert.equal(code, 0, '等待设置只影响速度，不判定环境失败');
+  assert.equal(check.optional, true);
+  assert.match(check.hint, /未在 Codex 配置中找到 \[mcp_servers\.cc_team\]/);
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\n\n[mcp_servers.cc_team.env]\nCC_TEAM_STATE_DIR = "/x"\n');
+  ({ check } = await run());
+  assert.deepEqual([check.ok, check.toolTimeoutSec, check.waitTimeoutMs], [false, 60, 50000]);
+  assert.match(check.hint, /tool_timeout_sec = 600/);
+  writeFileSync(file, '[mcp_servers.cc_team]\ncommand = "node"\ntool_timeout_sec = 600\n\n[mcp_servers.cc_team.env]\nCC_TEAM_WAIT_TIMEOUT_MS = "570000"\n\n[mcp_servers.other]\ntool_timeout_sec = 1\n');
+  ({ check } = await run());
+  assert.deepEqual([check.ok, check.toolTimeoutSec, check.waitTimeoutMs, check.hint], [true, 600, 570000, undefined]);
+});

@@ -183,8 +183,8 @@ test('close 等待实际子进程退出，重复关闭复用同一 Promise', asy
   assert.equal(closed, true);
 });
 
-test('复用现有 exe、配置与环境，read 工作者移除写入和再委派工具', async () => {
-  const h = harness({ workerOverrides: { access: 'read', model: 'custom-model', sessionId: 'saved-session' } });
+test('复用现有 exe、配置与环境，read 工作者移除写入工具，关闭 explore 时不能再委派', async () => {
+  const h = harness({ workerOverrides: { access: 'read', model: 'custom-model', sessionId: 'saved-session', explore: false } });
   assert.equal(h.spawnOptions.command, 'D:/tools/claude.exe');
   assert.equal(h.spawnOptions.windowsHide, true);
   assert.equal(h.options.env.DISABLE_AUTOUPDATER, '1');
@@ -318,8 +318,9 @@ test('默认免权限模式不再经主控审批，verify 工作者可运行命�
   assert.equal(h.options.allowDangerouslySkipPermissions, true);
   assert.equal(h.options.permissionPrompts, 'none');
   assert.equal(h.options.canUseTool, undefined);
-  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'Bash']);
+  assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'Bash', 'Agent']);
   assert.doesNotMatch(h.options.systemPrompt.append, /report_progress/);
+  assert.match(h.options.systemPrompt.append, /确需主控决定时才调用 mcp__team__ask_parent/);
   await h.instance.close();
 });
 
@@ -332,7 +333,7 @@ test('团队工具直接放行，权限拒绝不伪装成功', async () => {
   const context = { signal: new AbortController().signal, requestId: 'request-1', toolUseID: 'tool-1' };
   assert.equal(h.options.strictMcpConfig, true);
   assert.deepEqual(h.options.settings, { disableAllHooks: true, disableSkillShellExecution: true });
-  for (const toolName of ['mcp__team__report_progress', 'mcp__team__ask_parent', 'mcp__team__read_dependency']) {
+  for (const toolName of ['mcp__team__ask_parent', 'mcp__team__read_dependency']) {
     const input = { summary: '协调消息' };
     assert.deepEqual(await h.options.canUseTool(toolName, input, { ...context, mcpServer: { name: 'team', source: 'sdk' } }), { behavior: 'allow', updatedInput: input });
   }
@@ -543,9 +544,8 @@ test('内嵌 MCP 记录进度并等待主控问答，不虚报主控已读', asy
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
-    const progress = await client.callTool({ name: 'report_progress', arguments: { summary: '已完成分析' } });
-    assert.equal(progress.content[0].text, '进度已记录，等待主控读取。');
-    assert.ok(h.events.some(({ type, data }) => type === 'progress' && data.summary === '已完成分析'));
+    // 主控阻塞等待时不读进度，report_progress 只会多耗工作者的模型轮次，已移除。
+    assert.deepEqual((await client.listTools()).tools.map(item => item.name).sort(), ['ask_parent', 'read_dependency']);
     const waiting = client.callTool({ name: 'ask_parent', arguments: { question: '继续哪一步', options: ['检查', '修改'] } });
     const pending = await asked.promise;
     assert.equal(pending.kind, 'question');
@@ -756,9 +756,20 @@ test('write 工作者的文件编辑工具只能写分配范围，免权限模�
     configOverrides: { permissionMode: undefined },
     workerOverrides: { access: 'write', cwd: root, writeRoots: [join(root, 'src')] },
   });
-  const [matcher] = h.options.hooks.PreToolUse;
+  const [matcher, agents] = h.options.hooks.PreToolUse;
   assert.equal(matcher.matcher, 'Edit|Write|MultiEdit|NotebookEdit');
   const hook = matcher.hooks[0];
+  // 写入任务默认可用 Explore 和 general-purpose 子 agent，不能嵌套；子 agent 的编辑同样经过范围钩子。
+  assert.equal(agents.matcher, 'Agent|Task');
+  assert.equal(h.options.tools, undefined);
+  assert.ok(!h.options.disallowedTools.includes('Agent'));
+  const agentHook = agents.hooks[0];
+  assert.deepEqual(await agentHook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose' } }), {});
+  assert.deepEqual(await agentHook({ tool_name: 'Agent', tool_input: { prompt: '默认类型' } }), {});
+  assert.deepEqual(await agentHook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore' } }), {});
+  assert.equal((await agentHook({ tool_name: 'Agent', tool_input: { subagent_type: 'Plan' } })).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal((await agentHook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore' }, agent_id: 'sub-1' })).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal((await hook({ tool_name: 'Edit', tool_input: { file_path: join(root, 'README.md') }, cwd: root, agent_id: 'sub-1' })).hookSpecificOutput.permissionDecision, 'deny');
   assert.deepEqual(await hook({ tool_name: 'Edit', tool_input: { file_path: join(root, 'src', 'a.js') }, cwd: root }), {});
   assert.deepEqual(await hook({ tool_name: 'Write', tool_input: { file_path: 'src/new.js' }, cwd: root }), {});
   assert.deepEqual(await hook({ tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: root }), {});
@@ -780,13 +791,17 @@ test('write 工作者的文件编辑工具只能写分配范围，免权限模�
   assert.equal(requests.length, 0);
   await approval.instance.close();
 
-  const reader = harness({ workerOverrides: { access: 'read' } });
+  const reader = harness({ workerOverrides: { access: 'read', explore: false } });
   assert.equal(reader.options.hooks, undefined);
   await reader.instance.close();
+  const plain = harness({ workerOverrides: { access: 'write', cwd: root, writeRoots: [join(root, 'src')], explore: false } });
+  assert.equal(plain.options.hooks.PreToolUse.length, 1);
+  assert.ok(plain.options.disallowedTools.includes('Agent'));
+  await plain.instance.close();
 });
 
-test('explore 只读工作者可用 Explore 子 agent，钩子拒绝其他子 agent、嵌套和非检索工具', async () => {
-  const h = harness({ workerOverrides: { access: 'read', explore: true } });
+test('只读工作者默认可用 Explore 子 agent，钩子拒绝其他子 agent、嵌套和非检索工具', async () => {
+  const h = harness({ workerOverrides: { access: 'read' } });
   assert.deepEqual(h.options.tools, ['Read', 'Glob', 'Grep', 'Agent']);
   assert.ok(!h.options.disallowedTools.includes('Agent'));
   assert.ok(!h.options.disallowedTools.includes('Task'));
@@ -797,7 +812,7 @@ test('explore 只读工作者可用 Explore 子 agent，钩子拒绝其他子 ag
   const denied = result => result.hookSpecificOutput?.permissionDecision === 'deny';
   assert.deepEqual(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: '查找' } }), {});
   assert.deepEqual(await hook({ tool_name: 'Grep', tool_input: { pattern: 'x' }, agent_id: 'sub-1' }), {});
-  assert.deepEqual(await hook({ tool_name: 'mcp__team__report_progress', tool_input: {} }), {});
+  assert.deepEqual(await hook({ tool_name: 'mcp__team__ask_parent', tool_input: {} }), {});
   assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { prompt: '默认类型' } })));
   assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose' } })));
   assert.ok(denied(await hook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore' }, agent_id: 'sub-1' })));
@@ -807,11 +822,17 @@ test('explore 只读工作者可用 Explore 子 agent，钩子拒绝其他子 ag
   assert.ok(denied(await hook({ tool_name: 'Edit', tool_input: { file_path: 'a.js' } })));
   assert(h.events.some(event => event.type === 'scope_denied' && event.data.toolUseId === 'tool-7'));
   await h.instance.close();
-  // explore 只对 read 生效，verify 工作者仍不能委派。
-  const verifier = harness({ workerOverrides: { access: 'verify', explore: true } });
-  assert.deepEqual(verifier.options.tools, ['Read', 'Glob', 'Grep', 'Bash']);
-  assert.ok(verifier.options.disallowedTools.includes('Agent'));
-  assert.equal(verifier.options.hooks, undefined);
+  // verify 工作者也可用 Explore 并行检索，自己可运行命令，但任何一方都不能编辑文件。
+  const verifier = harness({ workerOverrides: { access: 'verify' } });
+  assert.deepEqual(verifier.options.tools, ['Read', 'Glob', 'Grep', 'Bash', 'Agent']);
+  assert.ok(!verifier.options.disallowedTools.includes('Agent'));
+  const verifyHook = verifier.options.hooks.PreToolUse[0].hooks[0];
+  assert.deepEqual(await verifyHook({ tool_name: 'Bash', tool_input: { command: 'npm test' } }), {});
+  assert.deepEqual(await verifyHook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore' } }), {});
+  assert.ok(denied(await verifyHook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose' } })));
+  const edit = await verifyHook({ tool_name: 'Edit', tool_input: { file_path: 'a.js' }, agent_id: 'sub-1' });
+  assert.ok(denied(edit));
+  assert.match(edit.hookSpecificOutput.permissionDecisionReason, /验证任务不能使用 Edit/);
   await verifier.instance.close();
 });
 

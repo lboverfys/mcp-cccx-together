@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { inside, physicalPath, toPosix } from './paths.mjs';
-import { DEFAULT_LINKS, createWorktree, integrateWorktree, removeWorktree, repoRoot, worktreeChanges, worktreeDiff } from './worktree.mjs';
+import { DEFAULT_LINKS, createWorktree, integrateWorktree, rebaseWorktree, removeWorktree, repoRoot, worktreeChanges, worktreeDiff } from './worktree.mjs';
 
 const clip = (text, max) => String(text ?? '').slice(0, max);
 const escapeRegExp = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -46,16 +46,22 @@ export class WorktreeIsolation {
     return { isolation, ...(isolation === 'worktree' ? { links: spec.links ?? DEFAULT_LINKS } : {}) };
   }
 
-  /** 首次启动时创建 worktree；已登记但目录已清理时在原路径重建，CC 会话按路径恢复。 */
-  ensure(worker, warnings = []) {
+  /**
+   * 首次启动时创建 worktree；已登记但目录已清理时在原路径重建，CC 会话按路径恢复。
+   * bases 由调度传入，同一轮启动的写任务共用一次主工作区快照。
+   */
+  ensure(worker, warnings = [], bases) {
     const { data } = worker;
     if (data.worktree && existsSync(data.worktree.root)) return;
     const { config, teamId } = this.manager;
     const root = data.worktree?.root ?? resolve(config.stateDir, teamId, 'worktrees', data.id);
     const recreated = Boolean(data.worktree);
-    data.worktree = createWorktree({ cwd: data.cwd, root, tempDir: this.tempDir, links: data.links ?? [] });
+    const started = Date.now();
+    data.worktree = createWorktree({ cwd: data.cwd, root, tempDir: this.tempDir, links: data.links ?? [], bases });
+    const ms = Date.now() - started;
+    this.manager.addTiming(worker, 'worktreeMs', ms);
     this.manager.save(worker);
-    try { this.manager.event(data.id, 'worktree', { root: data.worktree.root, cwd: data.worktree.cwd, links: data.worktree.links, recreated }); }
+    try { this.manager.event(data.id, 'worktree', { root: data.worktree.root, cwd: data.worktree.cwd, links: data.worktree.links, recreated, ms }); }
     catch (error) { warnings.push(`${data.name} 的隔离工作区已创建，但事件记录失败：${error.message}`); }
   }
 
@@ -79,14 +85,32 @@ export class WorktreeIsolation {
   /** 合并隔离工作区的改动；返回结果而不抛错，由调用方决定发回修复、拒绝或报错。 */
   merge(worker) {
     const { data } = worker;
+    const started = Date.now();
     try {
       if (!existsSync(data.worktree.root)) throw new Error(`隔离工作区不存在：${data.worktree.root}；无法确认交付内容，未执行合并`);
       const merged = integrateWorktree(data.worktree, { allowed: this.scopeFilter(data), tempDir: this.tempDir });
+      this.manager.addTiming(worker, 'mergeMs', Date.now() - started);
       return { ok: true, files: merged.files,
         worktree: merged.tree !== data.worktree.baseTree ? { ...data.worktree, baseTree: merged.tree, integratedAt: new Date().toISOString() } : data.worktree };
     } catch (error) {
       return { ok: false, kind: error.code === 'SCOPE' ? 'scope' : error.code === 'CONFLICT' ? 'conflict' : 'error',
         files: error.files ?? [], error: clip(error.message, 4000) };
+    }
+  }
+
+  /**
+   * 合并冲突时把主工作区最新内容并入隔离工作区（冲突处留标记）并更新基线，由原工作者解决后再验收。
+   * 返回结果而不抛错；失败时隔离工作区保持原样。
+   */
+  rebase(worker) {
+    const { data } = worker;
+    try {
+      const rebased = rebaseWorktree(data.worktree, { tempDir: this.tempDir });
+      data.worktree = rebased.worktree;
+      this.manager.save(worker);
+      return { ok: true, conflicts: rebased.conflicts };
+    } catch (error) {
+      return { ok: false, error: clip(error.message, 2000) };
     }
   }
 

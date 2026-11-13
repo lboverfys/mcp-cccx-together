@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { executableCommand, loadConfig, projectRoot } from './config.mjs';
-import { codexConfigPath, updateCodexServer } from './codex-config.mjs';
+import { codexConfigPath, inspectCodexServer, updateCodexServer } from './codex-config.mjs';
 import { providerSourceVariables } from './providers.mjs';
 
 const execute = promisify(execFile);
@@ -16,19 +16,20 @@ const LONG_WAIT_MS = 570000;
 const cliPath = fileURLToPath(import.meta.url);
 const help = `CC Team MCP — Codex 协调本机 Claude Code
 
-用法：cc-team-mcp [serve|doctor|print-config|setup|prune|recover] [选项]
+用法：cc-team-mcp [serve|doctor|print-config|setup|stats|prune|recover] [选项]
 
   serve         启动标准输入/输出 MCP 服务（默认命令）
   doctor        检查客户端、运行时及目录权限；不调用模型、不创建目录
   print-config  输出通用 MCP JSON 配置
   setup         使用 codex mcp add 注册服务，并设置长等待和工具超时；保留已有同名配置
+  stats         汇总团队耗时：主控（Codex）在调用之间的时间、CC 运行、验证与合并时间
   prune         预览已关闭团队的历史结果清理，保护仍被引用的版本
   recover       预览异常退出团队的锁及日志尾行恢复，拒绝未完成收尾的任务
-  --team ID     prune/recover 的团队 ID
+  --team ID     stats/prune/recover 的团队 ID
   --keep-results N  prune 每名工作者至少保留最近 N 份结果（必填）
   --apply       prune/recover 实际执行；省略时仅预览
   --config PATH 指定 JSON 配置文件
-  --name NAME   MCP 注册名称（默认 cc_team；setup/print-config）
+  --name NAME   MCP 注册名称（默认 cc_team；setup/print-config/doctor）
   --help        显示帮助
   --version     显示版本
 
@@ -49,7 +50,7 @@ function parseArgs(args) {
       continue;
     }
     if (arg === '--apply') { options.apply = true; continue; }
-    if (['serve', 'doctor', 'print-config', 'setup', 'prune', 'recover'].includes(arg) && !commandSeen) {
+    if (['serve', 'doctor', 'print-config', 'setup', 'stats', 'prune', 'recover'].includes(arg) && !commandSeen) {
       options.command = arg;
       commandSeen = true;
       continue;
@@ -57,10 +58,12 @@ function parseArgs(args) {
     throw new Error(`未知参数：${arg}；使用 --help 查看用法`);
   }
   if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,79}$/.test(options.name)) throw new Error('--name 只能包含字母、数字、下划线和连字符，最多 80 字符');
-  if (options.name !== 'cc_team' && !['setup', 'print-config'].includes(options.command)) throw new Error('--name 仅适用于 setup 或 print-config');
+  if (options.name !== 'cc_team' && !['setup', 'print-config', 'doctor'].includes(options.command)) throw new Error('--name 仅适用于 setup、print-config 或 doctor');
   const maintenance = ['prune', 'recover'].includes(options.command);
-  if (maintenance && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(options.team ?? '')) throw new Error('维护命令需要有效的 --team ID');
-  if (!maintenance && (options.team !== undefined || options.apply)) throw new Error('--team/--apply 仅适用于 prune 或 recover');
+  const teamCommand = maintenance || options.command === 'stats';
+  if (teamCommand && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(options.team ?? '')) throw new Error(`${options.command} 需要有效的 --team ID`);
+  if (!teamCommand && options.team !== undefined) throw new Error('--team 仅适用于 stats、prune 或 recover');
+  if (!maintenance && options.apply) throw new Error('--apply 仅适用于 prune 或 recover');
   if (options.command === 'prune') {
     if (!/^[1-9][0-9]*$/.test(options['keep-results'] ?? '') || !Number.isSafeInteger(Number(options['keep-results']))) throw new Error('prune 需要正整数 --keep-results N');
   } else if (options['keep-results'] !== undefined) throw new Error('--keep-results 仅适用于 prune');
@@ -98,6 +101,23 @@ function inspectDirectory(directory) {
   }
 }
 
+/**
+ * Codex 侧等待设置：team_wait 单次等待太短时，CC 运行期间主控要反复调用，每次都是一轮慢的主控回合。
+ * 只影响速度，不影响可用性，因此标为可选检查。
+ */
+function codexWaitCheck(file, name) {
+  let found;
+  try { found = inspectCodexServer(file, name); }
+  catch (error) { return { ok: false, optional: true, file, error: error.message }; }
+  if (!found.found) return { ok: false, optional: true, file, hint: `未在 Codex 配置中找到 [mcp_servers.${name}]；运行 cc-team-mcp setup 注册` };
+  const waitTimeoutMs = found.waitTimeoutMs ?? DEFAULT_WAIT_MS;
+  const toolTimeoutSec = found.toolTimeoutSec ?? 60;
+  const ok = waitTimeoutMs >= 120000 && toolTimeoutSec * 1000 > waitTimeoutMs;
+  return { ok, optional: true, file, toolTimeoutSec, waitTimeoutMs,
+    ...(ok ? {} : { hint: `team_wait 单次只等 ${Math.round(Math.min(waitTimeoutMs, toolTimeoutSec * 1000) / 1000)} 秒，CC 运行期间主控要多轮调用。` +
+      `在 [mcp_servers.${name}] 设置 tool_timeout_sec = 600，并把 env 中的 CC_TEAM_WAIT_TIMEOUT_MS 设为 "570000"` }) };
+}
+
 export async function runCli(args = process.argv.slice(2), {
   stdout = process.stdout, stderr = process.stderr, executeImpl = execute,
   loadConfigImpl = loadConfig, runServerImpl, entryPath = cliPath, env = process.env, home = homedir(),
@@ -110,7 +130,13 @@ export async function runCli(args = process.argv.slice(2), {
       return 0;
     }
     const maintenance = ['prune', 'recover'].includes(options.command);
-    const config = loadConfigImpl(options.config, { requireClaude: !maintenance && options.command !== 'doctor', diagnostic: maintenance || options.command === 'doctor' });
+    const offline = maintenance || options.command === 'stats';
+    const config = loadConfigImpl(options.config, { requireClaude: !offline && options.command !== 'doctor', diagnostic: offline || options.command === 'doctor' });
+    if (options.command === 'stats') {
+      const { teamStats } = await import('./timing.mjs');
+      stdout.write(`${JSON.stringify(teamStats(config, options.team), null, 2)}\n`);
+      return 0;
+    }
     if (maintenance) {
       const { pruneTeam, recoverTeam } = await import('./maintenance.mjs');
       const result = options.command === 'prune'
@@ -148,6 +174,7 @@ export async function runCli(args = process.argv.slice(2), {
           checks.notifications = { ok: false, mode: 'codex-queue', error: `当前 Codex 不支持 queue 通知：${error.message}；可将 notificationMode 设置为 poll` };
         }
       }
+      checks.codexWait = codexWaitCheck(codexConfigPath(env, home), options.name);
       checks.stateDir = inspectDirectory(config.stateDir);
       checks.tempDir = inspectDirectory(config.tempDir);
       stdout.write(`${JSON.stringify({ checks, stateDir: config.stateDir, tempDir: config.tempDir,

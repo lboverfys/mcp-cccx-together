@@ -28,6 +28,7 @@ CC Team MCP 是一个本地 [MCP](https://modelcontextprotocol.io) 服务，让 
 - [模型与 provider](#模型与-provider)
 - [配置](#配置)
 - [恢复工作](#恢复工作)
+- [测量速度](#测量速度)
 - [维护](#维护)
 - [排查问题](#排查问题)
 - [开发](#开发)
@@ -54,7 +55,9 @@ sequenceDiagram
 - **一次调用完成委派。** Codex 是慢的一方，所以服务尽量省 Codex 的轮数：`team_dispatch` 一次提交全部任务，默认等到全部停下或有任务需要决策才返回，和 Claude Code 自己的子 agent 一样。读代码、搜索、运行命令、修改文件都交给工作者，Codex 不先自己调查。
 - **以验证为准，不以自述为准。** 提供 `verify` 命令（例如 `npm test`）时，由服务自己检查结果，失败就发回同一工作者修复，最多 `maxFixRounds` 轮。没有 `verify` 的写入任务由 Codex 验收后才放行下游。
 - **同一件事只做一次。** 只读和验证任务完成即自动验收并回收进程，报告全文随派发结果返回。工作者按固定格式简短汇报：开头是 Codex 可以直接转述的答复，带 `文件:行号` 证据，已证实与推测分开。服务会读出每条引用的原文放在 `evidence` 里，并标出不存在的引用，Codex 不用打开文件就能核对，也不重做调查。
-- **写入隔离。** 在 git 仓库中，每个写入任务在独立的 git worktree 中工作，并行的写入者和各自的测试互不看到对方未完成的修改。验收时只合并任务 `scope` 内的改动，范围外的改动会被拒绝。
+- **隔离且并行的写入。** 在 git 仓库中，每个写入任务在独立的 git worktree 中工作，因此范围重叠的写入任务也能并行，各自的测试互不看到对方未完成的修改。验收时只合并任务 `scope` 内的改动，范围外的改动会被拒绝。若其他任务先改了相同的行，服务会把主工作区的最新内容并入该工作者的 worktree，留下冲突标记后发回同一工作者解决。
+- **工作者内部并行。** Codex 委派前不读代码，往往拆不开任务；工作者可以拆：它能使用 Claude Code 自带的子 agent，只读和验证任务用只读的 Explore，写入任务还可用 general-purpose，且同样受 `scope` 约束。
+- **只跑命令不开会话。** 不写 prompt 的验证任务是命令任务：服务直接运行它的 `verify` 命令，不启动 Claude Code。多个写入完成后的整体测试就用它。
 - **依赖调度。** `dependsOn` 串联任务；前置结果验收后，下游立即启动，并收到上游交付作为交接。
 - **任意 Anthropic 兼容模型。** 配置一次 provider（例如 DeepSeek），然后按任务选择。
 - **状态持久化。** 团队、结果和验收记录保存在磁盘上。关掉 Codex，第二天回来按名字恢复工作者，Claude Code 会话完整保留。
@@ -69,7 +72,7 @@ sequenceDiagram
 > - 不信任的代码请放在容器或虚拟机中运行。
 > - 如需由 Codex 审批工具调用，把 `permissionMode` 设为 `default` 或 `acceptEdits`（见[配置](#配置)）。
 
-工作者不能再创建子 agent（`explore: true` 的只读任务例外，只能使用只读的 Explore 子 agent），不会运行你的 Claude Code hooks，并且只能看到本服务提供的协作工具（不加载其他 MCP 服务）。
+除非任务设置 `explore: false`，工作者可以创建 Claude Code 子 agent：只读和验证任务只能用只读的 Explore，写入任务还可用 general-purpose。子 agent 不能再创建子 agent，它们的文件修改同样限制在任务的 `scope` 内。工作者不会运行你的 Claude Code hooks，并且只能看到本服务提供的协作工具（不加载其他 MCP 服务）。
 
 ## 安装
 
@@ -88,7 +91,7 @@ cc-team-mcp doctor
 cc-team-mcp setup
 ```
 
-- `doctor` 检查 Node、Claude Code、Codex 以及状态/临时目录，不调用模型，也不创建任何文件。
+- `doctor` 检查 Node、Claude Code、Codex、状态/临时目录，以及 Codex 是否允许 `team_wait` 足够长时间阻塞（`codexWait`），不调用模型，也不创建任何文件。
 - `setup` 通过 `codex mcp add` 把服务注册为 `cc_team`。它同时设置 Codex 的工具超时，让 `team_wait` 单次最多可等待 9.5 分钟，并转发 provider 需要的凭据变量（见[延长单次等待](#延长单次等待)）。已存在同名配置时不会覆盖，可用 `--name` 指定其他名称。
 - `--omit=optional` 跳过 Agent SDK 自带的 Claude 程序，直接使用你已安装的 Claude Code。
 
@@ -147,7 +150,9 @@ npm uninstall -g cc-team-mcp
    | `blocked` | 先处理 `blockedBy` 中的上游任务 |
    | `awaiting_review` | 查看结果附带的 `diff`（补丁过长时用 `team_diff` 翻页），再 `team_review` |
 
-4. 重复 `team_wait` 直到 `done: true`，然后转述报告。有多个写入任务时，整体测试由同一批中依赖全部写任务的验证任务完成，不由 Codex 自己跑。自动验收的只读和验证工作者已自动关闭，无需 `team_close`，追问用 `team_resume`。
+4. 重复 `team_wait` 直到 `done: true`，然后转述报告。有多个写入任务时，整体测试由同一批中依赖全部写任务的命令任务完成（`access: "verify"`、填 `verify` 命令、不写 `prompt`），不由 Codex 自己跑。自动验收的只读和验证工作者已自动关闭，无需 `team_close`，追问用 `team_resume`。
+
+工作者只在操作具有破坏性、或猜错会白做时才向 Codex 提问（`needs_input`）；其余情况按最合理的理解继续，并在报告里写明所作假设。
 
 ### 计划示例
 
@@ -155,15 +160,16 @@ npm uninstall -g cc-team-mcp
 {
   "workers": [
     { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"] },
-    { "name": "实现cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现功能", "access": "write", "scope": ["src"], "dependsOn": ["设计cc"], "verify": "npm test", "provider": "deepseek" },
-    { "name": "验证cc", "cwd": "/项目/绝对路径", "prompt": "对照契约检查实现并运行测试", "access": "verify", "dependsOn": ["实现cc"] }
+    { "name": "接口cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现接口部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "auto", "provider": "deepseek" },
+    { "name": "界面cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现界面部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "auto" },
+    { "name": "测试cc", "cwd": "/项目/绝对路径", "access": "verify", "verify": "npm test", "dependsOn": ["接口cc", "界面cc"] }
   ]
 }
 ```
 
 1. `设计cc` 是只读任务，默认完成即通过验收，随后进程自动关闭。
-2. `实现cc` 使用 DeepSeek，在独立 worktree 中从设计交接开始工作。它持续修复直到 `npm test` 在该 worktree 中通过，然后把 `src` 内的改动合并回主工作区。
-3. `验证cc` 是验证任务，同样完成即通过验收；它的报告随 `team_wait` 返回给 Codex。
+2. `接口cc`（使用 DeepSeek）和 `界面cc` 从设计交接同时开始，各自在独立 worktree 中工作。`verify: "auto"` 按项目文件找出测试命令（这里是 `npm test`），各自修复到通过后把改动合并回主工作区；两者改了相同的行时，后合并的一方会收到冲突并自行解决。
+3. `测试cc` 是命令任务：两个写入都合并后，服务直接在主工作区运行 `npm test`，不启动 Claude Code，输出随 `team_wait` 返回给 Codex。
 
 ## 任务参数
 
@@ -173,14 +179,14 @@ npm uninstall -g cc-team-mcp
 | --- | --- | --- |
 | `name` | — | 简短的职责名。缺少 `cc` 时自动补上；包含 `cc` 最多 24 个字符；同一团队内唯一。 |
 | `cwd` | — | 项目目录的绝对路径。 |
-| `prompt` | — | 任务内容。写清要回答的问题或目标，以及已有的线索；搜索交给工作者。 |
-| `access` | `read` | `read`：仅 Read/Glob/Grep。`verify`：额外提供 Bash，用于运行测试和构建（不应修改文件）。`write`：完整工具集。 |
-| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**，不确定会改哪些文件时填 `["."]`。写入范围重叠的任务依次执行；文件编辑工具和合并都限制在该范围内。 |
+| `prompt` | — | 任务内容。写清要回答的问题或目标，以及已有的线索；搜索交给工作者。填了 `verify` 的验证任务省略它即为命令任务。 |
+| `access` | `read` | `read`：仅 Read/Glob/Grep。`verify`：额外提供 Bash，用于测试、构建、查 git 历史和日志或运行程序（不应修改文件）。`write`：完整工具集。 |
+| `scope` | 整个 `cwd` | 相对于 `cwd` 的路径（不是 glob）。`write` **必填**，不确定会改哪些文件时填 `["."]`。文件编辑工具和合并都限制在该范围内。隔离的写入任务范围重叠也并行；共享工作区的写入和验证任务会等待范围重叠的写入。 |
 | `dependsOn` | `[]` | 需先通过验收的任务名字或 ID，可引用同一批次中的任务。 |
-| `verify` | — | 工作者成功后执行的 shell 命令；隔离任务在其 worktree 中执行。退出码 0 表示通过，超时 10 分钟。 |
+| `verify` | — | 工作者成功后执行的 shell 命令；隔离任务在其 worktree 中执行。退出码 0 表示通过，超时 10 分钟。填 `auto` 时按项目文件推断（`package.json` 的 test 脚本、`go.mod`、`Cargo.toml`、pytest 配置、Gradle、Maven、.NET、`make test`），向上查找到仓库根目录为止；找不到时写入任务退回 Codex 验收。 |
 | `review` | `read`/`verify` 任务和带 `verify` 的写入任务为 `auto`，其余为 `codex` | `auto`：工作者成功且 `verify`（如有）通过即验收；`read`/`verify` 任务随后自动关闭进程。`codex`：等待 Codex 调用 `team_review`。写入任务使用 `auto` 必须提供 `verify`。 |
-| `explore` | `false` | 仅 `read` 任务：允许工作者用 Claude Code 的 Explore 子 agent 并行检索互不重叠的部分，适合跨多个模块的大范围搜索。子 agent 同样只能 Read/Glob/Grep，且不能再嵌套。 |
-| `maxFixRounds` | `2` | `verify` 失败或改动越界时自动发回工作者修复的轮数，超过后交给 Codex（0–5）。 |
+| `explore` | `true` | 允许工作者在值得时把工作分给 Claude Code 子 agent 并行：只读和验证任务用 Explore，写入任务还可用 general-purpose。子 agent 不能再嵌套。设为 `false` 关闭。 |
+| `maxFixRounds` | `2` | `verify` 失败、改动越界或合并冲突时自动发回工作者修复的轮数，超过后交给 Codex（0–5）。`verify` 命令根本无法运行（找不到命令）时直接交给 Codex。 |
 | `isolation` | git 仓库中的写入任务为 `worktree` | `worktree` 或 `shared`，见[隔离与合并](#隔离与合并)。 |
 | `links` | `node_modules`、`.venv`、`venv` | 从主工作区链接进 worktree 的被忽略路径（相对 `cwd`），例如 `.env`。仅在 `worktree` 下生效。 |
 | `provider` | `defaultProvider`（如已设置） | 运行该工作者的 provider，见[模型与 provider](#模型与-provider)。 |
@@ -199,13 +205,13 @@ npm uninstall -g cc-team-mcp
 | `team_wait` | 阻塞到全部任务停下或有任务需要处理，返回已停下工作者的报告全文、引用行原文（`evidence`）和待验收写入的 diff |
 | `team_open` | 创建或重新打开团队，设置约束和并发；列出已配置的 provider |
 | `team_list` | 列出已保存的团队 |
-| `team_status` | 完整状态：依赖、排队原因、进程、worktree、待答复请求、最近结果和验收 |
+| `team_status` | 完整状态：依赖、排队原因、进程、worktree、待答复请求、最近结果和验收，以及耗时统计 `timing`（见[测量速度](#测量速度)） |
 | `team_events` | 按游标读取原始事件流（用于排查；等待请用 `team_wait`） |
 | `team_request` | 读取待答复问题或权限请求的全文 |
 | `team_reply` | 回答问题，或允许/拒绝工具调用 |
 | `team_result` | 分页读取完整结果（每页最多 100 KB） |
 | `team_diff` | 查看隔离任务尚未合并的改动：文件、越界文件、统计和分页补丁 |
-| `team_review` | 验收或拒绝指定版本的结果（必须传 `resultId`）；验收隔离任务时合并其改动 |
+| `team_review` | 验收或拒绝指定版本的结果（必须传 `resultId`）；验收隔离任务时合并其改动，合并冲突时发回工作者解决（`sentBack: true`） |
 | `team_send` | 向工作者追加指令 |
 | `team_interrupt` | 中断工作者的当前轮次 |
 | `team_resume` | 在原 Claude Code 会话中恢复已关闭的工作者 |
@@ -218,15 +224,15 @@ npm uninstall -g cc-team-mcp
 
 `cwd` 位于 git 仓库内的写入任务默认在独立的 [git worktree](https://git-scm.com/docs/git-worktree) 中运行。不在 git 仓库中时直接修改你的文件（`shared`），`team_dispatch` 会返回警告。
 
-- **起点。** worktree 以任务启动时主工作区的快照为起点，包括未提交的修改和未被忽略的未跟踪文件。你的分支、索引和 `HEAD` 都不会改动；快照提交不挂在任何分支上。
+- **起点。** worktree 以任务启动时主工作区的快照为起点，包括未提交的修改和未被忽略的未跟踪文件；同时启动的写入任务共用一次快照。你的分支、索引和 `HEAD` 都不会改动；快照提交不挂在任何分支上。
 - **位置。** `<stateDir>/<teamId>/worktrees/<workerId>`。状态目录必须位于仓库之外。
 - **依赖。** 测试需要的被忽略目录会从主工作区链接进来：默认 `node_modules`、`.venv` 和 `venv`，可用 `links` 添加更多。链接目录是共享的，工作者重装依赖会改动主工作区的 `node_modules`。
 - **路径。** 发给工作者的消息中指向项目的绝对路径会改写为 worktree 路径；文件编辑工具拒绝 worktree 中范围以外的路径。
 - **验收即合并。** 结果被验收时（自动验收或 `team_review`），服务取出工作者自起点以来的改动：
   - 每个改动的路径都必须在 `scope` 内，否则验收失败。自动验收会在 `maxFixRounds` 内把越界清单发回工作者；`team_review` 返回错误。
-  - 期间你或其他任务改过相同文件时做三方合并；冲突会让验收失败，且不改动任何文件。
+  - 期间你或其他任务改过相同文件时做三方合并。冲突时不合并任何文件：服务把主工作区当前内容并入工作者的 worktree 并留下冲突标记，把它的起点推进到当前内容，再把冲突文件清单发回该工作者（自动验收时计入 `maxFixRounds`）。工作者再次汇报后照常经过 `verify` 和合并。
   - 合并结果只写入你的工作区文件，不会暂存或提交。
-- **并行只读。** 隔离的写入任务在合并前不改动你的工作区，因此范围重叠的只读任务可以同时运行。验证任务会在工作区里运行命令，仍需排队。
+- **并行工作。** 隔离的写入任务在合并前不改动你的工作区，因此范围重叠的只读任务和其他隔离写入任务可以同时运行。验证任务会在工作区里运行命令，仍需排队。
 - **合并前检查。** 等待 Codex 验收的写入结果附带改动文件、越界文件和最多 12,000 字符的补丁；其余部分用 `team_diff` 翻页查看。
 - **清理。** 关闭工作者时，已全部合并的 worktree 会被删除；仍有未合并改动的会保留（路径见 `team_status`）。`team_resume` 会在原路径重建已删除的 worktree，Claude Code 会话因此可以继续。`prune` 会清理遗留的无改动 worktree。
 
@@ -292,6 +298,8 @@ Codex 会在工具超时后终止调用。无论是 `team_dispatch` 还是 `team
 
 `setup` 会自动处理：注册 `CC_TEAM_WAIT_TIMEOUT_MS = 570000`，并在 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）的 `[mcp_servers.cc_team]` 表中写入 `tool_timeout_sec = 600`。如果你自己设置了 `waitTimeoutMs`，`setup` 会保留该值，并把工具超时设为比它多 30 秒。无法修改该文件时，`setup` 改为注册安全的 50 秒默认值，并输出手动步骤。
 
+`cc-team-mcp doctor` 会从 Codex 配置中读出这两个设置，放在 `checks.codexWait` 中，等待过短时附带提示。
+
 手动配置时请同时调高两个上限：
 
 ```toml
@@ -322,9 +330,28 @@ CC_TEAM_WAIT_TIMEOUT_MS = "570000"
 
 Codex 会调用 `team_list`，用原 `teamId` 通过 `team_open` 重新打开团队，再按名字调用 `team_resume`。约束、并发、依赖、验收记录和 worktree 都会恢复；尚未投递的消息会保留，并在 `team_resume` 后按顺序发送。
 
+## 测量速度
+
+委派的目的是更快完成，所以要测量而不是凭感觉判断。服务会为每个团队计时：
+
+- `codex`：Codex 在两次调用本服务之间自己花的时间（推理、自行运行的工具和回复）及次数。第一次调用之前的规划时间无法观测。超过 5 分钟的间隔通常包含你自己的时间，只计数不计时（`longGapsExcluded`）。
+- `mcpCalls`：调用本服务的次数，以及 Codex 阻塞在 `team_dispatch` 和 `team_wait` 中的时间。
+- `workerRunMs`、`verifyMs`、`mergeMs`、`worktreeMs`：Claude Code 的运行时间（命令任务为命令耗时），以及服务自身的验证、合并和建 worktree 时间。每个工作者的明细见 `team_status`。
+
+可以让 Codex 调用 `team_status`，也可以随时在终端查看（团队打开期间也可以）：
+
+```sh
+cc-team-mcp stats --team <团队ID>
+```
+
+Codex 自己的回合通常占大头。两项设置能减少这部分时间：
+
+- 延长单次等待（见[延长单次等待](#延长单次等待)），工作者运行期间 Codex 不必每 50 秒被唤醒一次。
+- 委派会话使用较低的 Codex 推理强度，例如建一个 `model_reasoning_effort = "medium"` 的 Codex profile。使用 mct 时 Codex 主要负责拆分任务和转述报告。
+
 ## 维护
 
-运行维护命令前请先关闭团队。两条命令默认只预览，加 `--apply` 才实际执行。
+运行 `prune` 或 `recover` 前请先关闭团队。两条命令默认只预览，加 `--apply` 才实际执行。
 
 ```sh
 # 清理历史结果（每个工作者至少保留最近 3 份，以及仍被引用的版本），
@@ -349,10 +376,11 @@ cc-team-mcp recover --team <团队ID> --apply
 | 提示 provider“需要环境变量” | `envFrom` 的来源变量没有传到服务。重新运行 `setup`，或把它加入 `env_vars` |
 | `team_wait` 因工具超时失败 | 调低 `CC_TEAM_WAIT_TIMEOUT_MS` 或调高 `tool_timeout_sec`（见[延长单次等待](#延长单次等待)） |
 | 验收失败，提示“超出分配范围” | `team_diff` 会列出 `outsideScope`。让工作者撤销这些文件，或扩大 `scope` 后重新派发 |
-| 验收失败，提示“冲突” | 主工作区改动了相同的行。先在主工作区解决，或拒绝该结果后基于当前状态重新派发 |
+| 验收失败，提示“冲突” | 冲突已发回工作者但 `maxFixRounds` 用完，或工作者进程已退出。用 `team_resume` 让工作者解决，或拒绝该结果后基于当前状态重新派发 |
+| 自动验收失败，提示“找不到命令或程序” | `verify` 命令在该目录无法运行。修正命令（或改用 `auto`）后 `team_send` 给工作者，或由 Codex 自行验收 |
 | worktree 中 `verify` 报缺少模块 | 把测试需要的被忽略目录或文件加入 `links` |
 | 提示“stateDir 位于该 git 仓库内” | 把 `stateDir` 移到仓库之外，或使用 `isolation: "shared"` |
-| 任务一直处于 `waiting_scope` | 查看 `blockedBy`，该工作者完成并验收后会自动启动；拆分范围即可并行 |
+| 任务一直处于 `waiting_scope` | 查看 `blockedBy`，该工作者完成并验收后会自动启动。只有共享工作区的写入和验证任务会等待范围重叠的任务；拆分范围即可并行 |
 | 工作者停在 `needs_input` | 用 `team_request` 读取请求，再用 `team_reply` 回答 |
 | 提示团队被其他进程占用 | 关闭另一个会话；如为异常退出，运行 `recover` |
 | 关闭失败 | Claude Code 后台任务未能确认停止。先自行核实再重试，不要直接删除锁文件 |

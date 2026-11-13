@@ -410,14 +410,19 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
     'team_wait', 'team_diff',
   ].sort());
   assert.match(instructions, /team_diff/);
-  assert.match(instructions, /没有 verify 的 write 任务默认由主控验收/);
+  assert.match(instructions, /没有 verify 的 write 任务由主控验收/);
+  assert.match(instructions, /不知道时填 "auto"/);
+  assert.match(instructions, /范围重叠也并行，合并冲突由 MCP 发回原工作者解决/);
+  assert.match(instructions, /需要运行命令、查 git 历史或本地日志的调查用 verify/);
+  assert.match(instructions, /不要另派汇总工作者/);
+  assert.doesNotMatch(instructions, /只读汇总工作者/);
   assert.match(instructions, /已派出的问题主控不要再自己调查/);
   assert.match(instructions, /summary 即工作者报告全文/);
   assert.match(instructions, /主控不要先自己调查/);
   assert.match(instructions, /wait: false/);
   assert.match(instructions, /不确定改哪些文件时填 \["\."\]/);
   assert.match(instructions, /evidence/);
-  assert.match(instructions, /dependsOn 全部写任务的 verify 工作者/);
+  assert.match(instructions, /不写 prompt、只填 access: "verify"、verify 命令和 dependsOn 全部写任务的命令任务/);
   assert.doesNotMatch(instructions, /几次搜索就能回答的窄问题，主控先自行定位/);
   assert.equal(tools.find(tool => tool.name === 'team_dispatch').inputSchema.properties.wait.default, true);
   for (const name of ['team_status', 'team_events', 'team_request', 'team_wait', 'team_diff']) {
@@ -777,4 +782,24 @@ test('未填 review 时 read/verify 任务自动验收，team_open 和说明列�
   const diff = await endpoint.raw('team_diff', { workerId: '甲cc' });
   assert.equal(diff.isError, true);
   assert.match(diff.content[0].text, /只有 worktree 隔离/);
+});
+
+test('命令任务可省略 prompt，其他任务缺少 prompt 时拒绝；team_status 汇总主控调用节奏', async t => {
+  const f = await fixture(t);
+  const endpoint = await f.connect();
+  const missing = await endpoint.raw('team_dispatch', { workers: [{ name: '查', cwd: f.cwd }] });
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0].text, /缺少 prompt/);
+  const dispatched = await endpoint.call('team_dispatch', { workers: [
+    { name: '测试', cwd: f.cwd, access: 'verify', verify: `"${process.execPath}" -e "0"` },
+  ], wait: true });
+  assert.equal(dispatched.done, true);
+  assert.match(dispatched.workers[0].summary, /^命令通过/);
+  assert.equal(f.controllers.length, 0);
+  await endpoint.call('team_status');
+  // 每次调用在返回后才记入，第二次查询能看到派发和第一次查询。
+  const status = await endpoint.call('team_status');
+  assert.equal(status.timing.mcpCalls.count, 2);
+  assert.equal(status.timing.codex.turns, status.timing.mcpCalls.count - 1, '除首个调用外，每次调用前的空档都计入主控');
+  assert.equal(status.workers[0].command, `"${process.execPath}" -e "0"`);
 });

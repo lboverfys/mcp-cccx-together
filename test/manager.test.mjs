@@ -1717,7 +1717,14 @@ test('read/verify 任务默认自动验收，没有 verify 的 write 任务交�
   assert.equal(warnings.length, 2);
   assert.ok(warnings.every(warning => /不是 git 仓库/.test(warning)));
   assert.throws(() => manager.dispatch([f.spec('D', { access: 'write', scope: ['back'], review: 'auto' })]), /必须提供 verify/);
-  assert.throws(() => manager.dispatch([f.spec('X', { access: 'verify', explore: true })]), /explore 只适用于 read 任务/);
+  assert.throws(() => manager.dispatch([f.spec('X', { access: 'read', prompt: undefined })]), /只有给出 verify 命令的 verify 任务可以省略 prompt/);
+  // verify: auto 识别不出命令时，写任务退回主控验收，命令任务直接拒绝。
+  const fallback = [];
+  const [guessed] = manager.dispatch([f.spec('Y', { access: 'write', scope: ['back'], verify: 'auto', review: undefined })], fallback);
+  assert.equal(manager.get(guessed.id).data.review, 'codex');
+  assert.equal(manager.get(guessed.id).data.verify, undefined);
+  assert.ok(fallback.some(warning => /未识别出测试命令，改由主控验收/.test(warning)));
+  assert.throws(() => manager.dispatch([f.spec('Z', { access: 'verify', verify: 'auto', prompt: undefined })]), /未识别出测试命令/);
   assert.throws(() => manager.dispatch([f.spec('E', { access: 'write', scope: ['back'], isolation: 'worktree' })]), /不在 git 仓库中/);
   assert.throws(() => manager.dispatch([f.spec('F', { isolation: 'worktree' })]), /只有 write 任务/);
   assert.throws(() => manager.dispatch([f.spec('G', { access: 'write', scope: ['back'], links: ['../x'] })]), /links 必须是 cwd 内/);
@@ -1782,11 +1789,11 @@ test('team_wait 的证据取自完整报告，引用在摘要截断位置之后�
   assert.deepEqual([second.summary, second.evidence, second.durationMs], [undefined, undefined, undefined]);
 });
 
-test('工作者说明要求结论先行的简短报告，explore 只读任务允许 Explore 子 agent', async t => {
+test('工作者说明要求结论先行的简短报告，默认允许子 agent，explore: false 时禁止', async t => {
   const f = await fixture(t);
   const manager = await f.create();
   const [reader, explorer, writer] = manager.dispatch([
-    f.spec('读取'), f.spec('检索', { explore: true }), f.spec('写入', { access: 'write', scope: ['front'] }),
+    f.spec('读取', { explore: false }), f.spec('检索'), f.spec('写入', { access: 'write', scope: ['front'] }),
   ]);
   const text = id => manager.get(id).data.instructions;
   assert.match(text(reader.id), /1500 字以内.*直接回答任务.*文件:行号/);
@@ -1797,8 +1804,12 @@ test('工作者说明要求结论先行的简短报告，explore 只读任务允
   assert.doesNotMatch(text(reader.id), /修改的文件/);
   assert.match(text(explorer.id), /subagent_type 只能是 Explore/);
   assert.doesNotMatch(text(explorer.id), /不要自行再创建 agent/);
-  assert.equal(manager.status([explorer.id]).workers[0].explore, true);
+  assert.equal(manager.status([explorer.id]).workers[0].explore, undefined);
+  assert.equal(manager.status([reader.id]).workers[0].explore, false);
   assert.match(text(writer.id), /列出修改的文件、验证命令及结果和未完成项/);
+  assert.match(text(writer.id), /Explore 或 general-purpose/);
+  // 主控回应慢：工作者按合理假设继续，不轻易提问。
+  assert.match(text(reader.id), /按最合理的理解继续，并在报告里写明所作假设/);
 });
 
 test('provider 校验来源变量，默认 provider 生效，预算估算给出警告', async t => {
@@ -1832,4 +1843,87 @@ test('前置交付摘要被截断时，下游指令明确要求读取完整交�
   assert.equal(manager.get(up.id).data.lastResult.text.length, 2000);
   manager.review(up.id, true, '通过');
   assert.match(f.controllers[1].options.worker.instructions, /摘要已截断为前 2000 字符，开始前必须用 mcp__team__read_dependency 读取完整交付/);
+});
+
+test('命令任务不启动 CC：MCP 直接运行 verify 命令，通过即验收并回收，失败交主控并带输出和证据', async t => {
+  const f = await fixture(t);
+  writeFileSync(path.join(f.cwd, 'front', 'view.js'), 'const broken = 1;\n');
+  const manager = await f.create();
+  const pass = `"${process.execPath}" -e "console.log('all good')"`;
+  const fail = `"${process.execPath}" -e "console.error('front/view.js:1 broke'); process.exit(3)"`;
+  const [ok, bad] = manager.dispatch([
+    f.spec('通过', { access: 'verify', verify: pass, prompt: undefined, review: undefined }),
+    f.spec('失败', { access: 'verify', verify: fail, prompt: undefined, review: undefined }),
+  ]);
+  assert.equal(f.controllers.length, 0, '命令任务不启动 CC');
+  assert.equal(manager.get(ok.id).data.command, pass);
+  assert.equal(manager.get(ok.id).data.verify, undefined, '命令只运行一次，不再作为验收命令重复执行');
+  assert.equal(manager.status([ok.id]).workers[0].model, '命令任务（不启动 CC）');
+
+  const passed = (await manager.wait({ workerIds: [ok.id], timeoutMs: 10000 })).workers[0];
+  assert.equal(passed.attention, false);
+  assert.match(passed.summary, /^命令通过：.*all good/s);
+  assert.equal(passed.review.accepted, true);
+  await until(() => manager.get(ok.id).data.status === 'closed', '通过后回收');
+
+  const failed = (await manager.wait({ workerIds: [bad.id], timeoutMs: 10000 })).workers[0];
+  assert.equal(failed.attention, true);
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.summary, /命令未通过：.*退出码 3.*front\/view\.js:1 broke/s);
+  assert.deepEqual(failed.evidence.map(item => [item.ref, item.ok]), [['front/view.js:1', true]]);
+  assert.equal(failed.turns, 0);
+  // 主控修好后 team_send 即重新运行同一命令。
+  manager.send(bad.id, '重新运行');
+  await until(() => manager.get(bad.id).data.lastResult.resultId !== failed.resultId, '重新运行');
+  assert.equal(f.controllers.length, 0);
+});
+
+test('验证命令无法运行（找不到命令）时直接交主控，不消耗修复轮次', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [writer] = manager.dispatch([f.spec('写', { access: 'write', scope: ['front'], verify: 'cc-team-no-such-command-xyz', maxFixRounds: 2, review: undefined })]);
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '完成' });
+  await until(() => manager.get(writer.id).data.lastReview, '自动拒绝');
+  assert.equal(manager.get(writer.id).data.lastReview.accepted, false);
+  assert.match(manager.get(writer.id).data.lastReview.note, /找不到命令或程序/);
+  assert.equal(controller.sent.length, 1, '没有发回工作者修复');
+  assert.equal(manager.get(writer.id).data.fixRounds ?? 0, 0);
+});
+
+test('自动验收后回收中的工作者不拖住 team_wait，进程关闭前即返回结果', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [reader] = manager.dispatch([f.spec('读取', { review: undefined })]);
+  const controller = f.controllers[0];
+  controller.closeGate = deferred();
+  const waiting = manager.wait({ workerIds: [reader.id], timeoutMs: 5000 });
+  controller.emit('result', { success: true, text: '结论' });
+  const result = await waiting;
+  assert.equal(result.timedOut, false);
+  assert.equal(result.done, true);
+  assert.equal(result.workers[0].summary, '结论');
+  assert.equal(manager.get(reader.id).data.status, 'closing');
+  controller.closeGate.resolve();
+  await until(() => manager.get(reader.id).data.status === 'closed', '关闭完成');
+  assert.equal((await manager.wait({ timeoutMs: 1000 })).workers.length, 0);
+});
+
+test('工作者计时累计 CC 运行和验证耗时，status 汇总主控调用节奏', async t => {
+  const f = await fixture(t);
+  const manager = await f.create();
+  const [worker] = manager.dispatch([f.spec('读取', { review: undefined, verify: `"${process.execPath}" -e "0"` })]);
+  f.controllers[0].emit('result', { success: true, text: '完成', durationMs: 1200 });
+  await until(() => manager.get(worker.id).data.lastReview, '验收');
+  assert.equal(manager.get(worker.id).data.timing.runMs, 1200);
+  assert.ok(manager.get(worker.id).data.timing.verifyMs >= 0);
+  manager.recordCall({ tool: 'team_dispatch', ms: 5000, at: 0, end: 5000 });
+  manager.recordCall({ tool: 'team_status', ms: 10, gap: 3000, at: 8000, end: 8010 });
+  const { timing } = manager.status();
+  assert.deepEqual(timing.codex, { turns: 1, ms: 3000 });
+  assert.deepEqual(timing.mcpCalls, { count: 2, ms: 5010, blockedWaitingMs: 5000 });
+  assert.equal(timing.workerRunMs, 1200);
+  await manager.close();
+  const reopened = await f.create();
+  assert.equal(reopened.status().timing.mcpCalls.count, 2, '计时随团队持久保存');
 });
