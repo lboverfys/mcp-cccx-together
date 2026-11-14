@@ -44,7 +44,7 @@ const workerSpec = providers => z.object({
   provider: (providers.length ? z.enum(providers) : z.string().min(1).max(40)).optional()
     .describe(providers.length ? `执行模型的 provider，省略时使用默认 provider；可选：${providers.join('、')}` : '未配置 provider；工作者使用 Claude Code 自身的模型配置'),
   verify: z.string().trim().min(1).max(2000).optional()
-    .describe('完成后由 MCP 在 cwd 执行的验证命令，退出码 0 视为通过，例如 npm test；不知道命令时填 auto，按项目文件推断（package.json、go.mod、Cargo.toml、pytest 等）'),
+    .describe('完成后由 MCP 在工作者实际目录执行的验证命令，退出码 0 视为通过；优先填已知可靠的定向测试命令，不确定时填 auto，按项目文件推断并保留完整测试回退。多个写任务合并后另用命令任务做完整验证'),
   maxFixRounds: z.number().int().min(0).max(5).default(2)
     .describe('verify 失败、改动越界或合并冲突时自动发回工作者修复的最多轮数，超过后交主控处理'),
   instructions: z.string().max(20000).optional(), model: z.string().max(200).optional(),
@@ -73,14 +73,14 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
   const server = new McpServer({ name: 'cc-team', version }, { instructions:
     'cc_team（别名 mct、ctm，不区分大小写）。用户说“使用/用 mct 或 ctm”做事时，即要求通过本 MCP 委派 Claude Code（CC）子 agent：' +
     'Codex 只负责拆分和转述，读代码、搜索、运行命令、修改文件全部交给 CC。' +
-    '流程：①立即 team_dispatch，主控不要先自己调查，已派出的问题也不要再自己查；只读问题只填 name、cwd、prompt，改代码加 access:"write"、verify:"auto"。' +
+    '流程：①立即 team_dispatch，主控不要先自己调查，已派出的问题也不要再自己查；只读问题只填 name、cwd、prompt；改代码加 access:"write"，verify 优先填已知定向测试命令，不确定时填 "auto"。' +
     '②调用会阻塞到出结果；timedOut 为 true 时直接再调 team_wait。' +
     '③把各 summary 开头直接转述给用户；evidence 是 MCP 按行号读出的原文，核对看它，不要再打开文件或重做调查。' +
     '④只处理 attention 为 true 的工作者，照返回最前面的 next 操作。' +
     '任务明确时直接委派，无需再次确认；只说别名时结合上下文确定任务，仍无任务才询问；仅讨论、引用别名或明确要求不使用时不触发。\n' +
     '拆分：互不依赖的子问题各派一个工作者并行；拆不开就派一个，它会自己用子 agent 并行。需要运行命令、查 git 历史或本地日志的调查用 access:"verify"。图片有本地路径时把路径写进 prompt，CC 能直接读图。' +
     '写入：git 仓库中的写任务各在独立工作区，scope 省略即整个 cwd，范围重叠也并行，合并冲突由 MCP 发回原工作者解决；不要为了填 scope 先自己查代码。' +
-    'verify 填测试命令，不知道时填 "auto"：通过即自动合并回主工作区，失败自动发回修复；没有 verify 的 write 任务由主控验收：结果附带 diff（截断时用 team_diff），核对后 team_review（传 resultId）。' +
+    'verify 优先填已知可靠的定向测试命令；不确定时填 "auto"，保留完整测试回退，不猜测局部命令。不同工作区即使命令相同也要分别验证，不能按命令去重。通过即自动合并回主工作区，失败自动发回修复；没有 verify 的 write 任务由主控验收：结果附带 diff（截断时用 team_diff），核对后 team_review（传 resultId）。' +
     '有多个写任务时，同批加一个不写 prompt、只填 access: "verify"、verify 命令和 dependsOn 全部写任务的命令任务做整体验证，由 MCP 直接运行，不启动 CC，也不要主控自己跑测试。' +
     '结果：summary 即工作者报告全文（summaryTruncated 时用 team_result 续读）；多个报告由主控直接合并转述，不要另派汇总工作者。' +
     'team_send、team_reply、team_resume、team_review 处理后默认继续等待，返回内容同 team_wait；主控确有不重叠的工作时才传 wait: false，做完再 team_wait。' +
@@ -98,15 +98,17 @@ export function createTeamServer(config, { factory, notifierFactory = options =>
       const call = clock.begin();
       // Codex 对同一服务串行调用：新调用到达时仍未返回的等待已被它放弃，立即结束且不把结果记为已返回。
       manager?.abandonWaits();
+      let waitedMs = 0;
       try {
         const result = await action(input, extra);
+        waitedMs = result.waitedMs ?? 0;
         return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
       } catch (error) {
         return { isError: true, content: [{ type: 'text', text: error.message }] };
       } finally {
         // 调用之间的空档即主控自身的耗时，记入当前团队，供 team_status 和 stats 对比。
         const end = clock.end();
-        manager?.recordCall({ tool: name, ms: end - call.at, gap: call.gap, at: call.at, end });
+        manager?.recordCall({ tool: name, ms: end - call.at, waitedMs, gap: call.gap, at: call.at, end });
       }
     });
   }

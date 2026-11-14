@@ -22,15 +22,29 @@ test('调用之间的空档计为主控耗时：并发调用期间不计，首�
   now = 9500;
   clock.end();
   clock.end();
-  let timing = addCall(undefined, { tool: 'team_dispatch', ms: 5000, gap: first.gap, at: 1000, end: 6000 });
-  timing = addCall(timing, { tool: 'team_wait', ms: 500, gap: second.gap, at: 9000, end: 9500 });
+  let timing = addCall(undefined, { tool: 'team_dispatch', ms: 5000, waitedMs: 4500, gap: first.gap, at: 1000, end: 6000 });
+  timing = addCall(timing, { tool: 'team_wait', ms: 500, waitedMs: 400, gap: second.gap, at: 9000, end: 9500 });
   timing = addCall(timing, { tool: 'team_status', ms: 5, gap: IDLE_CAP_MS + 1, at: 9_000_000, end: 9_000_005 });
   const summary = summarizeTiming(timing, [{ timing: { runMs: 4000, verifyMs: 300 } }, { timing: { runMs: 1000, mergeMs: 20 } }, {}]);
   assert.deepEqual(summary.codex, { turns: 1, ms: 3000, longGapsExcluded: 1 });
-  assert.deepEqual(summary.mcpCalls, { count: 3, ms: 5505, blockedWaitingMs: 5500 });
+  assert.deepEqual(summary.mcpCalls, { count: 3, ms: 5505, blockedWaitingMs: 4900 });
   assert.deepEqual([summary.workerRunMs, summary.verifyMs, summary.mergeMs, summary.worktreeMs], [5000, 300, 20, 0]);
   assert.equal(summary.spanMs, 9_000_005 - 1000);
   assert.deepEqual(timing.byTool.team_wait, { calls: 1, ms: 500 });
+});
+
+test('所有等待入口累计实际等待，wait:false 调用和接口处理时间不计入等待', () => {
+  let timing;
+  const tools = ['team_dispatch', 'team_wait', 'team_send', 'team_reply', 'team_resume', 'team_review'];
+  for (const tool of tools) {
+    timing = addCall(timing, { tool, ms: 100, waitedMs: 40, at: 0, end: 100 });
+    timing = addCall(timing, { tool, ms: 20, at: 100, end: 120 });
+  }
+  const summary = summarizeTiming(timing, [{ timing: { runMs: 1000 } }, { timing: { runMs: 1000 } }]);
+  assert.equal(summary.mcpCalls.blockedWaitingMs, tools.length * 40);
+  assert.equal(summary.mcpCalls.ms, tools.length * 120);
+  assert.equal(summary.spanMs, 120);
+  assert.equal(summary.workerRunMs, 2000, '并行工作者累计时间独立于实际经过时间');
 });
 
 test('stats 命令离线读取团队耗时，缺少团队时报错', async t => {

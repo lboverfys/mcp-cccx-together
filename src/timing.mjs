@@ -33,11 +33,11 @@ export class CallClock {
 }
 
 /** 把一次调用累加进团队计时；返回新对象。 */
-export function addCall(timing, { tool, ms, gap, at, end }) {
+export function addCall(timing, { tool, ms, waitedMs = 0, gap, at, end }) {
   const next = { ...EMPTY, ...timing, byTool: { ...timing?.byTool } };
   next.calls += 1;
   next.toolMs += ms;
-  if (tool === 'team_dispatch' || tool === 'team_wait') next.waitMs += ms;
+  next.waitMs += waitedMs;
   if (gap !== undefined) {
     if (gap <= IDLE_CAP_MS) { next.codexMs += gap; next.codexTurns += 1; }
     else next.longGaps += 1;
@@ -76,6 +76,6 @@ export function teamStats(config, teamId) {
     teamId, summary: summarizeTiming(team.timing, workers), byTool: team.timing?.byTool ?? {},
     workers: workers.map(data => ({ name: data.name, access: data.access, ...(data.command ? { command: data.command } : {}),
       status: data.status, ...data.timing, ...(data.lastResult?.numTurns !== undefined ? { turns: data.lastResult.numTurns } : {}) })),
-    note: 'codex.ms 是主控在两次调用本 MCP 之间的耗时（推理、自行运行的工具和回复），首次调用前的规划时间不在其中；超过 5 分钟的间隔不计入',
+    note: 'spanMs 仅覆盖首次 MCP 调用到最后一次返回；codex.ms 是调用之间的空档，首次调用前和最后返回后的时间不在其中，超过 5 分钟的间隔不计入。blockedWaitingMs 是各接口实际等待时间；workerRunMs 等工作者时间为累计值，并行时会重叠，不能与等待时间相加',
   };
 }

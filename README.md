@@ -155,21 +155,23 @@ Codex then:
 
 Workers ask Codex (`needs_input`) only when an action is destructive or a wrong guess would waste the work. Otherwise they go with the most reasonable reading and state the assumption in the report.
 
+Prefer known, reliable targeted test commands for each write task, with one full-suite command task after all writes merge. When a targeted command is not known, keep `verify: "auto"` and its full-suite fallback. Do not deduplicate identical commands across worktrees: they check different changes. MCP runs the auto-review command, so workers need not repeat it just to hand off their result; necessary checks during development are still allowed.
+
 ### Example plan
 
 ```json
 {
   "workers": [
     { "name": "designcc", "cwd": "/abs/path/to/project", "prompt": "Write the API contract and acceptance criteria", "scope": ["src"] },
-    { "name": "apicc", "cwd": "/abs/path/to/project", "prompt": "Implement the API part of the contract", "access": "write", "scope": ["."], "dependsOn": ["designcc"], "verify": "auto", "provider": "deepseek" },
-    { "name": "uicc", "cwd": "/abs/path/to/project", "prompt": "Implement the UI part of the contract", "access": "write", "scope": ["."], "dependsOn": ["designcc"], "verify": "auto" },
+    { "name": "apicc", "cwd": "/abs/path/to/project", "prompt": "Implement the API part of the contract", "access": "write", "scope": ["."], "dependsOn": ["designcc"], "verify": "node --test test/api.test.mjs", "provider": "deepseek" },
+    { "name": "uicc", "cwd": "/abs/path/to/project", "prompt": "Implement the UI part of the contract", "access": "write", "scope": ["."], "dependsOn": ["designcc"], "verify": "node --test test/ui.test.mjs" },
     { "name": "testcc", "cwd": "/abs/path/to/project", "access": "verify", "verify": "npm test", "dependsOn": ["apicc", "uicc"] }
   ]
 }
 ```
 
 1. `designcc` is read-only, so it is accepted when it finishes and its process is closed.
-2. `apicc` (on DeepSeek) and `uicc` start together from the design handoff, each in its own worktree. `verify: "auto"` finds the test command from the project files (here `npm test`); each keeps fixing until it passes, then its changes are merged back. If both touched the same lines, the second one gets the conflict back and resolves it.
+2. `apicc` (on DeepSeek) and `uicc` start together from the design handoff, each in its own worktree. This example assumes the module tests are known to be `test/api.test.mjs` and `test/ui.test.mjs`; each targeted check must pass before its changes merge back. Use `verify: "auto"` when the test command is not known. If both touched the same lines, the second one gets the conflict back and resolves it.
 3. `testcc` is a command task: once both writes are merged, the server runs `npm test` in your working tree, without starting Claude Code. Its output reaches Codex through `team_wait`.
 
 ## Task options
@@ -298,6 +300,8 @@ Environment variables override the file; `--config` overrides `CC_TEAM_CONFIG`. 
 
 Codex stops a tool call after its tool timeout. Each wait that times out, whether in `team_dispatch` or `team_wait`, costs Codex another turn, so longer waits mean fewer slow Codex turns. When the limit is under two minutes, a timed-out result carries a `hint` saying so.
 
+A wait timeout ends only that wait, not the worker. Continue with `team_wait` rather than re-dispatching or redoing the task. The 570-second limit is a maximum, not a fixed delay: completion or a request for attention returns early.
+
 `setup` handles this for you. It registers `CC_TEAM_WAIT_TIMEOUT_MS = 570000` and writes `tool_timeout_sec = 600` into the `[mcp_servers.cc_team]` table of `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). If you set `waitTimeoutMs` yourself, `setup` keeps it and sets the tool timeout 30 seconds higher. If `setup` cannot edit the file, it registers the safe 50-second default and prints the manual steps.
 
 `cc-team-mcp doctor` reads these two settings from the Codex config and reports them under `checks.codexWait`, with a hint when the wait is short.
@@ -313,6 +317,8 @@ tool_timeout_sec = 600
 [mcp_servers.cc_team.env]
 CC_TEAM_WAIT_TIMEOUT_MS = "570000"
 ```
+
+An existing registration does not need to be removed: edit these two values in its existing `cc_team` and `env` tables, preserving its command, paths and other environment variables. If a project `.codex/config.toml` overrides the user settings, update those values there too. They take effect in the next Codex session or after reconnecting MCP.
 
 ### Tool visibility and output budget
 
@@ -351,8 +357,9 @@ Codex calls `team_list`, reopens the team with `team_open` and its `teamId`, the
 The point of delegating is to finish sooner, so measure it instead of guessing. The server times every team:
 
 - `codex` — Codex's own time between two calls to this server (its reasoning, tools it ran itself and its replies), and how many such turns there were. Planning before the first call can't be seen. Gaps over 5 minutes usually include you, so they are only counted (`longGapsExcluded`).
-- `mcpCalls` — calls to this server, and how long Codex was blocked in `team_dispatch` and `team_wait`.
-- `workerRunMs`, `verifyMs`, `mergeMs`, `worktreeMs` — Claude Code run time (or command time for command tasks), and the server's own verify, merge and worktree work. Each worker's own figures are in `team_status`.
+- `spanMs` — elapsed time from the first MCP call to the last return, excluding planning before the first call and replies after the last return.
+- `mcpCalls` — call count, total interface time (`ms`), and actual waiting time (`blockedWaitingMs`). Dispatch, wait, send, reply, review and resume all use their returned `waitedMs`; `wait: false` and interface processing add no waiting time. Existing historical totals are not recomputed.
+- `workerRunMs`, `verifyMs`, `mergeMs`, `worktreeMs` — cumulative run, verification, merge and worktree time across workers (run time means command time for command tasks). Concurrent work overlaps, so these totals are not elapsed user waiting time and must not be added to waiting time. Each worker's own figures are in `team_status`.
 
 Ask Codex for `team_status`, or read it from a terminal at any time, even while the team is open:
 
@@ -360,7 +367,7 @@ Ask Codex for `team_status`, or read it from a terminal at any time, even while 
 cc-team-mcp stats --team <teamId>
 ```
 
-Codex's own turns are usually the largest share. Two settings cut them down:
+If the measurements show substantial time between Codex calls, two settings can reduce it:
 
 - Long waits ([Longer waits](#longer-waits)), so Codex isn't woken every 50 seconds while workers run.
 - A lower Codex reasoning effort for delegated sessions, for example a Codex profile with `model_reasoning_effort = "medium"`. With mct, Codex mostly splits tasks and relays reports.

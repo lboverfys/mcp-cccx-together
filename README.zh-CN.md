@@ -155,21 +155,23 @@ npm uninstall -g cc-team-mcp
 
 工作者只在操作具有破坏性、或猜错会白做时才向 Codex 提问（`needs_input`）；其余情况按最合理的理解继续，并在报告里写明所作假设。
 
+验证命令优先使用已知可靠的定向测试，全部写入合并后由一个命令任务运行完整测试。不能可靠确定局部命令时继续用 `verify: "auto"`，保留完整测试回退。不要仅因不同工作区的命令相同就去重，它们验证的是不同改动。自动验收的命令由 MCP 执行，工作者无需为交付再重复运行；开发时仍可运行必要的定向检查。
+
 ### 计划示例
 
 ```json
 {
   "workers": [
     { "name": "设计cc", "cwd": "/项目/绝对路径", "prompt": "梳理接口契约和验收条件", "scope": ["src"] },
-    { "name": "接口cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现接口部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "auto", "provider": "deepseek" },
-    { "name": "界面cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现界面部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "auto" },
+    { "name": "接口cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现接口部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "node --test test/api.test.mjs", "provider": "deepseek" },
+    { "name": "界面cc", "cwd": "/项目/绝对路径", "prompt": "按契约实现界面部分", "access": "write", "scope": ["."], "dependsOn": ["设计cc"], "verify": "node --test test/ui.test.mjs" },
     { "name": "测试cc", "cwd": "/项目/绝对路径", "access": "verify", "verify": "npm test", "dependsOn": ["接口cc", "界面cc"] }
   ]
 }
 ```
 
 1. `设计cc` 是只读任务，默认完成即通过验收，随后进程自动关闭。
-2. `接口cc`（使用 DeepSeek）和 `界面cc` 从设计交接同时开始，各自在独立 worktree 中工作。`verify: "auto"` 按项目文件找出测试命令（这里是 `npm test`），各自修复到通过后把改动合并回主工作区；两者改了相同的行时，后合并的一方会收到冲突并自行解决。
+2. `接口cc`（使用 DeepSeek）和 `界面cc` 从设计交接同时开始，各自在独立 worktree 中工作。示例假设已知两个模块的测试文件分别为 `test/api.test.mjs` 和 `test/ui.test.mjs`，各自定向验证通过后把改动合并回主工作区；未知测试命令时改用 `verify: "auto"`。两者改了相同的行时，后合并的一方会收到冲突并自行解决。
 3. `测试cc` 是命令任务：两个写入都合并后，服务直接在主工作区运行 `npm test`，不启动 Claude Code，输出随 `team_wait` 返回给 Codex。
 
 ## 任务参数
@@ -298,6 +300,8 @@ env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "
 
 Codex 会在工具超时后终止调用。无论是 `team_dispatch` 还是 `team_wait`，每次等待超时都要多花一轮 Codex，因此等待越长，慢速的 Codex 轮次越少。上限低于两分钟时，超时结果会带上 `hint` 提示这一点。
 
+等待超时只结束本次等待，不会停止工作者；继续调用 `team_wait` 即可，不要重新派发或重做任务。570 秒是上限，不是固定延迟，任务完成或需要主控处理时会提前返回。
+
 `setup` 会自动处理：注册 `CC_TEAM_WAIT_TIMEOUT_MS = 570000`，并在 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）的 `[mcp_servers.cc_team]` 表中写入 `tool_timeout_sec = 600`。如果你自己设置了 `waitTimeoutMs`，`setup` 会保留该值，并把工具超时设为比它多 30 秒。无法修改该文件时，`setup` 改为注册安全的 50 秒默认值，并输出手动步骤。
 
 `cc-team-mcp doctor` 会从 Codex 配置中读出这两个设置，放在 `checks.codexWait` 中，等待过短时附带提示。
@@ -313,6 +317,8 @@ tool_timeout_sec = 600
 [mcp_servers.cc_team.env]
 CC_TEAM_WAIT_TIMEOUT_MS = "570000"
 ```
+
+已有注册无需先移除：在现有 `cc_team` 表及其 `env` 表中修改这两个值即可，保留原命令、路径和其他环境变量。若项目 `.codex/config.toml` 覆盖了用户配置，也要同步对应值；下一次 Codex 会话或重新连接 MCP 后生效。
 
 ### 工具可见性与输出预算
 
@@ -351,8 +357,9 @@ Codex 会调用 `team_list`，用原 `teamId` 通过 `team_open` 重新打开团
 委派的目的是更快完成，所以要测量而不是凭感觉判断。服务会为每个团队计时：
 
 - `codex`：Codex 在两次调用本服务之间自己花的时间（推理、自行运行的工具和回复）及次数。第一次调用之前的规划时间无法观测。超过 5 分钟的间隔通常包含你自己的时间，只计数不计时（`longGapsExcluded`）。
-- `mcpCalls`：调用本服务的次数，以及 Codex 阻塞在 `team_dispatch` 和 `team_wait` 中的时间。
-- `workerRunMs`、`verifyMs`、`mergeMs`、`worktreeMs`：Claude Code 的运行时间（命令任务为命令耗时），以及服务自身的验证、合并和建 worktree 时间。每个工作者的明细见 `team_status`。
+- `spanMs`：首次 MCP 调用到最后一次返回的实际经过时间，不包含首次调用前的规划和最后返回后的回复。
+- `mcpCalls`：调用次数、接口总处理时间 `ms`，以及各接口实际等待的 `blockedWaitingMs`。派发、等待、追加、答复、验收和恢复都按返回的 `waitedMs` 计入；`wait: false` 和接口自身处理不计入等待。已有历史累计值不重算。
+- `workerRunMs`、`verifyMs`、`mergeMs`、`worktreeMs`：各工作者累计的执行、验证、合并和建 worktree 时间（命令任务的执行时间为命令耗时）。并行任务的时间会重叠，不能把它们与等待时间相加，也不能把累计值当成用户实际等待时间。每个工作者的明细见 `team_status`。
 
 可以让 Codex 调用 `team_status`，也可以随时在终端查看（团队打开期间也可以）：
 
@@ -360,7 +367,7 @@ Codex 会调用 `team_list`，用原 `teamId` 通过 `team_open` 重新打开团
 cc-team-mcp stats --team <团队ID>
 ```
 
-Codex 自己的回合通常占大头。两项设置能减少这部分时间：
+如果统计显示主控回合耗时较多，两项设置能减少这部分时间：
 
 - 延长单次等待（见[延长单次等待](#延长单次等待)），工作者运行期间 Codex 不必每 50 秒被唤醒一次。
 - 委派会话使用较低的 Codex 推理强度，例如建一个 `model_reasoning_effort = "medium"` 的 Codex profile。使用 mct 时 Codex 主要负责拆分任务和转述报告。

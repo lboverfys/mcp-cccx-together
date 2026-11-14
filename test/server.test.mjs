@@ -299,6 +299,8 @@ test('team_dispatch 未打开团队时自动打开，team_wait 等到自动验�
   assert.ok(Date.now() - started < 2000, '等待时间应受 waitTimeoutMs 上限约束');
   assert.equal(early.timedOut, true);
   assert.equal(early.workers[0].attention, false);
+  assert.equal(f.controllers.length, 1, '等待超时不重新创建工作者');
+  assert.equal(f.controllers[0].closeCalls, 0, '等待超时不结束原任务');
   const waiting = endpoint.call('team_wait');
   f.controllers[0].emit('result', { success: true, text: '实现完成' });
   const result = await waiting;
@@ -421,7 +423,7 @@ test('MCP 传递 mct/ctm 委派说明并暴露全部 16 个工具，未打开团
   ].sort());
   assert.match(instructions, /team_diff/);
   assert.match(instructions, /没有 verify 的 write 任务由主控验收/);
-  assert.match(instructions, /不知道时填 "auto"/);
+  assert.match(instructions, /不确定时填 "auto"，保留完整测试回退/);
   assert.match(instructions, /范围重叠也并行，合并冲突由 MCP 发回原工作者解决/);
   assert.match(instructions, /需要运行命令、查 git 历史或本地日志的调查用 access:"verify"/);
   assert.match(instructions, /不要另派汇总工作者/);
@@ -817,6 +819,27 @@ test('命令任务可省略 prompt，其他任务缺少 prompt 时拒绝；team_
   assert.equal(status.timing.mcpCalls.count, 2);
   assert.equal(status.timing.codex.turns, status.timing.mcpCalls.count - 1, '除首个调用外，每次调用前的空档都计入主控');
   assert.equal(status.workers[0].command, `"${process.execPath}" -e "0"`);
+  assert.equal(status.timing.mcpCalls.blockedWaitingMs, dispatched.waitedMs);
+});
+
+test('570 秒等待在任务完成时提前返回，派发说明保留定向测试和完整验证回退', async t => {
+  const f = await fixture(t);
+  f.config.waitTimeoutMs = 570000;
+  const endpoint = await f.connect();
+  const tools = (await endpoint.client.listTools()).tools;
+  assert.match(tools.find(tool => tool.name === 'team_wait').inputSchema.properties.timeoutMs.description, /570000/);
+  assert.match(endpoint.client.getInstructions(), /verify 优先填已知可靠的定向测试命令/);
+  assert.match(endpoint.client.getInstructions(), /保留完整测试回退/);
+  assert.match(endpoint.client.getInstructions(), /不同工作区即使命令相同也要分别验证/);
+  const waiting = endpoint.call('team_dispatch', { workers: [{ name: '读取', cwd: f.cwd, prompt: '查找入口' }], wait: true });
+  while (!f.controllers.length) await tick();
+  const controller = f.controllers[0];
+  controller.emit('result', { success: true, text: '入口已找到', messageId: controller.sent[0].messageId });
+  const result = await waiting;
+  assert.equal(result.done, true);
+  assert.equal(result.timedOut, false);
+  assert.ok(result.waitedMs < 2500, '等待上限不应变成固定延迟');
+  assert.equal(result.workers[0].summary, '入口已找到');
 });
 
 test('客户端超时放弃的 team_wait 不吞掉报告，下一次 team_wait 照常带回', async t => {
@@ -875,6 +898,11 @@ test('team_send、team_reply、team_review、team_resume 默认处理后继续�
     workerId: '验证cc', message: '再看一遍' } }, undefined, { timeout: 4000 })).content[0].text);
   assert.ok(resumed.messageId);
   assert.equal(resumed.workers.find(worker => worker.name === '验证cc').summary, '补充完成');
+  const waited = [afterSend, review, replied, resumed].map(result => result.waitedMs);
+  assert.ok(waited.every(ms => ms > 0));
+  const status = await endpoint.call('team_status');
+  assert.equal(status.timing.mcpCalls.blockedWaitingMs, waited.reduce((sum, ms) => sum + ms, 0),
+    '追加、答复、验收和恢复内部的等待全部计入，非等待调用不计入');
 });
 
 test('读取过完整结果即视为已送达，没有可等的工作者时不再补发', async t => {

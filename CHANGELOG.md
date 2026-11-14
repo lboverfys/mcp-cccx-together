@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- **Targeted verification before integration.** Dispatch instructions prefer known, reliable targeted checks for each write task and a full-suite command task after all writes merge. Unknown commands retain the `auto` fallback; identical commands in different worktrees still run independently. Workers need not repeat the MCP-run command merely to hand off a result.
+- Clarified how to apply the paired 570-second wait / 600-second tool timeout to existing registrations and project overrides, and that a wait timeout does not stop a worker.
+
 - **Handling a worker waits for the next result in the same call.** `team_send`, `team_reply`, `team_resume` and `team_review` take `wait` (default `true`) and return what `team_wait` returns, so answering, fixing, reviewing or following up costs Codex one call instead of two. Pass `wait: false` for the old immediate receipt.
 - **Duplicate names no longer reject the batch.** A dispatch that repeats a task the team already has, with the same name, before its result reached Codex (for example after the call timed out in Codex) reattaches to the original worker (`retried: true`) instead of starting a second one. Any other name clash renames the new task (`apicc` → `api2cc`) and says so in `warnings`. Two tasks with the same name in one batch are still rejected. Names over 24 characters are shortened instead of rejected.
 - **Write tasks in a git repository may leave out `scope`.** They work in their own worktree and only in-scope changes are merged, so the whole `cwd` is a safe default. Write tasks outside a git repository edit the working tree directly and still need an explicit `scope`.
@@ -45,6 +48,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - `doctor` reports Codex's `tool_timeout_sec` and `CC_TEAM_WAIT_TIMEOUT_MS` for this server under `checks.codexWait`, with a hint when `team_wait` can only block briefly.
 
 ### Fixed
+
+- **Waiting time now covers every waiting interface.** `blockedWaitingMs` uses the actual returned `waitedMs` for dispatch, wait, send, reply, resume and review, excluding non-waiting calls and interface processing. Timing descriptions distinguish observed elapsed time from overlapping worker totals; historical totals are preserved.
 
 - **Results of an abandoned wait were lost.** When Codex gave up on `team_dispatch` or `team_wait` (its tool timeout, or the user interrupting), the server still marked the results as delivered, and the next `team_wait` returned `done: true` with no workers, so Codex never saw the report and tended to redo the work itself. The server now honours MCP cancellation, treats a wait as abandoned when Codex's next call arrives while it is still pending (Codex calls one server's tools one at a time), and returns those results with the next wait, with a `hint` to check the timeout settings. A cancellation reported as a timeout also shortens later waits below it.
 - **Evidence missed paths with non-ASCII characters.** Citations such as `网关/转发.go:3` or `D:/项目/a.go:3`, and paths written right after Chinese text (`位于src/a.go:3`), are now read back. Previously they were skipped, leaving Codex nothing to check against.

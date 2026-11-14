@@ -1925,7 +1925,7 @@ test('工作者计时累计 CC 运行和验证耗时，status 汇总主控调用
   await until(() => manager.get(worker.id).data.lastReview, '验收');
   assert.equal(manager.get(worker.id).data.timing.runMs, 1200);
   assert.ok(manager.get(worker.id).data.timing.verifyMs >= 0);
-  manager.recordCall({ tool: 'team_dispatch', ms: 5000, at: 0, end: 5000 });
+  manager.recordCall({ tool: 'team_dispatch', ms: 5000, waitedMs: 5000, at: 0, end: 5000 });
   manager.recordCall({ tool: 'team_status', ms: 10, gap: 3000, at: 8000, end: 8010 });
   const { timing } = manager.status();
   assert.deepEqual(timing.codex, { turns: 1, ms: 3000 });
@@ -2075,7 +2075,9 @@ test('自动验收的写任务告知工作者 MCP 会运行的验证命令，不
     f.spec('人工', { access: 'write', scope: ['back'], review: undefined }),
   ]);
   const text = id => manager.get(id).data.instructions;
-  assert.match(text(auto.id), /完成后 MCP 会在你的工作区运行验证命令：.*不必自己再完整运行这条命令/);
+  assert.match(text(auto.id), /完成后 MCP 会在你的工作区运行验证命令：.*这条命令由 MCP 执行，不必为了交付再重复运行/);
+  assert.match(text(auto.id), /开发过程中可运行必要的定向检查/);
+  assert.match(text(auto.id), /不同工作区即使命令相同也各自验证/);
   assert.match(text(auto.id), /你运行过的定向检查及结果/);
   assert.doesNotMatch(text(manual.id), /MCP 会在你的工作区运行验证命令/);
   assert.match(text(manual.id), /验证命令及结果/);
