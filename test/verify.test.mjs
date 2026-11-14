@@ -40,13 +40,40 @@ test('verify auto 在 git 仓库内向上查找项目目录，仓库外只看 cw
 
 test('runVerify 返回退出码和耗时，找不到命令单独标记', async () => {
   const signal = new AbortController().signal;
-  const failed = await runVerify(`"${process.execPath}" -e "process.exit(4)"`, process.cwd(), signal, tmpdir());
-  assert.deepEqual([failed.ok, failed.code, failed.missing], [false, 4, undefined]);
-  assert.ok(failed.ms >= 0);
+  for (const code of [0, 1, 4]) {
+    const result = await runVerify(`"${process.execPath}" -e "process.exit(${code})"`, process.cwd(), signal, tmpdir());
+    assert.deepEqual([result.ok, result.code, result.missing], [code === 0, code, undefined]);
+    assert.ok(result.ms >= 0);
+  }
   const missing = await runVerify('cc-team-no-such-command-xyz', process.cwd(), signal, tmpdir());
   assert.equal(missing.ok, false);
   assert.equal(missing.missing, true);
+  assert.equal(missing.code, process.platform === 'win32' ? 9009 : 127);
   assert.equal(commandMissing(9009, 'win32'), true);
   assert.equal(commandMissing(9009, 'linux'), false);
   assert.equal(commandMissing(1), false);
+});
+
+test('runVerify 保留组合命令的失败、短路和恢复结果', async () => {
+  const signal = new AbortController().signal;
+  const success = `"${process.execPath}" -e "process.exit(0)"`;
+  const failure = `"${process.execPath}" -e "process.exit(1)"`;
+  const missing = 'cc-team-no-such-command-xyz';
+  const cases = [
+    [`${success} && ${missing}`, false, process.platform === 'win32' ? 9009 : 127, true],
+    [`${failure} && ${missing}`, false, 1, undefined],
+    [`${missing} || ${success}`, true, 0, undefined],
+  ];
+  for (const [command, ok, code, isMissing] of cases) {
+    const result = await runVerify(command, process.cwd(), signal, tmpdir());
+    assert.deepEqual([result.ok, result.code, result.missing], [ok, code, isMissing], command);
+  }
+});
+
+test('runVerify 支持带空格的脚本路径，保留引号内的 shell 特殊字符', async t => {
+  const cwd = directory(t, { 'path with spaces/check.mjs': "console.log('quoted (a&b)'); process.exit(4);\n" });
+  const script = path.join(cwd, 'path with spaces', 'check.mjs');
+  const result = await runVerify(`"${process.execPath}" "${script}"`, cwd, new AbortController().signal, tmpdir());
+  assert.deepEqual([result.ok, result.code, result.missing], [false, 4, undefined]);
+  assert.match(result.output, /quoted \(a&b\)/);
 });

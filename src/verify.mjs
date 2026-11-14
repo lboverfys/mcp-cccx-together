@@ -10,7 +10,9 @@ export function runVerify(command, cwd, signal, tempDir) {
   return new Promise(resolveRun => {
     let output = '';
     let timedOut = false;
-    const child = spawn(command, { cwd, shell: true, windowsHide: true, detached: process.platform !== 'win32',
+    // cmd /c 会把找不到命令的退出码折成 1，显式退出以保留 ERRORLEVEL（9009）。
+    const shellCommand = process.platform === 'win32' ? `${command} & exit /b` : command;
+    const child = spawn(shellCommand, { cwd, shell: true, windowsHide: true, detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, TEMP: tempDir, TMP: tempDir, TMPDIR: tempDir } });
     const collect = data => { output = (output + data).slice(-VERIFY_OUTPUT_CHARS); };
     child.stdout.setEncoding('utf8').on('data', collect);
